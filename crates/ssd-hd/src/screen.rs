@@ -144,7 +144,7 @@ fn in_windows(regs: &LineRegs, areas: [u8; 2], logic: u8, x: i32) -> bool {
     }
 }
 
-fn bg_in_window(regs: &LineRegs, bg: usize, x: i32) -> bool {
+pub(crate) fn bg_in_window(regs: &LineRegs, bg: usize, x: i32) -> bool {
     in_windows(
         regs,
         [regs.bg_window_area[0][bg], regs.bg_window_area[1][bg]],

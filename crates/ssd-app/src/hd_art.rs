@@ -5,6 +5,7 @@
 //! picture's scale) is found here too; `--no-hd-font` turns it off.
 
 use ssd_hd::Font;
+use ssd_hd::lightning::Lightning;
 use ssd_hd::pack::{Overlay, Pack};
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
@@ -45,6 +46,7 @@ pub fn world(rom: &[u8]) -> Vec<u8> {
 // install a new pack between two runs).
 static PACK: Mutex<Option<Found<Pack>>> = Mutex::new(None);
 static FONT: Mutex<Option<Found<Font>>> = Mutex::new(None);
+static LIGHTNING: Mutex<Option<Found<Lightning>>> = Mutex::new(None);
 
 /// What a search found: a value or nothing, kept either way.
 #[derive(Clone)]
@@ -55,6 +57,7 @@ pub fn configure(config: Config) {
     *CONFIG.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = config;
     *PACK.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
     *FONT.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
+    *LIGHTNING.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = None;
 }
 
 /// The pack with the HD art for `rom`, found on first use; `None` when art is off, there is no
@@ -75,8 +78,14 @@ pub fn pack(rom: &[u8]) -> Option<Arc<Pack>> {
             },
             None => Pack::find(&crate::paths::data_dir().join("cache"), ssd_rom::crc32(rom)),
         };
+        // The pictures of the data folder's `art-override` replace the pack's art of the poses they name
+        let overrides = crate::paths::data_dir().join(ssd_hd::pack::ART_OVERRIDE);
         let found = found.map(|pack| {
-            config.overlays.iter().fold(pack, |pack, overlay| pack.with_overlay(overlay.clone()))
+            config
+                .overlays
+                .iter()
+                .fold(pack, |pack, overlay| pack.with_overlay(overlay.clone()))
+                .with_art_override(&overrides)
         });
         let pack = found
             .filter(|pack| !pack.art.pictures().is_empty() || !pack.art.objects().is_empty())?;
@@ -105,6 +114,21 @@ pub fn font(rom: &[u8]) -> Option<Arc<Font>> {
                 None
             }
         }
+    })
+}
+
+/// The lightning of Goku's first Super Saiyan transformation, read on first use from the data folder's
+/// `art-override\ssj-lightning\` (`frame-1.png` to `frame-4.png`, see [`ssd_hd::lightning`]); `None` when art is off
+/// (`--no-hd-art`) or the folder has no picture. The Enhanced pictures draw it over the frame while the transformation
+/// goes on (the app's [`crate::voice::SsjWatch::lightning_at`]).
+pub fn lightning() -> Option<Arc<Lightning>> {
+    cached(&LIGHTNING, || {
+        if CONFIG.lock().unwrap_or_else(std::sync::PoisonError::into_inner).off {
+            return None;
+        }
+        let dir =
+            crate::paths::data_dir().join(ssd_hd::pack::ART_OVERRIDE).join(ssd_hd::lightning::DIR);
+        Lightning::load(&dir).map(Arc::new)
     })
 }
 

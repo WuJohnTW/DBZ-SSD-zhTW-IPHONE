@@ -224,13 +224,16 @@ fn screens(flow: &mut Flow, dir: &Path, first: Page, note: Option<String>) -> an
     sdl3::hint::set("SDL_TOUCH_MOUSE_EVENTS", "1");
     let sdl = sdl3::init().map_err(|e| anyhow::anyhow!("{e}"))?;
     let video_subsystem = sdl.video().map_err(|e| anyhow::anyhow!("{e}"))?;
-    let mut video = Video::new(&video_subsystem, "Dragon Ball Z: Super Saiya Densetsu")?;
+    let mut video = Video::new(&video_subsystem, "七龍珠Z 超賽亞傳說 繁中版")?;
     let mut events = sdl.event_pump().map_err(|e| anyhow::anyhow!("{e}"))?;
     let gamepads = sdl.gamepad().ok();
     let mut pads = Vec::new();
     let mut input = InputAdapter::default();
     let mut art = Art::empty();
     let mut setup = Setup::new(first);
+    // The screens' words: the chosen language's, before any is chosen the translation the APK brings
+    // (`crate::lang::interface`).
+    let words = crate::lang::interface_text(&crate::options::read_settings().unwrap_or_default());
     if let Some(note) = note {
         setup.set_status(Status::Error(note));
     }
@@ -345,7 +348,7 @@ fn screens(flow: &mut Flow, dir: &Path, first: Page, note: Option<String>) -> an
         let shown = setup.clone();
         let mut tapped = None;
         video.present(&[], &mut input, |ui, _| {
-            tapped = setup_ui::show(ui, &shown, &mut art);
+            tapped = setup_ui::show(ui, &shown, words.as_deref(), &mut art);
         })?;
         commands.extend(tapped);
 
@@ -399,7 +402,7 @@ fn screens(flow: &mut Flow, dir: &Path, first: Page, note: Option<String>) -> an
             setup.set_status(Status::Busy { text: "Starting...".to_owned(), percent: Some(100) });
             let shown = setup.clone();
             video.present(&[], &mut input, |ui, _| {
-                setup_ui::show(ui, &shown, &mut art);
+                setup_ui::show(ui, &shown, words.as_deref(), &mut art);
             })?;
             return Ok(true);
         }

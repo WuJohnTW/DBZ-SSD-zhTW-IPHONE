@@ -47,6 +47,17 @@ make namek-zfighters status party=gohan,krillin,tien,yamcha,chiaotzu gohan.level
     krillin.level=22 tien.level=22 yamcha.level=20 chiaotzu.level=18 map=11 \
     flags=none,+1,+3,+4,+5,+6,+0x10,+0x11,+0x12,+0x13 leader=768,424 follower=640,304 \
     items=d.radar,scouter zeni=300 scene=0
+# Piccolo's Makankosappo (battle:22): the same place with Piccolo and Gohan at level 30, and the hand pinned
+# (page:41, five cards of six bytes) with the 必 card (symbol 5) third, the card the timeline plays.
+make makankosappo makankosappo party=piccolo,gohan piccolo.level=30 gohan.level=30 map=11 \
+    flags=none,+1,+3,+4,+5,+6,+0x10,+0x11,+0x12,+0x13 leader=768,424 follower=640,304 \
+    items=d.radar,scouter zeni=300 scene=0 page:41=d40505050100dc0504020300e40508040500ec0507070600f40508080000
+# Krillin's Kakusadan (battle:23) on five enemies: the same place with Krillin and Gohan at level 7, Krillin's KI at 36
+# and the hand pinned as above (the 必 card third). For every target after the first the engine writes battle:23 again
+# while the screen shows the status box, which the original shows without text.
+make kakusadan kakusadan party=krillin,gohan krillin.level=7 gohan.level=7 krillin.ki=36 map=11 \
+    flags=none,+1,+3,+4,+5,+6,+0x10,+0x11,+0x12,+0x13 leader=768,424 follower=640,304 \
+    items=d.radar,scouter zeni=300 scene=0 page:41=d40505050100dc0504020300e40508040500ec0507070600f40508080000
 # Zarbon and Vegeta joining: the same five on map 11, flag 2 set (the scene's test), flag 0x1B set
 # (else the scene of map 11's other trigger replaces it).
 make zarbon-vegeta-joins mash-3600 party=gohan,krillin,tien,yamcha,chiaotzu gohan.level=30 \

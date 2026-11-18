@@ -6,7 +6,7 @@
     <uses-feature android:name="android.hardware.gamepad" android:required="false" />
 
     <application
-        android:label="Super Saiya Densetsu"
+        android:label="七龍珠Z 超賽亞傳說 繁中版"
         android:icon="@mipmap/ic_launcher"
         android:roundIcon="@mipmap/ic_launcher_round"
         android:allowBackup="false"
@@ -14,8 +14,10 @@
         android:appCategory="game"
         android:isGame="true">
         <meta-data android:name="android.game_mode_config" android:resource="@xml/game_mode_config" />
+        <!-- The launcher shows the activity's label under the icon: the full name of the application is cut there. -->
         <activity
             android:name=".GameActivity"
+            android:label="超賽亞傳說"
             android:exported="true"
             android:screenOrientation="fullSensor"
             android:launchMode="singleTask"

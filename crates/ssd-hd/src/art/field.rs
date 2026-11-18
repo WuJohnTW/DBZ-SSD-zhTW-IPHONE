@@ -8,9 +8,9 @@ use crate::bgart::{BgArt, BgImage, Slot};
 use crate::mapart::{self, Entry};
 use crate::world::FieldState;
 use rustc_hash::{FxHashMap, FxHashSet};
-use std::collections::{BTreeSet, VecDeque};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
-use std::sync::{Arc, Condvar, Mutex};
+use std::sync::Arc;
 
 /// The memory budget of the field maps' tiles at the picture's scale, in bytes: the one limit of
 /// their cache, to lower for a device with less memory. The tiles kept and the ones being read
@@ -239,18 +239,17 @@ impl FieldTiles {
             for &(tx, ty) in &wanted {
                 self.get((at, tx, ty));
             }
-            let jobs: Vec<Job> = wanted
+            let jobs: Vec<(TileKey, Job)> = wanted
                 .into_iter()
                 .filter(|&(tx, ty)| !self.tiles.contains_key(&(at, tx, ty)))
-                .map(|(tx, ty)| Job {
-                    key: (at, tx, ty),
-                    path: dir.join(entry.tile_file(usize::from(tx), usize::from(ty))),
-                    side,
+                .map(|(tx, ty)| {
+                    let path = dir.join(entry.tile_file(usize::from(tx), usize::from(ty)));
+                    ((at, tx, ty), Job { path, side })
                 })
                 .collect();
             if !self.started && !jobs.is_empty() {
                 self.started = true;
-                self.reader = Reader::start();
+                self.reader = start_reader();
             }
             if let Some(reader) = &mut self.reader {
                 reader.ask(jobs);
@@ -328,8 +327,8 @@ impl FieldTiles {
         let Some(reader) = &mut self.reader else { return 0 };
         let read = reader.take();
         let count = read.len() as u32;
-        for (key, read_side, art) in read {
-            if read_side == side && !self.tiles.contains_key(&key) && self.wanted.contains(&key) {
+        for (key, job, art) in read {
+            if job.side == side && !self.tiles.contains_key(&key) && self.wanted.contains(&key) {
                 self.insert(key, art, self.room_left(budget, tile_bytes));
             }
         }
@@ -386,113 +385,24 @@ fn ahead(
     tiles.into_iter().map(|(_, y, x)| (x as u16, y as u16)).collect()
 }
 
-/// A tile to read: which, its file and the side it is read at.
+/// A tile to read: its file and the side it is read at.
 struct Job {
-    key: TileKey,
     path: PathBuf,
     side: usize,
 }
 
-/// What the drawing and the reading threads share: the tiles to read, in order, the tiles read
-/// and not taken yet, and whether the reader is gone.
-#[derive(Default)]
-struct Shared {
-    jobs: VecDeque<Job>,
-    read: Vec<(TileKey, usize, Option<Arc<Image>>)>,
-    closed: bool,
+/// A thread that reads tiles of the field maps' art ahead of the frames (see [`FieldTiles`]): a
+/// tile, the side it was read at and its art come back.
+type Reader = super::reader::Reader<TileKey, Job, Option<Arc<Image>>>;
+
+/// The reader, its thread started; `None` when the thread cannot be.
+fn start_reader() -> Option<Reader> {
+    start_reader_with(read_tile)
 }
 
-/// A thread that reads tiles of the field maps' art ahead of the frames (see [`FieldTiles`]); it
-/// ends when this is dropped.
-struct Reader {
-    shared: Arc<(Mutex<Shared>, Condvar)>,
-    /// The tiles asked for that have not come back.
-    asked: FxHashSet<TileKey>,
-    /// The thread: once it has ended while the reader is there, it panicked.
-    worker: std::thread::JoinHandle<()>,
-}
-
-impl Reader {
-    /// The reader, its thread started; `None` when the thread cannot be.
-    fn start() -> Option<Self> {
-        Self::start_with(read_tile)
-    }
-
-    /// [`Reader::start`], the tiles read with `read`.
-    fn start_with(read: fn(&Path, usize) -> Option<Arc<Image>>) -> Option<Self> {
-        let shared = Arc::new((Mutex::new(Shared::default()), Condvar::new()));
-        let theirs = Arc::clone(&shared);
-        let worker = std::thread::Builder::new()
-            .name("hd-field-tiles".to_owned())
-            .spawn(move || {
-                while let Some(job) = next_job(&theirs) {
-                    let art = read(&job.path, job.side);
-                    let Ok(mut shared) = theirs.0.lock() else { return };
-                    shared.read.push((job.key, job.side, art));
-                }
-            })
-            .ok()?;
-        Some(Self { shared, asked: FxHashSet::default(), worker })
-    }
-
-    /// Whether the thread still runs (it only ends on its own by a panic).
-    fn alive(&self) -> bool {
-        !self.worker.is_finished()
-    }
-
-    /// Asks for `jobs`, in order, in place of the tiles asked for before that the thread has not
-    /// started reading.
-    fn ask(&mut self, jobs: Vec<Job>) {
-        let (lock, wake) = &*self.shared;
-        let Ok(mut shared) = lock.lock() else { return };
-        for job in shared.jobs.drain(..) {
-            self.asked.remove(&job.key);
-        }
-        for job in jobs {
-            if self.asked.insert(job.key) {
-                shared.jobs.push_back(job);
-            }
-        }
-        if !shared.jobs.is_empty() {
-            wake.notify_one();
-        }
-    }
-
-    /// The tiles read since the last call: the tile, the side it was read at and its art.
-    fn take(&mut self) -> Vec<(TileKey, usize, Option<Arc<Image>>)> {
-        let Ok(mut shared) = self.shared.0.lock() else { return Vec::new() };
-        let read = std::mem::take(&mut shared.read);
-        for (key, _, _) in &read {
-            self.asked.remove(key);
-        }
-        read
-    }
-}
-
-impl Drop for Reader {
-    fn drop(&mut self) {
-        let (lock, wake) = &*self.shared;
-        if let Ok(mut shared) = lock.lock() {
-            shared.closed = true;
-            shared.jobs.clear();
-        }
-        wake.notify_all();
-    }
-}
-
-/// The next tile the reading thread reads, waiting for one; `None` once the reader is gone.
-fn next_job(shared: &(Mutex<Shared>, Condvar)) -> Option<Job> {
-    let (lock, wake) = shared;
-    let mut shared = lock.lock().ok()?;
-    loop {
-        if shared.closed {
-            return None;
-        }
-        if let Some(job) = shared.jobs.pop_front() {
-            return Some(job);
-        }
-        shared = wake.wait(shared).ok()?;
-    }
+/// [`start_reader`], the tiles read with `read`.
+fn start_reader_with(read: fn(&Path, usize) -> Option<Arc<Image>>) -> Option<Reader> {
+    Reader::start("hd-field-tiles", move |job: &Job| read(&job.path, job.side))
 }
 
 #[cfg(test)]
@@ -815,19 +725,17 @@ mod tests {
         let entry = layer(dir.path());
         // At 1x (resized) and at 4x (the file's own size, not resized)
         for side in [mapart::TILE, mapart::TILE * mapart::SCALE] {
-            let mut reader = Reader::start().unwrap();
+            let mut reader = start_reader().unwrap();
             let path = dir.path().join(entry.tile_file(2, 1));
-            reader.ask(vec![Job { key: (0, 2, 1), path: path.clone(), side }]);
+            reader.ask(vec![((0, 2, 1), Job { path: path.clone(), side })]);
             let started = Instant::now();
             let mut read = Vec::new();
             while read.is_empty() && started.elapsed() < Duration::from_secs(30) {
                 std::thread::sleep(Duration::from_millis(5));
                 read = reader.take();
             }
-            let [(key, read_side, Some(ahead))] = read.as_slice() else {
-                panic!("one tile read ahead")
-            };
-            assert_eq!((*key, *read_side), ((0, 2, 1), side));
+            let [(key, job, Some(ahead))] = read.as_slice() else { panic!("one tile read ahead") };
+            assert_eq!((*key, job.side), ((0, 2, 1), side));
             let here = read_tile(&path, side).unwrap();
             let before = read_as_before(&path, side);
             assert_eq!((ahead.width, ahead.height), (side, side));
@@ -845,7 +753,7 @@ mod tests {
         let budget = 4 * tile_bytes;
         let view = BTreeSet::from([(0, 0), (1, 0), (0, 1), (1, 1)]);
         // A tile an older frame asked for, still being read: out of this view's reach
-        let mut reader = Reader::start().unwrap();
+        let mut reader = start_reader().unwrap();
         reader.asked.insert((0, 2, 2));
         let mut cache = FieldTiles { reader: Some(reader), started: true, ..FieldTiles::default() };
         let (shown, read, _) =
@@ -866,11 +774,8 @@ mod tests {
         let dir = tempfile::tempdir().unwrap();
         let entry = layer(dir.path());
         let side = mapart::TILE;
-        let mut cache = FieldTiles {
-            reader: Reader::start_with(fails),
-            started: true,
-            ..FieldTiles::default()
-        };
+        let mut cache =
+            FieldTiles { reader: start_reader_with(fails), started: true, ..FieldTiles::default() };
         let view = BTreeSet::from([(0, 0)]);
         // The ring is asked for; the thread panics on the first tile
         cache.tiles(dir.path(), &entry, 0, &view, [10, 10, 200, 200], side, TILE_BUDGET);
@@ -917,12 +822,11 @@ mod tests {
         let (side, tile_bytes) = (mapart::TILE, mapart::TILE * mapart::TILE * 4);
         let budget = 4 * tile_bytes;
         // (2, 2) was asked for by an older frame, (1, 1) is still wanted: both come back
-        let mut reader = Reader::start().unwrap();
+        let mut reader = start_reader().unwrap();
         reader.asked.extend([(0, 2, 2), (0, 1, 1)]);
-        if let Ok(mut shared) = reader.shared.0.lock() {
-            shared.read.push(((0, 2, 2), side, Some(art(tile_bytes))));
-            shared.read.push(((0, 1, 1), side, Some(art(tile_bytes))));
-        }
+        let job = || Job { path: PathBuf::new(), side };
+        reader.put_read((0, 2, 2), job(), Some(art(tile_bytes)));
+        reader.put_read((0, 1, 1), job(), Some(art(tile_bytes)));
         let mut cache = FieldTiles {
             reader: Some(reader),
             started: true,

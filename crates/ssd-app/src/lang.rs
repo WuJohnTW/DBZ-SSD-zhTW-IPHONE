@@ -8,7 +8,9 @@
 //! the executable, and a font in a `fonts` folder there. Every `<code>.tsv` there that is a translation is a language
 //! the player is offered (`zh-hk.tsv` is Traditional Chinese for Hong Kong, as it always was), named by the file's
 //! `#name` line and drawn with the font its `#font` line names first ([`ssd_catalogue::translation::Header`]).
-//! Without a translation, or for a key it lacks, the text stays English; a missing file is said once in the log.
+//! Before the player chooses (and without `--lang`), the language is the first translation of the first launch's
+//! Language page, on every platform ([`interface`]). Without a translation, or for a key it lacks, the text stays
+//! English; a missing file is said once in the log.
 
 use crate::paths;
 use ssd_catalogue::translation::{Header, Translation};
@@ -19,6 +21,19 @@ use ssd_menus::options::Values;
 use ssd_menus::ui_text::UiText;
 use std::path::{Path, PathBuf};
 use std::sync::{Arc, Mutex};
+
+/// The files of the translations the Android APK brings, which `android.rs` installs into the data folder: each
+/// language's two tables, packed from `translations/<code>/`, and the font they share, from `translations/zh-tw/fonts`
+/// (`android/app/build.gradle`). Here, not in `android.rs`, so that the desktop's tests check it.
+#[cfg_attr(not(target_os = "android"), allow(dead_code))]
+pub(crate) const APK_TRANSLATION_FILES: &[&str] = &[
+    "zh-tw.tsv",
+    "ui-zh-tw.tsv",
+    "zh-hk.tsv",
+    "ui-zh-hk.tsv",
+    "fonts/LXGWWenKaiTC-Regular.ttf",
+    "fonts/OFL.txt",
+];
 
 /// The language `--lang` gave, which wins over the PC file for the run.
 static OVERRIDE: Mutex<Option<Language>> = Mutex::new(None);
@@ -80,9 +95,54 @@ pub fn overridden() -> Option<Language> {
     *OVERRIDE.lock().unwrap_or_else(std::sync::PoisonError::into_inner)
 }
 
-/// The language of a run whose PC file holds `values`: the command line's, else the file's, else English.
+/// The language of a run whose PC file holds `values` (the game's text and the HD menus): the command line's, else
+/// the file's; before any is chosen, the first translation of the first launch's Language page, so that the page and
+/// its font are those of a translation the player has; English without one ([`interface_in`]).
 pub fn effective(values: &Values) -> Language {
-    overridden().or_else(|| Language::from_values(values)).unwrap_or_default()
+    effective_in(values, &offered())
+}
+
+/// [`effective`] with the translations offered given.
+fn effective_in(values: &Values, offered: &[Locale]) -> Language {
+    interface_in(overridden(), Language::from_values(values), offered)
+}
+
+/// The language a run takes at once when its PC file comes to hold `values` (the Options changed a row): the stored
+/// one, which wins over `--lang` from then on; with none (the Language row reset) the one a run starts in
+/// ([`effective`]: `--lang`, else the first translation, English without one), as the next start does before it asks.
+/// Nothing is written: the file keeps no language, and the next start asks.
+pub fn followed(values: &Values) -> Language {
+    followed_in(values, &offered())
+}
+
+/// [`followed`] with the translations offered given.
+fn followed_in(values: &Values, offered: &[Locale]) -> Language {
+    Language::from_values(values).unwrap_or_else(|| effective_in(values, offered))
+}
+
+/// The language of the app's own words around the game (the touch controls, the first launch's screens) where the PC
+/// file holds `values`: the command line's, else the file's; before any is chosen, the first translation of the first
+/// launch's Language page, English without one ([`interface_in`]); the same as [`effective`].
+pub fn interface(values: &Values) -> Language {
+    interface_in(overridden(), Language::from_values(values), &offered())
+}
+
+/// [`interface`] from its parts: the command line's language, the PC file's, and the translations offered. Before a
+/// choice, the first translation of the first launch's Language page ([`ssd_menus::setup::language_before_a_choice`]:
+/// Traditional Chinese (Taiwan) where it is offered, else the first by code), on every platform; English where the
+/// player has no translation (as upstream). The Options' Language row shows the same while nothing is stored.
+fn interface_in(
+    command_line: Option<Language>,
+    saved: Option<Language>,
+    offered: &[Locale],
+) -> Language {
+    command_line.or(saved).unwrap_or_else(|| ssd_menus::setup::language_before_a_choice(offered))
+}
+
+/// The words of the app's own screens in [`interface`]'s language: the HD menus' table ([`ui_text`]); `None` for
+/// English.
+pub fn interface_text(values: &Values) -> Option<Arc<UiText>> {
+    ui_text(interface(values))
 }
 
 /// The folders the player's files of the translation are looked for in, in order: the data folder, then the
@@ -314,12 +374,13 @@ fn read_font(path: &Path) -> Option<Arc<[u8]>> {
     }
 }
 
-/// The bytes of the font of the language the run starts in (the command line's, else the PC file's; see
-/// [`font_of`]), read on first use; `None` when there is none (said once in the log). The HD menus take it as a
-/// fallback of their font for the run, and the languages' names are drawn with it.
+/// The bytes of the font of the language the run starts in (the command line's, else the PC file's, before any is
+/// chosen the app's own screens' ([`interface`]); see [`font_of`]), read on first use; `None` when there is none (said
+/// once in the log). The HD menus take it as a fallback of their font for the run, and the languages' names are drawn
+/// with it.
 pub fn cjk_font() -> Option<Arc<[u8]>> {
     looked_up(&FONT, || {
-        let language = effective(&crate::options::read_settings().unwrap_or_default());
+        let language = interface(&crate::options::read_settings().unwrap_or_default());
         let Some(path) = font_of(&places(), language) else {
             log::info!(
                 "no fonts/NotoSansHK-*.otf (or the font a translation names) in the data folder: no translation \
@@ -375,11 +436,32 @@ mod tests {
         let _guard = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
         configure(None);
         let mut values = Values::new();
-        assert_eq!(effective(&values), Language::ENGLISH);
+        // no translation offered (given, not the data folder's): English
+        assert_eq!(effective_in(&values, &[]), Language::ENGLISH);
         Language::ZH_HK.store(&mut values);
         assert_eq!(effective(&values), Language::ZH_HK);
         configure(Some(Language::ENGLISH));
         assert_eq!(effective(&values), Language::ENGLISH);
+        configure(None);
+    }
+
+    #[test]
+    fn the_game_starts_in_the_first_translation_until_one_is_chosen_on_every_platform() {
+        let _guard = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        configure(None);
+        let zh = Language::from_code("zh-tw").unwrap();
+        let offered = [Locale::unnamed(zh)];
+        let mut values = Values::new();
+        assert_eq!(effective_in(&values, &offered), zh, "nothing chosen yet");
+        assert_eq!(effective_in(&values, &[]), Language::ENGLISH, "no translation: as upstream");
+        Language::ENGLISH.store(&mut values);
+        assert_eq!(
+            effective_in(&values, &offered),
+            Language::ENGLISH,
+            "a saved choice wins (the Language row changes it later)"
+        );
+        configure(Some(Language::ZH_HK));
+        assert_eq!(effective_in(&Values::new(), &offered), Language::ZH_HK, "--lang first");
         configure(None);
     }
 
@@ -460,6 +542,195 @@ mod tests {
         let codes: Vec<&str> =
             offered_in(&places).iter().map(|locale| locale.language.code()).collect();
         assert_eq!(codes, ["xx", "zh-hk"]);
+    }
+
+    #[test]
+    fn the_app_screens_language_is_the_chosen_one_else_the_first_translation() {
+        let zh = Language::from_code("zh-tw").unwrap();
+        let xx = Language::from_code("xx").unwrap();
+        let offered = [Locale::unnamed(zh)];
+        let english = Some(Language::ENGLISH);
+        assert_eq!(interface_in(Some(xx), Some(zh), &offered), xx, "the command line first");
+        assert_eq!(interface_in(None, english, &offered), Language::ENGLISH, "a saved choice wins");
+        assert_eq!(interface_in(None, None, &offered), zh, "nothing chosen yet");
+        assert_eq!(interface_in(None, None, &[]), Language::ENGLISH, "no translation");
+    }
+
+    #[test]
+    fn before_a_choice_android_words_are_taiwan_when_both_are_there() {
+        let taiwan = Language::from_code("zh-tw").unwrap();
+        let offered = [Locale::unnamed(Language::ZH_HK), Locale::unnamed(taiwan)];
+        assert_eq!(interface_in(None, None, &offered), taiwan, "the page's first button");
+        assert_eq!(effective_in(&Values::new(), &offered), taiwan, "the game's text as well");
+        assert_eq!(
+            interface_in(None, Some(Language::ZH_HK), &offered),
+            Language::ZH_HK,
+            "a chosen Hong Kong"
+        );
+    }
+
+    #[test]
+    fn before_a_choice_android_takes_the_only_translation() {
+        let offered = [Locale::unnamed(Language::ZH_HK)];
+        assert_eq!(interface_in(None, None, &offered), Language::ZH_HK);
+    }
+
+    #[test]
+    fn before_a_choice_the_desktop_too_takes_the_first_of_the_page_and_english_without_one() {
+        let taiwan = Language::from_code("zh-tw").unwrap();
+        let xx = Language::from_code("xx").unwrap();
+        let offered = [Locale::unnamed(Language::ZH_HK), Locale::unnamed(taiwan)];
+        assert_eq!(interface_in(None, None, &offered), taiwan, "Taiwan first");
+        assert_eq!(
+            interface_in(None, None, &[Locale::unnamed(Language::ZH_HK), Locale::unnamed(xx)]),
+            xx,
+            "without Taiwan: the first by code"
+        );
+        assert_eq!(interface_in(None, None, &[]), Language::ENGLISH, "no translation: as upstream");
+        assert_eq!(interface_in(Some(Language::ZH_HK), None, &offered), Language::ZH_HK, "--lang");
+        assert_eq!(
+            interface_in(None, Some(Language::ENGLISH), &offered),
+            Language::ENGLISH,
+            "saved"
+        );
+        assert_eq!(
+            effective_in(&Values::new(), &[]),
+            Language::ENGLISH,
+            "the game's text, no table"
+        );
+    }
+
+    #[test]
+    fn after_a_reset_the_language_row_shows_the_language_the_game_takes_before_a_choice() {
+        use ssd_menus::cheats::Cheats;
+        use ssd_menus::options::Category;
+        let _guard = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        configure(None);
+        let taiwan = Language::from_code("zh-tw").unwrap();
+        let shown_after_a_reset = |offered: &[Locale]| {
+            ssd_menus::options::offer_languages(offered.to_vec());
+            let row = Category::Accessibility
+                .rows()
+                .iter()
+                .find(|row| row.key == Language::KEY)
+                .expect("the Language row");
+            let (mut values, mut cheats) = (Values::new(), Cheats::neutral());
+            Language::ZH_HK.store(&mut values);
+            row.reset(&mut values, &mut cheats);
+            assert_eq!(Language::from_values(&values), None, "no access.language left");
+            let index = row.index(&values, &cheats, 0);
+            let shown = ssd_menus::options::offered_languages()[index].language;
+            (shown, effective_in(&values, offered))
+        };
+        let (shown, in_use) =
+            shown_after_a_reset(&[Locale::unnamed(Language::ZH_HK), Locale::unnamed(taiwan)]);
+        assert_eq!(shown, in_use, "the row shows the language in use");
+        assert_eq!(shown, taiwan);
+        let (shown, in_use) = shown_after_a_reset(&[Locale::unnamed(Language::ZH_HK)]);
+        assert_eq!((shown, in_use), (Language::ZH_HK, Language::ZH_HK), "Hong Kong alone");
+        ssd_menus::options::offer_languages(Vec::new());
+        configure(None);
+    }
+
+    /// The PC file's `values` once the Options' Language row, with `offered` given to the Options, is reset from
+    /// `stored`.
+    fn reset_from(stored: Language, offered: &[Locale]) -> Values {
+        use ssd_menus::cheats::Cheats;
+        use ssd_menus::options::Category;
+        ssd_menus::options::offer_languages(offered.to_vec());
+        let mut values = Values::new();
+        stored.store(&mut values);
+        if let Some(row) =
+            Category::Accessibility.rows().iter().find(|row| row.key == Language::KEY)
+        {
+            row.reset(&mut values, &mut Cheats::neutral());
+        } else {
+            values.remove(Language::KEY);
+        }
+        ssd_menus::options::offer_languages(Vec::new());
+        values
+    }
+
+    #[test]
+    fn a_reset_language_row_follows_the_language_a_run_starts_in() {
+        let _guard = LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        configure(None);
+        let taiwan = Language::from_code("zh-tw").unwrap();
+        let both = [Locale::unnamed(Language::ZH_HK), Locale::unnamed(taiwan)];
+        let values = reset_from(Language::ZH_HK, &both);
+        assert_eq!(Language::from_values(&values), None, "nothing stored: the next start asks");
+        assert_eq!(followed_in(&values, &both), taiwan, "Taiwan at once, as at the next start");
+        assert_eq!(followed_in(&values, &both), effective_in(&values, &both));
+        let values = reset_from(Language::ZH_HK, &[]);
+        assert_eq!(followed_in(&values, &[]), Language::ENGLISH, "no translation: English");
+        let mut kept = Values::new();
+        Language::ZH_HK.store(&mut kept);
+        assert_eq!(followed_in(&kept, &both), Language::ZH_HK, "a stored choice: unchanged");
+        let mut gone = Values::new();
+        Language::from_code("xx").unwrap().store(&mut gone);
+        assert_eq!(
+            followed_in(&gone, &both).code(),
+            "xx",
+            "a stored language whose files are gone: as before (its text stays English)"
+        );
+        configure(Some(Language::ZH_HK));
+        let values = reset_from(taiwan, &both);
+        assert_eq!(followed_in(&values, &both), Language::ZH_HK, "--lang: as effective");
+        assert_eq!(followed_in(&values, &both), effective_in(&values, &both));
+        let mut chosen = Values::new();
+        taiwan.store(&mut chosen);
+        assert_eq!(followed_in(&chosen, &both), taiwan, "a choice in the Options wins over --lang");
+        configure(None);
+    }
+
+    #[test]
+    fn before_a_choice_the_page_has_the_font_the_first_translation_names() {
+        // The desktop's folder as the launcher fills it: both tables naming LXGWWenKaiTC, that font alone.
+        let dir = tempfile::tempdir().unwrap();
+        let places = [dir.path().to_path_buf()];
+        let header = |name: &str| format!("#name\t{name}\n#font\tLXGWWenKaiTC\n");
+        std::fs::write(dir.path().join("zh-tw.tsv"), made_up(&header("繁體中文（台灣）"))).unwrap();
+        std::fs::write(dir.path().join("zh-hk.tsv"), made_up(&header("繁體中文（香港）"))).unwrap();
+        let fonts = dir.path().join("fonts");
+        std::fs::create_dir(&fonts).unwrap();
+        std::fs::write(fonts.join("LXGWWenKaiTC-Regular.ttf"), b"x").unwrap();
+        // The steps of `cjk_font`: the language before a choice, then its font.
+        let language = interface_in(None, None, &offered_in(&places));
+        assert_eq!(language.code(), "zh-tw");
+        assert_eq!(font_of(&places, language), Some(fonts.join("LXGWWenKaiTC-Regular.ttf")));
+        assert_eq!(
+            font_of(&places, Language::ENGLISH),
+            None,
+            "English names no font: none is found"
+        );
+    }
+
+    #[test]
+    fn each_translation_brings_both_of_its_tables() {
+        // The tables: the files beside the fonts.
+        let tables: Vec<&str> = APK_TRANSLATION_FILES
+            .iter()
+            .copied()
+            .filter(|name| !name.starts_with("fonts/"))
+            .collect();
+        for name in &tables {
+            let other = match name.strip_prefix("ui-") {
+                Some(game) => game.to_owned(),
+                None => format!("ui-{name}"),
+            };
+            assert!(name.strip_suffix(".tsv").is_some(), "{name} is a table");
+            assert!(tables.contains(&other.as_str()), "{name} without {other}");
+        }
+        for name in ["zh-tw.tsv", "ui-zh-tw.tsv", "zh-hk.tsv", "ui-zh-hk.tsv"] {
+            assert!(tables.contains(&name), "{name} is brought");
+        }
+        // Each file is in a folder `android/app/build.gradle` packs as the APK's assets.
+        let translations = Path::new(env!("CARGO_MANIFEST_DIR")).join("../../translations");
+        for name in APK_TRANSLATION_FILES {
+            let found =
+                ["zh-tw", "zh-hk"].iter().any(|dir| translations.join(dir).join(name).is_file());
+            assert!(found, "{name} is in translations/zh-tw or translations/zh-hk");
+        }
     }
 
     #[test]

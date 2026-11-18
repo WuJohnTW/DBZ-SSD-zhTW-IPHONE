@@ -84,6 +84,8 @@ impl Style {
             .collect();
         let sizes = if self.large_text { text_sizes(ops, &windows) } else { Vec::new() };
         let mut out = DrawList::new();
+        // Where each text run of `list` is in `out`, for the marks of the runs drawn as one text (DrawList::keep_marks).
+        let mut moved: Vec<Option<usize>> = vec![None; ops.len()];
         // The fills turned black by high contrast: a text on one of them is white.
         let mut dark: Vec<Rect> = Vec::new();
         for (index, op) in ops.iter().enumerate() {
@@ -111,6 +113,7 @@ impl Style {
                             color = palette::WHITE;
                         }
                     }
+                    moved[index] = Some(out.ops().len());
                     out.push(Op::Text {
                         x: *x,
                         y: *y,
@@ -132,6 +135,7 @@ impl Style {
                 other => out.push(other.clone()),
             }
         }
+        out.keep_marks(&list, &moved);
         out
     }
 }

@@ -1,5 +1,10 @@
 # Contributing
 
+> **繁中說明**：本 repo 是《七龍珠Z 超賽亞傳說》Rust 重製版的繁體中文（台灣）版 fork，不是上游專案本身。
+> 翻譯、譯名或繁中版（語言包、啟動器、安裝程式）的問題，回報方式照 [README.md](README.md)「已知問題」最後一項（附 `last-run.log`、F12 截圖與發生的位置）。
+> 遊戲程式本身的修正與功能，請到上游 [JackRushante/DBZ-Super-Saiya-Densetsu-Rust](https://github.com/JackRushante/DBZ-Super-Saiya-Densetsu-Rust) 貢獻。
+> 以下是上游的英文原文，保留不改。
+
 Thanks for looking. The project is a Rust rewrite of a 1992 game, and the one rule that matters more
 than any other is: **nothing from the game goes into this repository.** Not graphics, not text, not
 tables, not disassembly, not screenshots of the original, not a save, not a replay. The game is read

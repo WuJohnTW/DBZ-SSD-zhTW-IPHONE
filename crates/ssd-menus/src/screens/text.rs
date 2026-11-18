@@ -186,13 +186,19 @@ fn preview(list: &mut DrawList, view: TextView) {
     let rest: String = chars[written..].iter().collect();
     let advance = NUMBER_TEXT * ADVANCE;
     let x = box_.x + 20.0;
+    let done_run = list.ops().len();
     list.text(x, 406.0, &done, NUMBER_TEXT, palette::BLACK, Align::Left);
     // The mark and the line still to come start after the last visible character: a space is not one.
     let end = x + done.trim_end().chars().count() as f32 * advance;
+    let marks = list.ops().len();
     down_mark(list, end + 11.0, 406.0);
-    if !rest.is_empty() {
+    let marks = marks..list.ops().len();
+    let rest_run = (!rest.is_empty()).then(|| {
         list.text(end + 22.0, 406.0, rest.trim_start(), NUMBER_TEXT, UNWRITTEN, Align::Left);
-    }
+        list.ops().len() - 1
+    });
+    // A translation of the line is typed as the English is
+    list.mark_typed(SAMPLE, written, done_run, rest_run, marks);
     list.text(
         LEFT,
         464.0,
@@ -228,6 +234,64 @@ fn down_mark(list: &mut DrawList, x: f32, y: f32) {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn a_translated_preview_is_typed_as_the_english_is() {
+        let zh = "悟空：龍珠就在附近了。走吧！";
+        let translate = |text: &str| (text == SAMPLE).then(|| zh.to_owned());
+        let runs = |list: &DrawList| -> Vec<(f32, String)> {
+            list.ops()
+                .iter()
+                .filter_map(|op| match op {
+                    Op::Text { x, y, text, .. } if (*y - 406.0).abs() < 0.5 => {
+                        Some((*x, text.clone()))
+                    }
+                    _ => None,
+                })
+                .collect()
+        };
+        let mark_left = |list: &DrawList| {
+            list.ops()
+                .iter()
+                .filter_map(|op| match op {
+                    Op::Fill { rect, color }
+                        if *color == palette::DARK_RED && (396.0..=408.0).contains(&rect.y) =>
+                    {
+                        Some(rect.x)
+                    }
+                    _ => None,
+                })
+                .fold(f32::MAX, f32::min)
+        };
+        let english = |frames| text_screen(&TextView { speed: 2, frames });
+        // Half of the English written: half of the translation, the mark after its last character, the rest after it
+        let half = SAMPLE.chars().count() / 2;
+        let mut list = english(half as u32);
+        let before = list.clone();
+        list.map_text(translate);
+        let typed = runs(&list);
+        let written: String = zh.chars().take(7).collect();
+        let still: String = zh.chars().skip(7).collect();
+        assert_eq!(
+            typed.iter().map(|(_, t)| t.clone()).collect::<Vec<_>>(),
+            [written.clone(), still]
+        );
+        let x = typed[0].0;
+        let end = x + written.chars().count() as f32 * NUMBER_TEXT;
+        assert!((typed[1].0 - (end + 22.0)).abs() < 0.01, "the rest after the written characters");
+        assert!((mark_left(&list) - (end + 11.0 - 9.0)).abs() < 0.01, "the mark after them");
+        // Nothing written yet, and all of it: nothing of the English is left
+        for frames in [0, 200] {
+            let mut list = english(frames);
+            list.map_text(translate);
+            let shown: String = runs(&list).iter().map(|(_, t)| t.as_str()).collect();
+            assert_eq!(shown, zh);
+        }
+        // Without a translation the preview is drawn as before
+        let mut kept = before.clone();
+        kept.map_text(|_| None);
+        assert_eq!(kept.ops(), before.ops());
+    }
 
     fn texts(list: &DrawList) -> Vec<String> {
         list.texts().map(|(_, _, text)| text.to_owned()).collect()

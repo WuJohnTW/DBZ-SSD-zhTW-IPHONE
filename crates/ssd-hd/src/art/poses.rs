@@ -351,6 +351,14 @@ pub(crate) fn region_digest(sprites: &[Sprite], org: (i32, i32), w: usize, h: us
     total
 }
 
+/// The key of a fighter's pose whose trimmed palette-index array is `arr`, `w` x `h` (0 transparent, row by row): the key
+/// the capture gives such a pose. `None` when the box is not 1 to 255 pixels each way or `arr` is not `w` x `h`.
+pub(crate) fn fighter_key(arr: &[u8], w: usize, h: usize) -> Option<u64> {
+    let size = |n: usize| u8::try_from(n).ok().filter(|&n| n != 0);
+    let (w8, h8) = (size(w)?, size(h)?);
+    (arr.len() == w * h).then(|| digest(arr, [h8, w8]))
+}
+
 fn digest(data: &[u8], tail: [u8; 2]) -> u64 {
     let mut hash = Sha1::new();
     hash.update(data);

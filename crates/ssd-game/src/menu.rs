@@ -63,8 +63,11 @@ const ITEMS_DROP_STEP: u8 = 6;
 /// `field_state` while a menu is opening, and once it is open.
 const STATE_OPENING: u8 = 0x0F;
 const STATE_OPEN: u8 = 1;
-/// `travel_mode` while the party flies (1 is walking).
-const TRAVEL_FLYING: u8 = 2;
+/// The low nibble of `gate_flag_01bc` while the party flies: the test of the original's command screen (`01:8914`:
+/// `$01BC` AND `$0F` = 1 picks the flying window). `travel_mode` is no such test: it is the leader's X step, 2 in a
+/// flight and 4 while the flight is powered up (X, `01:80DA`), with the flying window all the same.
+const FLAGS_FLYING: u8 = 0x01;
+const FLAGS_MODE: u8 = 0x0F;
 /// `game_mode` of a town or an interior (`$24`; `docs/re/data/menus.md`).
 const TOWN_MODE: u8 = 0x01;
 /// `game_mode` of the field, a chapter map walked or flown (`$24`).
@@ -265,10 +268,11 @@ impl<'a> MenuProbe<'a> {
         self.party().len()
     }
 
-    /// Whether the party flies (`travel_mode`).
+    /// Whether the party flies, as the original's command screen tells it (`gate_flag_01bc`, see [`FLAGS_FLYING`]):
+    /// also while the flight is powered up.
     #[must_use]
     pub fn flying(&self) -> bool {
-        self.byte(d::TRAVEL_MODE) == Some(TRAVEL_FLYING)
+        self.byte(d::GATE_FLAG_01BC).is_some_and(|flags| flags & FLAGS_MODE == FLAGS_FLYING)
     }
 
     /// Whether the party is in a town or an interior: `game_mode` says so before the menu opens,
@@ -680,8 +684,18 @@ mod tests {
             (view.screen, view.town, view.flying, view.selected),
             (Screen::Command, false, false, None)
         );
-        set(&mut ram, d::TRAVEL_MODE, TRAVEL_FLYING);
+        // The flags of a flight (`$A1`) and of a powered-up flight (`$E1`, its X step 4): the flying window both
+        set(&mut ram, d::GATE_FLAG_01BC, 0xA1);
+        set(&mut ram, d::TRAVEL_MODE, 2);
         assert!(MenuProbe::new(&ram, &labels).view().unwrap().flying);
+        set(&mut ram, d::GATE_FLAG_01BC, 0xE1);
+        set(&mut ram, d::TRAVEL_MODE, 4);
+        assert!(MenuProbe::new(&ram, &labels).view().unwrap().flying, "a powered-up flight flies");
+        // On foot (`$82`, its X step 1)
+        set(&mut ram, d::GATE_FLAG_01BC, 0x82);
+        set(&mut ram, d::TRAVEL_MODE, 1);
+        assert!(!MenuProbe::new(&ram, &labels).view().unwrap().flying, "on foot");
+        set(&mut ram, d::GATE_FLAG_01BC, 0xA1);
         set(&mut ram, d::MENU_SCREEN, SCREEN_TOWN);
         let view = MenuProbe::new(&ram, &labels).view().unwrap();
         assert!(view.town && !view.flying, "a town has no flying");

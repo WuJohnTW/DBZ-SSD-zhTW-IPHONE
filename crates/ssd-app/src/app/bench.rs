@@ -198,6 +198,8 @@ fn run_one(
     let mut machine = new_machine(rom.to_vec(), hooks, &mut session)?;
     let mut state =
         WindowState::new(Controls::new(HooksArg::Original, HooksSwitch::Allowed, false, false));
+    // The bench times the window as it was measured before the debug switch: the pill drawn when the panel is closed.
+    state.controls.debug = true;
     state.controls.speed = Speed::ALL
         .into_iter()
         .find(|s| s.multiplier() == speed)

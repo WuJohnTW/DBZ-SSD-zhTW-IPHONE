@@ -10,7 +10,7 @@ use crate::{Fate, HdOptions, ItemKey, Look, Renderer, SpriteLine, TallyLayer};
 use ssd_oracle::{FrameLog, LineEntry, LineRegs};
 use std::sync::Arc;
 
-fn regs() -> LineRegs {
+pub(super) fn regs() -> LineRegs {
     LineRegs {
         brightness: 15,
         bg_mode: 1,
@@ -23,7 +23,7 @@ fn regs() -> LineRegs {
 }
 
 /// A frame of 224 lines with the object sprites evaluated and rebuilt on every line.
-fn log(regs: LineRegs) -> FrameLog {
+pub(super) fn log(regs: LineRegs) -> FrameLog {
     let entries = (1..=224_u16)
         .map(|scanline| LineEntry {
             scanline,
@@ -54,7 +54,12 @@ fn log(regs: LineRegs) -> FrameLog {
 
 /// A solid 4x PNG of `width` x `height` art pixels in `rgba`, with a different colour in the
 /// cell of each 32 x 32 block when `cells` (red grows with the cell number).
-fn write_png(path: &std::path::Path, width: u32, height: u32, rgba: impl Fn(u32, u32) -> [u8; 4]) {
+pub(super) fn write_png(
+    path: &std::path::Path,
+    width: u32,
+    height: u32,
+    rgba: impl Fn(u32, u32) -> [u8; 4],
+) {
     let mut data = Vec::new();
     for y in 0..height {
         for x in 0..width {
@@ -65,7 +70,7 @@ fn write_png(path: &std::path::Path, width: u32, height: u32, rgba: impl Fn(u32,
     crate::png::write_rgba(path, width, height, &data).unwrap();
 }
 
-fn pack_of(dir: &std::path::Path, assets: Vec<Asset>, art: ArtIndex) -> Arc<Pack> {
+pub(super) fn pack_of(dir: &std::path::Path, assets: Vec<Asset>, art: ArtIndex) -> Arc<Pack> {
     let index = Index::new(assets);
     let manifest = Manifest {
         format: crate::pack::FORMAT,
@@ -94,11 +99,11 @@ fn character() -> [u16; 16] {
     chars
 }
 
-fn options(scale: u32) -> HdOptions {
+pub(super) fn options(scale: u32) -> HdOptions {
     HdOptions { scale, look: Look::Crisp }
 }
 
-fn pixel(frame: &crate::HdFrame, x: usize, y: usize) -> [u8; 3] {
+pub(super) fn pixel(frame: &crate::HdFrame, x: usize, y: usize) -> [u8; 3] {
     let at = (y * frame.width as usize + x) * 4;
     [frame.rgba[at], frame.rgba[at + 1], frame.rgba[at + 2]]
 }
@@ -210,7 +215,7 @@ fn a_picture_chosen_by_palette_when_two_cover_the_same_characters() {
 }
 
 /// A fighter of one 16 x 16 sprite with palette 1, solid colour 2 (green), at `(x, y)`.
-fn fighter_log(x: u8, y: u8) -> (FrameLog, Pose) {
+pub(super) fn fighter_log(x: u8, y: u8) -> (FrameLog, Pose) {
     let mut log = log(regs());
     // Sprite 0, tile 0, palette 1, the large size; the object characters are at word 0 of VRAM
     log.oam_low[0] = x;
@@ -234,7 +239,7 @@ fn fighter_log(x: u8, y: u8) -> (FrameLog, Pose) {
     (log, poses.into_iter().next().unwrap())
 }
 
-fn object(pose: &Pose, art: &str, luma: bool) -> Object {
+pub(super) fn object(pose: &Pose, art: &str, luma: bool) -> Object {
     Object {
         key: pose.key,
         id: "battle-x-000".to_owned(),
@@ -654,7 +659,7 @@ fn a_shadow_goes_under_a_fighter_drawn_from_art() {
 }
 
 /// A picture of the portrait asset with one character, made for colour 1 = red (art solid red).
-fn red_picture_pack(dir: &std::path::Path, art_colour: [u8; 4]) -> Arc<Pack> {
+pub(super) fn red_picture_pack(dir: &std::path::Path, art_colour: [u8; 4]) -> Arc<Pack> {
     write_png(&dir.join("art/a.png"), 128, 128, |_, _| art_colour);
     let mut keys = vec![0_u64; 16];
     keys[0] = word_key(&character());
@@ -678,7 +683,7 @@ fn red_picture_pack(dir: &std::path::Path, art_colour: [u8; 4]) -> Arc<Pack> {
     pack_of(dir, vec![asset], ArtIndex::new(vec![picture], Vec::new()))
 }
 
-fn portrait_log(colour_1: u16) -> FrameLog {
+pub(super) fn portrait_log(colour_1: u16) -> FrameLog {
     let mut log = log(regs());
     log.vram[0x1000 + 16..0x1000 + 32].copy_from_slice(&character());
     log.vram[0x0400 + 32] = 1;
@@ -1005,6 +1010,55 @@ fn a_field_frame_draws_a_group_from_the_fields_art_though_a_fighter_has_art_for_
 }
 
 #[test]
+fn a_piece_the_edge_cuts_is_not_drawn_from_art_without_its_colours() {
+    // A rock the top of the window cuts in the hidden fight was held by the all-black silhouette
+    // `field-fg-9a2f097aa8` and by the white and blue ki aura `field-fg-46edb50fbe` and drawn as a
+    // black blob. The same cut group as above, held by art of none of its colours: the sprite stays
+    let dir = tempfile::tempdir().unwrap();
+    write_png(&dir.path().join("art/w.png"), 64, 32, |_, _| [0, 0, 0, 255]);
+    let mut frame = log(regs());
+    for row in 0..8 {
+        frame.vram[row] = 0xFF00;
+    }
+    frame.oam_low[0..4].copy_from_slice(&[0, 80, 0, 4 << 1]);
+    frame.cgram_start[0x80 + 4 * 16 + 2] = 0x03E0;
+    let sprites = poses::sprites(&frame);
+    let found = poses::poses(&frame, &sprites);
+    let cut = found.iter().find(|pose| pose.field).expect("a field group");
+    assert!(cut.cut);
+    let holder = |colours: &[(usize, [u8; 3])]| {
+        let mut whole = object(cut, "art/w.png", false);
+        whole.id = "field-fg-000".to_owned();
+        whole.key ^= 1;
+        whole.width = 16;
+        whole.height = 8;
+        whole.mask = vec![0xFF; 16];
+        whole.palette = Palette::default();
+        for &(index, colour) in colours {
+            whole.palette.mask |= 1 << index;
+            whole.palette.colors[index] = colour;
+        }
+        whole
+    };
+    let drawn_by = |whole: Object| {
+        let pack = pack_of(dir.path(), Vec::new(), ArtIndex::new(Vec::new(), vec![whole]));
+        let mut renderer = Renderer::new();
+        renderer.set_art(Some(pack));
+        let drawn = renderer.render_hd(&frame, options(4)).unwrap();
+        let matched = renderer.art_stats().poses.iter().any(|p| p.field && p.matched);
+        (matched, pixel(&drawn, 2 * 4 + 1, 82 * 4 + 1))
+    };
+    let green = [0, 255, 0];
+    assert_eq!(drawn_by(holder(&[(2, [0, 0, 0])])), (false, green), "black for green: the sprite");
+    assert_eq!(
+        drawn_by(holder(&[(12, [255, 255, 255])])),
+        (false, green),
+        "no colour 2: the sprite"
+    );
+    assert!(drawn_by(holder(&[(2, green)])).0, "its own green: the art");
+}
+
+#[test]
 fn a_field_group_cut_by_the_edge_is_drawn_from_the_group_that_holds_it() {
     let dir = tempfile::tempdir().unwrap();
     write_png(&dir.path().join("art/w.png"), 64, 32, |x, _| {
@@ -1178,7 +1232,7 @@ fn a_tally_draws_no_art() {
 
 /// A pack with one background layer: BG4 of mode 0 (map `$0400`, characters `$1000`, one screen), the
 /// tile rows 0 to 4, whose art is the colour (game x, game y, 0) of each game pixel at 4x.
-fn background_pack(dir: &std::path::Path, vram: &[u16], fill: bool) -> Arc<Pack> {
+pub(super) fn background_pack(dir: &std::path::Path, vram: &[u16], fill: bool) -> Arc<Pack> {
     let key = crate::bgart::layer_key(vram, 0x0400, 0x1000, 0, false, 2, [0, 4]);
     write_png(&dir.join("art/bg/test.png"), 1024, 128, |x, y| {
         [((x / 4) % 256) as u8, ((y / 4) % 256) as u8, 0, 255]
@@ -1206,7 +1260,7 @@ fn background_pack(dir: &std::path::Path, vram: &[u16], fill: bool) -> Arc<Pack>
 }
 
 /// BG4 (mode 0) showing the solid tile 1 on every tile of its map, in red.
-fn background_frame(h_scroll: u16) -> FrameLog {
+pub(super) fn background_frame(h_scroll: u16) -> FrameLog {
     let mut regs = regs();
     regs.bg_mode = 0;
     regs.main_bg = [false, false, false, true];
@@ -1223,6 +1277,27 @@ fn background_frame(h_scroll: u16) -> FrameLog {
     }
     log.cgram_start[0x61] = 0x001F;
     log
+}
+
+#[test]
+fn the_transformations_lightning_is_drawn_over_the_art() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = background_frame(10);
+    let pack = background_pack(dir.path(), &log.vram, true);
+    let mut renderer = Renderer::new();
+    renderer.set_art(Some(Arc::clone(&pack)));
+    let plain = renderer.render_hd(&log, options(4)).unwrap();
+    assert_eq!(pixel(&plain, 0, 0), [10, 1, 0], "the layer's art");
+    // An opaque picture (RGBA, alpha 255) of one colour: laid over by its alpha, it covers the art
+    let lightning = dir.path().join("ssj-lightning");
+    write_png(&lightning.join("frame-1.png"), 1024, 896, |_, _| [0, 0, 200, 255]);
+    renderer.set_lightning(crate::lightning::Lightning::load(&lightning).map(Arc::new));
+    renderer.set_conditions(Conditions::default().with_ssj_lightning(None));
+    assert!(renderer.render_hd(&log, options(4)).unwrap() == plain, "not in the transformation");
+    renderer.set_conditions(Conditions::default().with_ssj_lightning(Some(0)));
+    let lit = renderer.render_hd(&log, options(4)).unwrap();
+    assert_eq!(pixel(&lit, 0, 0), [0, 0, 200], "over the art");
+    assert_eq!(pixel(&lit, 8, 40 * 4), [0, 0, 200], "and over the tiles drawn as the look does");
 }
 
 #[test]
@@ -1391,7 +1466,7 @@ fn a_frame_whose_layer_is_not_in_the_index_is_drawn_as_the_look() {
 
 /// A Mode 7 frame: BG1 alone, the identity matrix, every tile of the plane the tile 1 whose pixels
 /// are the colour index 5 (CGRAM 5 is `0x001F`, full red).
-fn plane_frame() -> FrameLog {
+pub(crate) fn plane_frame() -> FrameLog {
     let mut regs = regs();
     regs.bg_mode = 7;
     regs.main_obj = false;
@@ -1410,7 +1485,7 @@ fn plane_frame() -> FrameLog {
 
 /// A pack with the art of the plane of `vram`: the colour (game x / 4, game y / 4, 77) of each game
 /// pixel at 4x, made in the colour 5 = full red.
-fn plane_pack(dir: &std::path::Path, vram: &[u16]) -> Arc<Pack> {
+pub(crate) fn plane_pack(dir: &std::path::Path, vram: &[u16]) -> Arc<Pack> {
     plane_pack_with(dir, vram, |_, _| 255)
 }
 
@@ -1440,6 +1515,7 @@ fn plane_pack_with(
             key: format!("{:016x}", mode7art::plane_key(vram)),
             tiles: "test/t{x}_{y}.png".to_owned(),
             palette: vec!["FF0000".to_owned(); 256],
+            replace: false,
         }],
     };
     Arc::new(pack)
@@ -1514,6 +1590,342 @@ fn a_texel_of_the_plane_without_art_is_the_look() {
     let mut renderer = Renderer::new();
     renderer.set_art(Some(pack));
     assert_eq!(pixel(&renderer.render_hd(&log, options(4)).unwrap(), 36, 40), [255, 0, 0]);
+}
+
+/// [`plane_frame`] with other pixels in the character 2, which no map entry uses: what a battle's opening flight left
+/// by the battle before has in VRAM (the plane shows the same, its `plane_key` is another).
+fn plane_frame_with_other_unused_characters() -> FrameLog {
+    let mut log = plane_frame();
+    // (the low bytes are the map's, the tile 1 everywhere)
+    for pixel in 0..64 {
+        log.vram[128 + pixel] = 9 << 8 | 1;
+    }
+    log
+}
+
+#[test]
+fn a_plane_shown_with_other_unused_characters_is_drawn_from_the_art_of_what_it_shows() {
+    use crate::mode7art::{content_key, plane_key};
+    let dir = tempfile::tempdir().unwrap();
+    let log = plane_frame();
+    let other = plane_frame_with_other_unused_characters();
+    assert_ne!(plane_key(&other.vram), plane_key(&log.vram));
+    assert_eq!(content_key(&other.vram), content_key(&log.vram));
+    // The pack's art keyed by the content of `log` (as an art override's plane is)
+    let mut pack = (*plane_pack(dir.path(), &log.vram)).clone();
+    let plane_key_of_log = pack.mode7.plane[0].key.clone();
+    pack.mode7.plane[0].key =
+        format!("{}{:016x}", crate::mode7art::CONTENT_PREFIX, content_key(&log.vram));
+    let mut renderer = Renderer::new();
+    renderer.set_art(Some(Arc::new(pack.clone())));
+    assert_eq!(pixel(&renderer.render_hd(&other, options(4)).unwrap(), 36, 40), [2, 2, 77]);
+    assert_eq!(pixel(&renderer.render_hd(&log, options(4)).unwrap(), 36, 40), [2, 2, 77]);
+    // The same content in another colour (yellow, not the art's red): the game's pixels, the art not recoloured
+    let mut yellow = other.clone();
+    yellow.cgram_start[5] = 0x03FF;
+    assert_eq!(pixel(&renderer.render_hd(&yellow, options(4)).unwrap(), 36, 40), [255, 255, 0]);
+    // Keyed by the plane key of `log`, the art is found for it only, as before: the game's red for `other`
+    pack.mode7.plane[0].key = plane_key_of_log;
+    let mut renderer = Renderer::new();
+    renderer.set_art(Some(Arc::new(pack)));
+    assert_eq!(pixel(&renderer.render_hd(&other, options(4)).unwrap(), 36, 40), [255, 0, 0]);
+    assert_eq!(pixel(&renderer.render_hd(&log, options(4)).unwrap(), 36, 40), [2, 2, 77]);
+}
+
+#[test]
+fn a_plane_of_the_art_override_is_drawn_for_its_content_before_the_packs_own_art() {
+    use crate::mode7art::content_key;
+    let dir = tempfile::tempdir().unwrap();
+    let log = plane_frame();
+    let other = plane_frame_with_other_unused_characters();
+    let pack = (*plane_pack(dir.path(), &log.vram)).clone();
+    // The override's plane: the tile t0_0 only (plane pixels 0 to 255; the other tiles have no file), (10, 20, 30) but
+    // transparent left of plane column 128; no palette.txt and the pack has no art of this content: left out
+    let overrides = tempfile::tempdir().unwrap();
+    let folder = overrides
+        .path()
+        .join(crate::pack::MODE7_DIR)
+        .join(format!("{:016x}", content_key(&log.vram)));
+    write_png(&folder.join("t0_0.png"), 1024, 1024, |x, _| {
+        [10, 20, 30, if x < 512 { 0 } else { 255 }]
+    });
+    let refused = pack.clone().with_art_override(overrides.path());
+    assert!(refused.mode7.plane.iter().all(|entry| entry.content_value().is_none()));
+    // With its palette (the game's red at 5, as the art was made in): drawn for both VRAMs, before the pack's own art
+    let mut palette = vec!["000000"; 256];
+    palette[5] = "FF0000";
+    std::fs::write(folder.join("palette.txt"), palette.join("\n")).unwrap();
+    let mut renderer = Renderer::new();
+    renderer.set_art(Some(Arc::new(pack.clone().with_art_override(overrides.path()))));
+    // (plane pixel (150, 11) at picture (600, 40); plane pixel (9, 11), where the art is transparent, the game's red)
+    assert_eq!(pixel(&renderer.render_hd(&log, options(4)).unwrap(), 600, 40), [10, 20, 30]);
+    assert_eq!(pixel(&renderer.render_hd(&other, options(4)).unwrap(), 600, 40), [10, 20, 30]);
+    assert_eq!(pixel(&renderer.render_hd(&log, options(4)).unwrap(), 36, 40), [255, 0, 0]);
+    // A tile of another size, or a folder whose name is no content key, is left out
+    write_png(&folder.join("t1_0.png"), 512, 512, |_, _| [0, 0, 0, 255]);
+    let wrong = pack.clone().with_art_override(overrides.path());
+    assert!(wrong.mode7.plane.iter().all(|entry| entry.content_value().is_none()));
+    std::fs::remove_file(folder.join("t1_0.png")).unwrap();
+    std::fs::rename(&folder, overrides.path().join(crate::pack::MODE7_DIR).join("super-vegeta"))
+        .unwrap();
+    let unnamed = pack.with_art_override(overrides.path());
+    assert!(unnamed.mode7.plane.iter().all(|entry| entry.content_value().is_none()));
+}
+
+/// The messages logged since the test process started (a logger that keeps them, set by the first call).
+fn captured_log() -> Vec<String> {
+    struct Keep(std::sync::Mutex<Vec<String>>);
+    impl log::Log for Keep {
+        fn enabled(&self, _: &log::Metadata<'_>) -> bool {
+            true
+        }
+        fn log(&self, record: &log::Record<'_>) {
+            self.0.lock().unwrap().push(record.args().to_string());
+        }
+        fn flush(&self) {}
+    }
+    static KEEP: Keep = Keep(std::sync::Mutex::new(Vec::new()));
+    if log::set_logger(&KEEP).is_ok() {
+        log::set_max_level(log::LevelFilter::Info);
+    }
+    KEEP.0.lock().unwrap().clone()
+}
+
+#[test]
+fn an_override_plane_with_replace_shows_what_is_under_the_plane_where_its_art_is_transparent() {
+    use crate::mode7art::content_key;
+    let _ = captured_log();
+    let dir = tempfile::tempdir().unwrap();
+    let mut log = plane_frame();
+    // Under the plane (all red, colour 5): the backdrop, green
+    log.cgram_start[0] = 0x03E0;
+    let pack = (*plane_pack(dir.path(), &log.vram)).clone();
+    // The override's plane: the tile t0_0 only, transparent left of plane column 128, (10, 20, 30) right of it
+    let overrides = tempfile::tempdir().unwrap();
+    let folder = overrides
+        .path()
+        .join(crate::pack::MODE7_DIR)
+        .join(format!("{:016x}", content_key(&log.vram)));
+    write_png(&folder.join("t0_0.png"), 1024, 1024, |x, _| {
+        [10, 20, 30, if x < 512 { 0 } else { 255 }]
+    });
+    let mut palette = vec!["000000"; 256];
+    palette[5] = "FF0000";
+    std::fs::write(folder.join("palette.txt"), palette.join("\n")).unwrap();
+    // Picture pixels (36, 40) (plane pixel (9, 11): the art transparent) and (600, 40) (plane pixel (150, 11): the
+    // art), and the frames drawn again without BG1, in the Classic picture and in the wide view (window pixel 22 at
+    // picture column 160, the art transparent there)
+    let draw = |pack: &Pack| {
+        let mut renderer = Renderer::new();
+        renderer.set_art(Some(Arc::new(pack.clone())));
+        let picture = renderer.render_hd(&log, options(4)).unwrap();
+        let mut wide = WideRenderer::new();
+        wide.set_art(Some(Arc::new(pack.clone())));
+        let options_wide = WideOptions { width: 372, hud: HudPlacement::Window };
+        let view = wide.render_hd(Rom(&[]), 0x07, None, &log, options_wide, options(2)).unwrap();
+        (
+            pixel(&picture, 36, 40),
+            pixel(&picture, 600, 40),
+            renderer.art_stats().plane_under,
+            pixel(&view.picture, 160, 40),
+            wide.art_stats().plane_under,
+        )
+    };
+    let (red, green, art) = ([255, 0, 0], [0, 255, 0], [10, 20, 30]);
+    // Without `replace`: where the art is transparent, the game's red; the frame drawn once
+    let plain = pack.clone().with_art_override(overrides.path());
+    assert!(plain.mode7.plane.iter().all(|entry| !entry.replace));
+    assert_eq!(draw(&plain), (red, art, 0, red, 0));
+    // A file of another name (`Replace`, `replace.txt`) is not `replace`: left out, and the log says so
+    std::fs::write(folder.join("Replace"), "").unwrap();
+    std::fs::write(folder.join("replace.txt"), "").unwrap();
+    let misnamed = pack.clone().with_art_override(overrides.path());
+    assert!(misnamed.mode7.plane.iter().all(|entry| !entry.replace));
+    let logged = captured_log();
+    for name in ["Replace", "replace.txt"] {
+        let shown = format!("{} is left out", folder.join(name).display());
+        let said = format!("{}: {name} is left out", folder.display());
+        assert!(
+            logged.iter().any(|line| line.contains(&said) || line.contains(&shown)),
+            "{name}: {logged:?}"
+        );
+    }
+    assert_eq!(draw(&misnamed), (red, art, 0, red, 0));
+    // With `replace`: what is under the plane there (the backdrop), the frame drawn again without BG1 once
+    std::fs::remove_file(folder.join("Replace")).unwrap();
+    std::fs::write(folder.join("replace"), "").unwrap();
+    let replaced = pack.clone().with_art_override(overrides.path());
+    assert!(replaced.mode7.plane.iter().any(|entry| entry.replace));
+    assert_eq!(draw(&replaced), (green, art, 1, green, 1));
+    // The pack's own art: as before, the frame drawn once
+    let (own, _, again, _, again_wide) = draw(&pack);
+    assert_eq!((own, again, again_wide), ([2, 2, 77], 0, 0));
+}
+
+/// [`plane_frame`] whose tile shows the colour 5 in the left four columns and is transparent (colour 0) in the right
+/// four, over a green backdrop, with the main screen's BG1 window switched on but neither window set for BG1 (what
+/// the opening flights of Super Saiyan Goku and Super Vegeta do): the window hides nothing. Plane column `x` is
+/// transparent when `x % 8 >= 4`.
+fn plane_frame_with_an_idle_bg1_window() -> FrameLog {
+    let mut log = plane_frame();
+    for row in 0..8 {
+        for column in 4..8 {
+            log.vram[64 + row * 8 + column] = 0;
+        }
+    }
+    log.cgram_start[0] = 0x03E0;
+    for entry in &mut log.entries {
+        entry.regs.main_bg_window_off[0] = true;
+    }
+    log
+}
+
+/// The art override of the plane of `log` in `overrides`: the tiles `t0_0` to `t3_0` (plane rows 0..256, every column, so
+/// the wide view's margins, which wrap round the plane, have art too), (10, 20, 30) where `opaque(plane x)`, made in the
+/// game's red (colour 5); with the empty file `replace` when `replace`.
+fn override_plane(
+    overrides: &std::path::Path,
+    log: &FrameLog,
+    opaque: impl Fn(u32) -> bool,
+    replace: bool,
+) {
+    let folder = overrides
+        .join(crate::pack::MODE7_DIR)
+        .join(format!("{:016x}", crate::mode7art::content_key(&log.vram)));
+    for tx in 0..4_u32 {
+        write_png(&folder.join(format!("t{tx}_0.png")), 1024, 1024, |x, _| {
+            [10, 20, 30, if opaque(tx * 256 + x / 4) { 255 } else { 0 }]
+        });
+    }
+    let mut palette = vec!["000000"; 256];
+    palette[5] = "FF0000";
+    std::fs::write(folder.join("palette.txt"), palette.join("\n")).unwrap();
+    if replace {
+        std::fs::write(folder.join("replace"), "").unwrap();
+    }
+}
+
+/// The picture pixels of window pixel `x` (frame row 10) in the Classic picture (4x) and the wide view (2x).
+fn plane_pixels(pack: &Pack, log: &FrameLog, x: usize) -> [[u8; 3]; 2] {
+    let mut renderer = Renderer::new();
+    renderer.set_art(Some(Arc::new(pack.clone())));
+    let picture = renderer.render_hd(log, options(4)).unwrap();
+    let mut wide = WideRenderer::new();
+    wide.set_art(Some(Arc::new(pack.clone())));
+    let options_wide = WideOptions { width: 372, hud: HudPlacement::Window };
+    let view = wide.render_hd(Rom(&[]), 0x07, None, log, options_wide, options(2)).unwrap();
+    [pixel(&picture, x * 4 + 1, 41), pixel(&view.picture, (58 + x) * 2 + 1, 21)]
+}
+
+/// The wide view's picture pixel (2x) of window pixel `x` (frame row 10), which may be in a margin (`x` < 0 or > 255).
+fn wide_plane_pixel(pack: &Pack, log: &FrameLog, x: i32) -> [u8; 3] {
+    let mut wide = WideRenderer::new();
+    wide.set_art(Some(Arc::new(pack.clone())));
+    let options_wide = WideOptions { width: 372, hud: HudPlacement::Window };
+    let view = wide.render_hd(Rom(&[]), 0x07, None, log, options_wide, options(2)).unwrap();
+    pixel(&view.picture, ((58 + x) * 2 + 1) as usize, 21)
+}
+
+/// What the art of a plane must do under the BG1 window, for `pack` (whose art `is_art` tells from the game's red and
+/// the backdrop) and the frame of [`plane_frame_with_an_idle_bg1_window`]: drawn where the switch is on with no window
+/// set for BG1 (also past the game's outline); hidden inside a window set for BG1, over the whole line or part of it;
+/// drawn in the wide view's margins as the game's layer is there.
+fn the_plane_art_follows_the_bg1_window(
+    pack: &Pack,
+    is_art: impl Fn([u8; 3]) -> bool,
+    whose: &str,
+) {
+    let log = plane_frame_with_an_idle_bg1_window();
+    let art = |colours: [[u8; 3]; 2]| colours.iter().all(|&colour| is_art(colour));
+    // Where the game's plane shows its red and where it is transparent (past the outline): the art, not the
+    // backdrop of a pixel taken as hidden by the window
+    assert!(art(plane_pixels(pack, &log, 2)), "{whose}: the art");
+    assert!(art(plane_pixels(pack, &log, 6)), "{whose}: the art past the game's outline");
+    // A window set for BG1 over the whole line does hide the plane there: the backdrop, no art
+    let mut covered = log.clone();
+    for entry in &mut covered.entries {
+        entry.regs.bg_window_area[0][0] = 1;
+        entry.regs.window_left[0] = 0;
+        entry.regs.window_right[0] = 255;
+    }
+    assert_eq!(plane_pixels(pack, &covered, 6), [[0, 255, 0]; 2], "{whose}: inside a window");
+    // A window over part of the line (window pixels 0..=3) hides the plane there only
+    let mut part = log.clone();
+    for entry in &mut part.entries {
+        entry.regs.bg_window_area[0][0] = 1;
+        entry.regs.window_left[0] = 0;
+        entry.regs.window_right[0] = 3;
+    }
+    assert_eq!(
+        plane_pixels(pack, &part, 2),
+        [[0, 255, 0]; 2],
+        "{whose}: inside the window: the backdrop"
+    );
+    assert!(art(plane_pixels(pack, &part, 6)), "{whose}: outside it: the art");
+    // In the wide view's margins no window is inside (`screen::inside`): the game's BG1 shows there (its red at margin
+    // pixel -14, plane column 2 of the wrapped plane), and the art is drawn there as the layer is (at -10, column 6,
+    // where the plane is transparent), not taken as hidden by the window over the original's 256 pixels
+    let mut bare = pack.clone();
+    bare.mode7 = crate::mode7art::Index::default();
+    assert_eq!(
+        wide_plane_pixel(&bare, &covered, -14),
+        [255, 0, 0],
+        "the game's layer in the margin"
+    );
+    assert!(
+        is_art(wide_plane_pixel(pack, &covered, -10)),
+        "{whose}: the art in the margin, as the layer"
+    );
+}
+
+#[test]
+fn a_planes_art_past_the_games_outline_is_drawn_when_the_bg1_window_hides_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = plane_frame_with_an_idle_bg1_window();
+    // The pack's own art (blue 77), found by the plane key and by the plane's content (a `content:` key)
+    let pack = (*plane_pack(dir.path(), &log.vram)).clone();
+    let packs_art = |colour: [u8; 3]| colour[2] == 77;
+    the_plane_art_follows_the_bg1_window(&pack, packs_art, "the pack's plane");
+    let mut by_content = pack.clone();
+    by_content.mode7.plane[0].key = format!(
+        "{}{:016x}",
+        crate::mode7art::CONTENT_PREFIX,
+        crate::mode7art::content_key(&log.vram)
+    );
+    the_plane_art_follows_the_bg1_window(
+        &by_content,
+        packs_art,
+        "the pack's plane found by its content",
+    );
+    // A picture of the art override, (10, 20, 30)
+    let overrides = tempfile::tempdir().unwrap();
+    override_plane(overrides.path(), &log, |_| true, false);
+    let with = pack.with_art_override(overrides.path());
+    the_plane_art_follows_the_bg1_window(
+        &with,
+        |colour| colour == [10, 20, 30],
+        "the art override's plane",
+    );
+}
+
+#[test]
+fn an_override_plane_with_replace_shows_what_is_under_it_when_the_bg1_window_hides_nothing() {
+    let dir = tempfile::tempdir().unwrap();
+    let log = plane_frame_with_an_idle_bg1_window();
+    let pack = (*plane_pack(dir.path(), &log.vram)).clone();
+    let overrides = tempfile::tempdir().unwrap();
+    // The art is clear over the game's red columns and opaque over the transparent ones
+    override_plane(overrides.path(), &log, |x| x % 8 >= 4, true);
+    let with = pack.with_art_override(overrides.path());
+    assert!(with.mode7.plane.iter().any(|entry| entry.replace));
+    // Where the art is clear and the game's plane red: what is under the plane (the green backdrop), not the red
+    assert_eq!(
+        plane_pixels(&with, &log, 2),
+        [[0, 255, 0]; 2],
+        "under the plane, not the game's pixel"
+    );
+    // Where the game's plane is transparent and the art opaque: the art
+    assert_eq!(plane_pixels(&with, &log, 6), [[10, 20, 30]; 2], "the art past the game's outline");
 }
 
 /// A fighter of one 16 x 16 sprite whose tiles hold the left four columns of colour 2 (so its
@@ -1866,7 +2278,7 @@ fn a_portrait_whose_halves_use_two_palette_rows_is_drawn_in_one() {
 }
 
 /// Work RAM with the Kaioken on (`$0C36` bit 7) and Super Saiyan Goku in party record `slot`.
-fn wram_with_kaioken(on: bool, slot: usize) -> Vec<u8> {
+pub(super) fn wram_with_kaioken(on: bool, slot: usize) -> Vec<u8> {
     let mut wram = vec![0_u8; 0x20000];
     wram[0x0C36] = if on { 0x80 } else { 0x40 };
     wram[0x0B00 + 0x20 * slot + 1] = 0x3B;
@@ -1876,13 +2288,55 @@ fn wram_with_kaioken(on: bool, slot: usize) -> Vec<u8> {
 #[test]
 fn the_kaioken_condition_is_the_bit_of_the_state_and_goku_in_a_party_record() {
     let on = Conditions::of_work_ram(&wram_with_kaioken(true, 3));
-    assert_eq!(on, Conditions { kaioken: true, super_saiyan_goku: true });
+    assert_eq!(
+        on,
+        Conditions {
+            kaioken: true,
+            super_saiyan_goku: true,
+            kaioken_on: true,
+            ending_flight: false,
+            ssj_lightning: None
+        }
+    );
     let off = Conditions::of_work_ram(&wram_with_kaioken(false, 3));
-    assert_eq!(off, Conditions { kaioken: false, super_saiyan_goku: true }, "Goku without it");
+    assert_eq!(
+        off,
+        Conditions {
+            kaioken: false,
+            super_saiyan_goku: true,
+            kaioken_on: false,
+            ending_flight: false,
+            ssj_lightning: None
+        },
+        "Goku without it"
+    );
     let mut no_goku = wram_with_kaioken(true, 3);
     no_goku[0x0B00 + 0x20 * 3 + 1] = 0x39;
-    assert_eq!(Conditions::of_work_ram(&no_goku), Conditions::default(), "Goku's unit is $3B");
+    assert_eq!(
+        Conditions::of_work_ram(&no_goku),
+        Conditions {
+            kaioken: false,
+            super_saiyan_goku: false,
+            kaioken_on: true,
+            ending_flight: false,
+            ssj_lightning: None
+        },
+        "the pack's Kaioken variants need Goku's unit $3B; the Kaioken itself is on (patch 0050)"
+    );
     assert_eq!(Conditions::of_work_ram(&[]), Conditions::default(), "no work RAM says no");
+    let mut multiplier = vec![0_u8; 0x20000];
+    multiplier[0x01EF] = 5;
+    assert_eq!(
+        Conditions::of_work_ram(&multiplier),
+        Conditions {
+            kaioken: false,
+            super_saiyan_goku: false,
+            kaioken_on: true,
+            ending_flight: false,
+            ssj_lightning: None
+        },
+        "the Kaioken's multiplier in use (its first close-up, before $0C36 says it is on)"
+    );
 }
 
 #[test]
@@ -1974,9 +2428,484 @@ fn super_saiyan_goku_is_drawn_from_his_own_art_for_the_pixels_he_shares_with_the
     assert_eq!(pixel(&ssj, x, y), [255, 0, 0], "Super Saiyan Goku: his own art");
 }
 
+/// A pack of Goku's normal and Super Saiyan art for the pixels of the fighter of [`fighter_log`] (palette 1, colour 2
+/// green): `battle-goku-000` (blue) and `battle-goku-001` (other pixels), so the normal unit has the most poses, and
+/// `battle-goku-ssj-000` (red), each palette the colours given by index. (The pack of the game: `battle-goku-017` and
+/// `battle-goku-ssj-021` have the same key, the normal palette has black hair at 14 and 15, the Super Saiyan one yellow.)
+fn goku_pack(
+    dir: &tempfile::TempDir,
+    pose: &Pose,
+    normal: &[(usize, [u8; 3])],
+    super_saiyan: &[(usize, [u8; 3])],
+) -> Arc<Pack> {
+    write_png(&dir.path().join("art/normal.png"), 64, 64, |_, _| [0, 0, 255, 255]);
+    write_png(&dir.path().join("art/ssj.png"), 64, 64, |_, _| [255, 0, 0, 255]);
+    write_png(&dir.path().join("art/other.png"), 64, 64, |_, _| [0, 255, 0, 255]);
+    let unit = |id: &str, key: u64, art: &str, colours: &[(usize, [u8; 3])]| {
+        let mut held = Object { id: id.to_owned(), key, ..object(pose, art, false) };
+        for &(index, colour) in colours {
+            held.palette.mask |= 1 << index;
+            held.palette.colors[index] = colour;
+        }
+        held
+    };
+    let objects = vec![
+        unit("battle-goku-000", pose.key, "art/normal.png", normal),
+        unit("battle-goku-001", pose.key ^ 1, "art/other.png", normal),
+        unit("battle-goku-ssj-000", pose.key, "art/ssj.png", super_saiyan),
+    ];
+    pack_of(dir.path(), Vec::new(), ArtIndex::new(Vec::new(), objects))
+}
+
+/// The object the fighter of [`fighter_log`] is drawn from, under `conditions`.
+fn goku_drawn(pack: Arc<Pack>, frame: &FrameLog, conditions: Conditions) -> Option<u32> {
+    let mut renderer = Renderer::new();
+    renderer.set_art(Some(pack));
+    renderer.set_conditions(conditions);
+    renderer.render_hd(frame, options(4)).unwrap();
+    renderer.art_stats().poses.iter().find(|p| p.fighter).unwrap().art
+}
+
+#[test]
+fn super_saiyan_goku_in_the_party_coloured_as_the_normal_goku_is_drawn_from_the_normal_art() {
+    // The ending: unit `$3B` is still in the party, and the frame draws Goku in the normal palette (colour 2, his
+    // hair, is the frame's green in the normal art, yellow in the Super Saiyan art; colour 3 is the same in both)
+    let dir = tempfile::tempdir().unwrap();
+    let (frame, pose) = fighter_log(40, 50);
+    let pack = goku_pack(
+        &dir,
+        &pose,
+        &[(2, [0, 255, 0]), (3, [0, 0, 0])],
+        &[(2, [255, 198, 0]), (3, [0, 0, 0])],
+    );
+    let drawn = goku_drawn(pack, &frame, Conditions::of_work_ram(&wram_with_kaioken(false, 0)));
+    assert_eq!(drawn, Some(0), "battle-goku-000: the normal Goku's colours, the normal art");
+}
+
+#[test]
+fn super_saiyan_goku_in_the_party_coloured_as_the_super_saiyan_is_drawn_from_the_super_saiyan_art()
+{
+    // A fight: the frame draws Goku in the Super Saiyan palette (colour 2 the frame's green in the Super Saiyan art,
+    // black in the normal art)
+    let dir = tempfile::tempdir().unwrap();
+    let (frame, pose) = fighter_log(40, 50);
+    let pack = goku_pack(
+        &dir,
+        &pose,
+        &[(2, [0, 0, 0]), (3, [0, 0, 0])],
+        &[(2, [0, 255, 0]), (3, [0, 0, 0])],
+    );
+    let ssj = Conditions::of_work_ram(&wram_with_kaioken(false, 0));
+    assert_eq!(
+        goku_drawn(Arc::clone(&pack), &frame, ssj),
+        Some(2),
+        "battle-goku-ssj-000: the Super Saiyan's colours"
+    );
+    // Without his unit in the party the colours decide too: strictly nearer the Super Saiyan art's, his Super Saiyan
+    // art (he turns Super Saiyan before Frieza before `$3B` is in a party record)
+    assert_eq!(
+        goku_drawn(pack, &frame, Conditions::default()),
+        Some(2),
+        "no $3B, the Super Saiyan's colours: the Super Saiyan art"
+    );
+    // and in the normal Goku's colours, the normal art
+    let normal = goku_pack(
+        &dir,
+        &pose,
+        &[(2, [0, 255, 0]), (3, [0, 0, 0])],
+        &[(2, [0, 0, 0]), (3, [0, 0, 0])],
+    );
+    assert_eq!(
+        goku_drawn(normal, &frame, Conditions::default()),
+        Some(0),
+        "no $3B, the normal colours: the normal art"
+    );
+}
+
+#[test]
+fn goku_turning_super_saiyan_before_frieza_before_3b_is_in_the_party_is_drawn_from_the_super_saiyan_art()
+ {
+    // secret-ssj-frieza from frame 6188: the close-up `battle-goku-068` (and `battle-goku-ssj-070`, the same key) in
+    // the Super Saiyan palette (13 blue, 14 pale yellow, 15 gold) while no party record has `$3B` yet. The normal art
+    // has 13, 14 and 15 black: it drew him with black hair. The palette decides: the Super Saiyan art. Colours as near
+    // to both leave it to the party record: the normal art
+    let dir = tempfile::tempdir().unwrap();
+    let (mut frame, pose) = fighter_log(40, 50);
+    let (blue, yellow, gold) =
+        (poses::rgb555(0x7C00), poses::rgb555(0x53FF), poses::rgb555(0x0A98));
+    let black = [0, 0, 0];
+    let pack = goku_pack(
+        &dir,
+        &pose,
+        &[(1, black), (2, [0, 255, 0]), (13, black), (14, black), (15, black)],
+        &[(1, black), (2, [0, 255, 0]), (13, blue), (14, yellow), (15, gold)],
+    );
+    for (index, colour) in [(13, 0x7C00), (14, 0x53FF), (15, 0x0A98)] {
+        frame.cgram_start[0x80 + 16 + index] = colour;
+    }
+    let drawn = goku_drawn(Arc::clone(&pack), &frame, Conditions::default());
+    assert_eq!(drawn, Some(2), "the Super Saiyan palette, no $3B: battle-goku-ssj-000");
+    // The frame before (6186): the normal palette, black hair: the normal art
+    for index in [13, 14, 15] {
+        frame.cgram_start[0x80 + 16 + index] = 0;
+    }
+    let drawn = goku_drawn(Arc::clone(&pack), &frame, Conditions::default());
+    assert_eq!(drawn, Some(0), "the normal palette: battle-goku-000");
+    // As near to both (two sets whose palettes are alike): the normal art without `$3B`
+    frame.cgram_start[0x80 + 16 + 13] = 0x7C00;
+    frame.cgram_start[0x80 + 16 + 14] = 0x53FF;
+    frame.cgram_start[0x80 + 16 + 15] = 0x0A98;
+    let tie = goku_pack(
+        &dir,
+        &pose,
+        &[(1, black), (2, [0, 255, 0]), (13, blue), (14, yellow), (15, black)],
+        &[(1, black), (2, [0, 255, 0]), (13, blue), (14, yellow), (15, [0, 0, 0])],
+    );
+    assert_eq!(goku_drawn(tie, &frame, Conditions::default()), Some(0), "as near: the normal art");
+}
+
+#[test]
+fn a_colour_only_one_of_goku_s_palettes_has_does_not_decide_between_his_two_sets() {
+    // Both sets have the frame's green at colour 2; only the Super Saiyan palette has colour 4 (a yellow far from the
+    // frame's black). Compared over the colours both use the two are as near: the party record decides, the Super
+    // Saiyan art. (Summed over each palette's own colours the normal art would be nearer.)
+    let dir = tempfile::tempdir().unwrap();
+    let (frame, pose) = fighter_log(40, 50);
+    let pack =
+        goku_pack(&dir, &pose, &[(2, [0, 255, 0])], &[(2, [0, 255, 0]), (4, [255, 222, 41])]);
+    let drawn = goku_drawn(pack, &frame, Conditions::of_work_ram(&wram_with_kaioken(false, 0)));
+    assert_eq!(drawn, Some(2), "battle-goku-ssj-000: as near, the party record");
+}
+
+#[test]
+fn goku_holding_gohan_before_super_vegeta_is_drawn_from_the_super_saiyan_art_whatever_its_colours()
+{
+    // The ending's colours (colour 2 the row's green in the normal art, yellow in the Super Saiyan art) on the pose of
+    // Goku holding Gohan (`battle-goku-017`, `battle-goku-ssj-021`): the Super Saiyan art while `$3B` is in the party,
+    // a choice of this branch. The same colours on another pose give the normal art, and so does this pose without him.
+    let dir = tempfile::tempdir().unwrap();
+    let (_, pose) = fighter_log(40, 50);
+    let mut row = [[0_u8; 3]; 16];
+    row[2] = [0, 255, 0];
+    let unit_for = |key: u64, conditions: Conditions| {
+        let pose = Pose { key, ..pose.clone() };
+        let pack = goku_pack(&dir, &pose, &[(2, [0, 255, 0])], &[(2, [255, 198, 0])]);
+        let mut art = ArtState::new(pack);
+        art.conditions = conditions;
+        art.unit_for(&pose, &row)
+    };
+    let ssj = Conditions::of_work_ram(&wram_with_kaioken(false, 0));
+    assert_eq!(
+        unit_for(super::GOKU_HOLDING_GOHAN, ssj).as_deref(),
+        Some("battle-goku-ssj"),
+        "the Super Saiyan art for this pose"
+    );
+    assert_eq!(
+        unit_for(super::GOKU_HOLDING_GOHAN ^ 1, ssj).as_deref(),
+        Some("battle-goku"),
+        "another pose"
+    );
+    assert_eq!(
+        unit_for(super::GOKU_HOLDING_GOHAN, Conditions::default()).as_deref(),
+        Some("battle-goku"),
+        "no $3B in the party"
+    );
+}
+
+/// A pack of two units with art for the pixels of the fighter of [`fighter_log`] (palette 1, colour 2
+/// green): `battle-vegeta`, blue art, with a second pose (other pixels), so the unit with the most
+/// poses, and `battle-super-vegeta`, red art, of one pose; colour 2 of each palette as given. (The
+/// pack of the game: `battle-vegeta-034` and `battle-super-vegeta-000` have the same source key, the
+/// normal palette has black at 1, 14 and 15, the Super one yellow and orange at 14 and 15.)
+fn vegeta_pack(
+    dir: &tempfile::TempDir,
+    pose: &Pose,
+    vegeta: [u8; 3],
+    super_vegeta: [u8; 3],
+) -> Arc<Pack> {
+    write_png(&dir.path().join("art/vegeta.png"), 64, 64, |_, _| [0, 0, 255, 255]);
+    write_png(&dir.path().join("art/super.png"), 64, 64, |_, _| [255, 0, 0, 255]);
+    write_png(&dir.path().join("art/other.png"), 64, 64, |_, _| [0, 255, 0, 255]);
+    let unit = |id: &str, key: u64, art: &str, colour: [u8; 3]| {
+        let mut held = Object { id: id.to_owned(), key, ..object(pose, art, false) };
+        held.palette = Palette { mask: 0b100, ..Palette::default() };
+        held.palette.colors[2] = colour;
+        held
+    };
+    let objects = vec![
+        unit("battle-vegeta-034", pose.key, "art/vegeta.png", vegeta),
+        unit("battle-vegeta-035", pose.key ^ 1, "art/other.png", vegeta),
+        unit("battle-super-vegeta-000", pose.key, "art/super.png", super_vegeta),
+    ];
+    pack_of(dir.path(), Vec::new(), ArtIndex::new(Vec::new(), objects))
+}
+
+#[test]
+fn a_pose_two_units_have_art_for_is_drawn_from_the_unit_made_for_its_exact_colours() {
+    let dir = tempfile::tempdir().unwrap();
+    let (frame, pose) = fighter_log(40, 50);
+    // The game draws the pose in green: the Super unit's art is made for it, the normal unit's
+    // (more poses) for black, which recolouring cannot turn into the Super one's colours
+    let pack = vegeta_pack(&dir, &pose, [0, 0, 0], [0, 255, 0]);
+    let mut renderer = Renderer::new();
+    renderer.set_art(Some(pack));
+    let drawn = renderer.render_hd(&frame, options(4)).unwrap();
+    assert_eq!(pixel(&drawn, 41 * 4 + 1, 51 * 4 + 1), [255, 0, 0], "the unit of the exact colours");
+    let stats = renderer.art_stats();
+    let fighter = stats.poses.iter().find(|p| p.fighter).unwrap();
+    assert_eq!(fighter.art, Some(2), "battle-super-vegeta-000");
+    assert!(!fighter.recoloured, "drawn in its own colours");
+}
+
+#[test]
+fn a_pose_no_unit_has_art_for_its_exact_colours_is_drawn_from_the_unit_with_the_most_poses() {
+    let dir = tempfile::tempdir().unwrap();
+    let (frame, pose) = fighter_log(40, 50);
+    // Neither palette is the game's green (the Super one is one step of a channel off): the unit
+    // with the most poses, as before
+    let pack = vegeta_pack(&dir, &pose, [0, 0, 0], [0, 254, 0]);
+    let mut renderer = Renderer::new();
+    renderer.set_art(Some(pack));
+    renderer.render_hd(&frame, options(4)).unwrap();
+    let stats = renderer.art_stats();
+    let fighter = stats.poses.iter().find(|p| p.fighter).unwrap();
+    // (both arts are recoloured to green here, so the drawn colour does not tell them apart)
+    assert_eq!(fighter.art, Some(0), "battle-vegeta-034: the unit with the most poses");
+    assert!(fighter.recoloured);
+}
+
+/// Vegeta's palette as the pack's art of his poses has it: the outline (1) and the hair (14, 15) black, colour 2 the
+/// green of the fighter of [`fighter_log`]; with `hair`, Super Vegeta's (yellow, orange).
+fn vegeta_palette(hair: Option<([u8; 3], [u8; 3])>) -> Palette {
+    let mut palette = Palette { mask: 1 << 1 | 1 << 2 | 1 << 14 | 1 << 15, ..Palette::default() };
+    palette.colors[2] = [0, 255, 0];
+    if let Some((yellow, orange)) = hair {
+        palette.colors[14] = yellow;
+        palette.colors[15] = orange;
+    }
+    palette
+}
+
+#[test]
+fn super_vegeta_drawn_with_the_tiles_of_a_pose_only_vegeta_has_art_for_keeps_the_game_s_sprite() {
+    // The game draws Super Vegeta's energy wave with Vegeta's tiles in Super Vegeta's palette (yellow and orange hair
+    // at 14 and 15); the pack has art of that pose for Vegeta only (`gallery-enemy-vegeta-u15-087`), black hair, the
+    // colour of his outline. Recoloured, it drew him with black hair: the pose keeps the game's own sprite
+    let dir = tempfile::tempdir().unwrap();
+    let (mut frame, pose) = fighter_log(40, 50);
+    write_png(&dir.path().join("art/vegeta.png"), 64, 64, |_, _| [0, 0, 255, 255]);
+    let vegeta = Object {
+        id: "gallery-enemy-vegeta-u15-087".to_owned(),
+        palette: vegeta_palette(None),
+        ..object(&pose, "art/vegeta.png", false)
+    };
+    // His palette is known from the art of his other poses (another key, another size)
+    let (yellow, orange) = (poses::rgb555(0x03FF), poses::rgb555(0x11DF));
+    let super_vegeta = Object {
+        id: "battle-super-vegeta-000".to_owned(),
+        key: pose.key ^ 1,
+        palette: vegeta_palette(Some((yellow, orange))),
+        width: 8,
+        height: 8,
+        ..object(&pose, "art/vegeta.png", false)
+    };
+    // and a piece of him with no hair (his arm: the outline and colour 2), which says nothing of the hair
+    let mut arm = Object {
+        id: "battle-super-vegeta-001".to_owned(),
+        key: pose.key ^ 2,
+        ..super_vegeta.clone()
+    };
+    arm.palette.mask = 1 << 1 | 1 << 2;
+    let objects = vec![vegeta, super_vegeta, arm];
+    let pack = pack_of(dir.path(), Vec::new(), ArtIndex::new(Vec::new(), objects));
+    let mut renderer = Renderer::new();
+    renderer.set_art(Some(pack));
+    // Vegeta's own colours: his art
+    let drawn = renderer.render_hd(&frame, options(4)).unwrap();
+    assert_eq!(pixel(&drawn, 41 * 4 + 1, 51 * 4 + 1), [0, 0, 255], "Vegeta: the art");
+    assert_eq!(renderer.art_stats().poses.iter().find(|p| p.fighter).unwrap().art, Some(0));
+    // Super Vegeta's: the sprite, in the frame's green
+    frame.cgram_start[0x80 + 16 + 14] = 0x03FF; // yellow
+    frame.cgram_start[0x80 + 16 + 15] = 0x11DF; // orange
+    let drawn = renderer.render_hd(&frame, options(4)).unwrap();
+    assert_eq!(pixel(&drawn, 41 * 4 + 1, 51 * 4 + 1), [0, 255, 0], "Super Vegeta: the sprite");
+    let stats = renderer.art_stats();
+    let fighter = stats.poses.iter().find(|p| p.fighter).unwrap();
+    assert_eq!((fighter.art, fighter.matched), (None, false), "not Vegeta's art");
+    // Two other colours of hair, not Super Vegeta's palette: recoloured, as before
+    frame.cgram_start[0x80 + 16 + 15] = 0x7C00; // blue
+    renderer.render_hd(&frame, options(4)).unwrap();
+    let stats = renderer.art_stats();
+    let fighter = stats.poses.iter().find(|p| p.fighter).unwrap();
+    assert_eq!((fighter.art, fighter.recoloured), (Some(0), true), "not his palette: the art");
+    // The whole palette a few steps darker (a fade) keeps his three blacks one colour: still his art
+    for index in [1, 14, 15] {
+        frame.cgram_start[0x80 + 16 + index] = 0x0421;
+    }
+    renderer.render_hd(&frame, options(4)).unwrap();
+    let stats = renderer.art_stats();
+    assert_eq!(stats.poses.iter().find(|p| p.fighter).unwrap().art, Some(0), "a fade: the art");
+}
+
+#[test]
+fn super_saiyan_goku_in_a_pose_only_normal_art_exists_for_keeps_the_game_s_sprite() {
+    // Super Saiyan Goku's palette (13 blue, 14 and 15 pale yellow and gold) on tiles the pack has normal art for only,
+    // outline and hair black (a piece of his head at the screen's edge in the hidden fight, `noartfix-f884cde40d`):
+    // recoloured, it drew him with black hair. With Super Saiyan art for the pose the party record decides between
+    // the sets, as before
+    let dir = tempfile::tempdir().unwrap();
+    let (mut frame, pose) = fighter_log(40, 50);
+    write_png(&dir.path().join("art/goku.png"), 64, 64, |_, _| [0, 0, 255, 255]);
+    write_png(&dir.path().join("art/ssj.png"), 64, 64, |_, _| [255, 0, 0, 255]);
+    let (blue, yellow, gold) =
+        (poses::rgb555(0x7C00), poses::rgb555(0x53FF), poses::rgb555(0x0A98));
+    let goku = |id: &str, key: u64, art: &str, hair: Option<[[u8; 3]; 3]>| {
+        let mut palette =
+            Palette { mask: 1 << 1 | 1 << 2 | 1 << 13 | 1 << 14 | 1 << 15, ..Palette::default() };
+        palette.colors[2] = [0, 255, 0];
+        if let Some([thirteen, fourteen, fifteen]) = hair {
+            palette.colors[13] = thirteen;
+            palette.colors[14] = fourteen;
+            palette.colors[15] = fifteen;
+        }
+        Object { id: id.to_owned(), key, palette, ..object(&pose, art, false) }
+    };
+    let normal = goku("battle-goku-000", pose.key, "art/goku.png", None);
+    // his Super Saiyan palette, known from the art of another pose (another key, another size)
+    let other = Object {
+        width: 8,
+        height: 8,
+        ..goku("battle-goku-ssj-019", pose.key ^ 1, "art/ssj.png", Some([blue, yellow, gold]))
+    };
+    for (index, colour) in [(13, 0x7C00), (14, 0x53FF), (15, 0x0A98)] {
+        frame.cgram_start[0x80 + 16 + index] = colour;
+    }
+    let drawn_with = |objects: Vec<Object>| {
+        let pack = pack_of(dir.path(), Vec::new(), ArtIndex::new(Vec::new(), objects));
+        let mut renderer = Renderer::new();
+        renderer.set_art(Some(pack));
+        let drawn = renderer.render_hd(&frame, options(4)).unwrap();
+        let art = renderer.art_stats().poses.iter().find(|p| p.fighter).unwrap().art;
+        (pixel(&drawn, 41 * 4 + 1, 51 * 4 + 1), art)
+    };
+    assert_eq!(
+        drawn_with(vec![normal.clone(), other.clone()]),
+        ([0, 255, 0], None),
+        "only the normal art: the game's sprite"
+    );
+    // The Super Saiyan set has art for the pose: `unit_for` decides between the sets, here (no `$3B`, his colours) the
+    // Super Saiyan art
+    let own = goku("battle-goku-ssj-021", pose.key, "art/ssj.png", Some([blue, yellow, gold]));
+    let (_, art) = drawn_with(vec![normal, other, own]);
+    assert_eq!(art, Some(2), "a Super Saiyan art for the pose: unit_for decides");
+}
+
+#[test]
+fn the_sprites_super_vegeta_s_pose_keeps_are_not_drawn_by_the_art_of_a_field_group() {
+    // The same sprites are a field group too (a 71 x 55 dash of Super Vegeta in the hidden fight is also the key of
+    // `field-frieza-force-000`): once Vegeta's art is not drawn for the fighter, the group must not take its sprites
+    let dir = tempfile::tempdir().unwrap();
+    let (mut frame, pose) = fighter_log(40, 50);
+    let group = poses::poses(&frame, &poses::sprites(&frame))
+        .into_iter()
+        .find(|pose| pose.field)
+        .expect("the field group of the same sprites");
+    write_png(&dir.path().join("art/vegeta.png"), 64, 64, |_, _| [0, 0, 255, 255]);
+    write_png(&dir.path().join("art/field.png"), 64, 64, |_, _| [255, 0, 0, 255]);
+    let vegeta = Object {
+        id: "gallery-party-vegeta-u80-070".to_owned(),
+        palette: vegeta_palette(None),
+        ..object(&pose, "art/vegeta.png", false)
+    };
+    let (yellow, orange) = (poses::rgb555(0x03FF), poses::rgb555(0x11DF));
+    let super_vegeta = Object {
+        id: "battle-super-vegeta-000".to_owned(),
+        key: pose.key ^ 1,
+        palette: vegeta_palette(Some((yellow, orange))),
+        width: 8,
+        height: 8,
+        ..object(&pose, "art/vegeta.png", false)
+    };
+    let field = Object {
+        id: "field-frieza-force-000".to_owned(),
+        key: group.key,
+        palette: vegeta_palette(Some(([255, 0, 0], [160, 0, 0]))),
+        width: group.w as u16,
+        height: group.h as u16,
+        ..object(&pose, "art/field.png", false)
+    };
+    let pack = pack_of(
+        dir.path(),
+        Vec::new(),
+        ArtIndex::new(Vec::new(), vec![vegeta, super_vegeta, field]),
+    );
+    let mut renderer = Renderer::new();
+    renderer.set_art(Some(pack));
+    frame.cgram_start[0x80 + 16 + 14] = 0x03FF;
+    frame.cgram_start[0x80 + 16 + 15] = 0x11DF;
+    let drawn = renderer.render_hd(&frame, options(4)).unwrap();
+    assert_eq!(pixel(&drawn, 41 * 4 + 1, 51 * 4 + 1), [0, 255, 0], "the game's sprite");
+    let stats = renderer.art_stats();
+    assert!(stats.poses.iter().all(|p| !p.matched), "no art for the fighter nor the group");
+}
+
+#[test]
+fn vegeta_s_art_found_by_its_shape_that_would_lose_a_colour_of_super_vegeta_s_palette_is_not_drawn()
+{
+    // Vegeta's art of the same silhouette (another key): made for black at 1 and 14, while the sprite's colour 1 is
+    // yellow and its 14 black, a palette of Super Vegeta's art. Recolouring would give both one colour: the sprite
+    // stays
+    let dir = tempfile::tempdir().unwrap();
+    write_png(&dir.path().join("art/b.png"), 64, 60, |_, _| [0, 0, 0, 255]);
+    let (frame, pose) = banded_log(40, 50, [0x03FF, 0x7FE0, 0x7C1F]);
+    let shape = |fourteen: [u8; 3]| {
+        let mut shape = object(&pose, "art/b.png", false);
+        shape.id = "gallery-enemy-vegeta-u15-056".to_owned();
+        shape.key ^= 1;
+        shape.mask = vec![0; pose.arr.len().div_ceil(8)];
+        for n in (0..pose.arr.len()).filter(|&n| pose.arr[n] != 0) {
+            shape.mask[n / 8] |= 1 << (n % 8);
+        }
+        shape.palette = Palette { mask: 0b1110 | 1 << 14, ..Palette::default() };
+        shape.palette.colors[2] = [255, 255, 255];
+        shape.palette.colors[3] = [128, 128, 128];
+        shape.palette.colors[14] = fourteen;
+        shape
+    };
+    // Super Vegeta's palette, the sprite's colours (another key, another size)
+    let mut super_vegeta = object(&pose, "art/b.png", false);
+    super_vegeta.id = "battle-super-vegeta-000".to_owned();
+    super_vegeta.key ^= 2;
+    (super_vegeta.width, super_vegeta.height) = (8, 8);
+    super_vegeta.palette = Palette { mask: 0b1110 | 1 << 14, ..Palette::default() };
+    for (index, colour) in [(1, 0x03FF), (2, 0x7FE0), (3, 0x7C1F), (14, 0)] {
+        super_vegeta.palette.colors[index] = poses::rgb555(colour);
+    }
+    // and a field group's art of the same silhouette, which the sprites the pose keeps are not given to
+    let mut field = shape([90, 0, 0]);
+    field.id = "field-x-000".to_owned();
+    field.key ^= 3;
+    let drawn_from = |object: Object| {
+        let objects = vec![object, super_vegeta.clone(), field.clone()];
+        let pack = pack_of(dir.path(), Vec::new(), ArtIndex::new(Vec::new(), objects));
+        let mut renderer = Renderer::new();
+        renderer.set_art(Some(pack));
+        renderer.render_hd(&frame, options(4)).unwrap();
+        let stats = renderer.art_stats();
+        let others = stats.poses[1..].iter().filter(|p| p.matched).count();
+        (stats.poses[0].matched, stats.poses[0].recoloured, others)
+    };
+    assert_eq!(drawn_from(shape([0, 0, 0])), (false, false, 0), "black at 1 and 14: the sprite");
+    assert_eq!(drawn_from(shape([90, 0, 0])), (true, true, 0), "another colour at 14: recoloured");
+}
+
 /// A pack with the picture `art/o.png` of the fighter of [`fighter_log`] (blue) and the pose variant `art/v.png` (red, `size`
 /// art pixels) of the same object, drawn while the Kaioken is on; the variant's margin is 2 game pixels.
-fn variant_pack(dir: &tempfile::TempDir, pose: &Pose, variant: Option<(u32, u32)>) -> Arc<Pack> {
+pub(super) fn variant_pack(
+    dir: &tempfile::TempDir,
+    pose: &Pose,
+    variant: Option<(u32, u32)>,
+) -> Arc<Pack> {
     write_png(&dir.path().join("art/o.png"), 64, 64, |_, _| [0, 0, 255, 255]);
     let mut pack = pack_of(
         dir.path(),
@@ -2100,6 +3029,110 @@ fn the_kaioken_variant_of_an_object_is_drawn_while_it_holds_and_its_always_varia
     renderer.set_conditions(Conditions::of_work_ram(&wram_with_kaioken(true, 0)));
     let on = renderer.render_hd(&frame, options(4)).unwrap();
     assert_eq!(pixel(&on, 38 * 4, 48 * 4), [255, 255, 0], "the Kaioken on: `kaioken`");
+}
+
+/// The game's text font of a cartridge image that has only it: every tile of the UI set its own, and the space (tile `$01`)
+/// colour 1 everywhere, as the font's own tests make it.
+fn space_font() -> Arc<crate::font::Font> {
+    // (the UI set is 384 tiles of 2 bits)
+    let mut rom = vec![0_u8; crate::font::FONT_OFFSET + 384 * 16];
+    let at = |code: usize| crate::font::FONT_OFFSET + code * 16;
+    for code in 0..384 {
+        rom[at(code) + 15] = (code % 250) as u8 + 1;
+    }
+    for row in 0..8 {
+        rom[at(0x01) + 2 * row] = 0xFF;
+    }
+    rom[at(0x01) + 15] = 0;
+    Arc::new(crate::font::Font::standard(&rom).unwrap())
+}
+
+/// The fighter of [`fighter_log`] at (40, 50) in front of a BG3 of the font's space in white on every cell (the white of a
+/// Super Saiyan aura, or of a blast, behind the fighter): of priority 1 with BG3 over every layer when `window` (a window
+/// in front of the fighter), of priority 0 otherwise (behind the fighter's priority-0 sprite).
+fn fighter_on_spaces(window: bool) -> FrameLog {
+    let (mut frame, _) = fighter_log(40, 50);
+    for entry in &mut frame.entries {
+        entry.regs.main_bg[2] = true;
+        entry.regs.bg_map_base[2] = 0x0800;
+        entry.regs.bg_char_base[2] = 0x2000;
+        entry.regs.mode_1_bg3_priority = window;
+    }
+    // Tile 1 of BG3's characters: colour 1 on every pixel (the font's space)
+    for row in 0..8 {
+        frame.vram[0x2000 + 8 + row] = 0x00FF;
+    }
+    let entry = 1 | u16::from(window) << 13;
+    frame.vram[0x0800..0x0C00].fill(entry);
+    frame.cgram_start[1] = 0x7FFF;
+    frame
+}
+
+#[test]
+fn a_variants_margin_over_blank_text_cells_behind_the_fighter_is_not_painted_over_by_the_text() {
+    // Super Saiyan Goku's raised hair (`battle-goku-ssj-020` in the aura of the transformation) was cut along the cells of
+    // the aura's white BG3 spaces: the HD text filled every cell's pixels with its ground after the art
+    let dir = tempfile::tempdir().unwrap();
+    let (_, pose) = fighter_log(40, 50);
+    let mut pack = variant_pack(&dir, &pose, None);
+    let always = ssd_mod::pose::Condition::Always;
+    Arc::get_mut(&mut pack).unwrap().variants =
+        vec![flat_variant(&dir, "always", "battle-x-000", always, [255, 0, 0])];
+    let red = [255, 0, 0];
+    let frame = fighter_on_spaces(false);
+    // Enhanced (the 256-pixel picture)
+    let mut renderer = Renderer::new();
+    renderer.set_font(Some(space_font()));
+    renderer.set_art(Some(Arc::clone(&pack)));
+    let drawn = renderer.render_hd(&frame, options(4)).unwrap();
+    assert_eq!(pixel(&drawn, 41 * 4 + 1, 51 * 4 + 1), red, "the sprite's pixels");
+    assert_eq!(pixel(&drawn, 38 * 4, 48 * 4), red, "the margin's first pixel, on a space");
+    assert_eq!(pixel(&drawn, 57 * 4 + 3, 67 * 4 + 3), red, "the margin's last pixel, on a space");
+    assert_eq!(pixel(&drawn, 45 * 4 + 2, 48 * 4 + 1), red, "the margin above the sprite");
+    assert_eq!(
+        pixel(&drawn, 37 * 4 + 3, 50 * 4),
+        [0xFF; 3],
+        "past the margin the cells keep their white"
+    );
+    // The wide view of a battle (the window 58 pixels in)
+    let mut wide = WideRenderer::new();
+    wide.set_font(Some(space_font()));
+    wide.set_art(Some(pack));
+    let options_wide = WideOptions { width: 372, hud: HudPlacement::Window };
+    let shown = wide
+        .render_hd(Rom(&[]), 0x02, None, &frame, options_wide, super::tests::options(4))
+        .unwrap();
+    let at = |x: usize, y: usize| pixel(&shown.picture, (58 + x) * 4, y * 4);
+    assert_eq!(at(38, 48), red, "wide: the margin's first pixel, on a space");
+    assert_eq!(at(45, 48), red, "wide: the margin above the sprite");
+    assert_eq!(at(57, 67), red, "wide: the margin's last pixel");
+    assert_eq!(at(37, 50), [0xFF; 3], "wide: past the margin the cells keep their white");
+}
+
+#[test]
+fn a_variants_margin_under_a_text_window_in_front_of_the_fighter_is_still_covered_by_the_window() {
+    // BG3 of priority 1 over every layer (a window in front of the fighter): the window's cells are drawn over the variant
+    let dir = tempfile::tempdir().unwrap();
+    let (_, pose) = fighter_log(40, 50);
+    let mut pack = variant_pack(&dir, &pose, None);
+    let always = ssd_mod::pose::Condition::Always;
+    Arc::get_mut(&mut pack).unwrap().variants =
+        vec![flat_variant(&dir, "always", "battle-x-000", always, [255, 0, 0])];
+    let frame = fighter_on_spaces(true);
+    let mut renderer = Renderer::new();
+    renderer.set_font(Some(space_font()));
+    renderer.set_art(Some(Arc::clone(&pack)));
+    let drawn = renderer.render_hd(&frame, options(4)).unwrap();
+    assert_eq!(pixel(&drawn, 38 * 4, 48 * 4), [0xFF; 3], "the margin under the window: the window");
+    assert_eq!(pixel(&drawn, 45 * 4 + 2, 48 * 4 + 1), [0xFF; 3], "above the sprite too");
+    let mut wide = WideRenderer::new();
+    wide.set_font(Some(space_font()));
+    wide.set_art(Some(pack));
+    let options_wide = WideOptions { width: 372, hud: HudPlacement::Window };
+    let shown = wide
+        .render_hd(Rom(&[]), 0x02, None, &frame, options_wide, super::tests::options(4))
+        .unwrap();
+    assert_eq!(pixel(&shown.picture, (58 + 38) * 4, 48 * 4), [0xFF; 3], "wide: the window");
 }
 
 #[test]
@@ -2261,4 +3294,1757 @@ fn the_packs_own_variant_of_super_saiyan_goku_is_drawn_for_the_pixels_he_shares_
     let ssj = renderer.render_hd(&frame, options(4)).unwrap();
     assert_eq!(pixel(&ssj, 41 * 4 + 1, 51 * 4 + 1), [255, 255, 0], "Super Saiyan Goku: bigger art");
     assert_eq!(pixel(&ssj, 38 * 4, 48 * 4), [255, 255, 0], "and its margin");
+}
+
+/// The pose of `fighter_log` with art made for its green (palette 1, colour 2): the pack's own art `art/o.png` is solid
+/// green, and the override picture of its name (`battle-x-000`, 64 x 64 unless `size` says) a darker green in its lower
+/// half. Returns the pack, the same pack with the folder of overrides, and a pack whose own art has the override's pixels.
+fn override_packs(
+    dir: &tempfile::TempDir,
+    overrides: &tempfile::TempDir,
+    pose: &Pose,
+    size: u32,
+) -> (Arc<Pack>, Arc<Pack>, Arc<Pack>) {
+    let darker = |_: u32, y: u32| if y < size / 2 { [0, 255, 0, 255] } else { [0, 190, 0, 255] };
+    write_png(&dir.path().join("art/o.png"), 64, 64, |_, _| [0, 255, 0, 255]);
+    write_png(&dir.path().join("art/r.png"), 64, 64, darker);
+    write_png(&overrides.path().join("battle-x-000.png"), size, size, darker);
+    let made_for_green = |art: &str| {
+        let mut object = object(pose, art, false);
+        object.palette = Palette { mask: 0b100, ..Palette::default() };
+        object.palette.colors[2] = [0, 255, 0];
+        object
+    };
+    let pack = pack_of(
+        dir.path(),
+        Vec::new(),
+        ArtIndex::new(Vec::new(), vec![made_for_green("art/o.png")]),
+    );
+    let overridden = Arc::new((*pack).clone().with_art_override(overrides.path()));
+    let reference = pack_of(
+        dir.path(),
+        Vec::new(),
+        ArtIndex::new(Vec::new(), vec![made_for_green("art/r.png")]),
+    );
+    (pack, overridden, reference)
+}
+
+fn drawn_with(pack: &Arc<Pack>, frame: &FrameLog) -> crate::HdFrame {
+    let mut renderer = Renderer::new();
+    renderer.set_art(Some(Arc::clone(pack)));
+    renderer.render_hd(frame, options(4)).unwrap()
+}
+
+#[test]
+fn an_override_picture_is_drawn_in_place_of_the_packs_art_recoloured_flashed_and_faded_as_the_packs_own()
+ {
+    let (dir, overrides) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (frame, pose) = fighter_log(40, 50);
+    let (pack, overridden, reference) = override_packs(&dir, &overrides, &pose, 64);
+    let lower = (41 * 4 + 1, 61 * 4 + 1);
+
+    // The palette the art was made for: the picture as it is, where the pack's art is drawn
+    let own = drawn_with(&pack, &frame);
+    let drawn = drawn_with(&overridden, &frame);
+    assert_eq!(pixel(&own, lower.0, lower.1), [0, 255, 0]);
+    assert_eq!(pixel(&drawn, lower.0, lower.1), [0, 190, 0], "the override's darker half");
+    assert_eq!(pixel(&drawn, 41 * 4 + 1, 51 * 4 + 1), [0, 255, 0]);
+    assert_eq!(drawn, drawn_with(&reference, &frame), "as if the pack's own art were the picture");
+
+    // Another palette (the pose in another fighter's colours), the white of a hit and a fade of the screen: every one draws
+    // the override as the pack's own art of the same pixels is drawn, and not as the pack's art it replaces
+    let mut red = frame.clone();
+    red.cgram_start[0x80 + 16 + 2] = 0x001F;
+    let mut white = frame.clone();
+    white.cgram_start[0x80 + 16 + 2] = 0x7FFF;
+    let mut faded = frame.clone();
+    for entry in &mut faded.entries {
+        entry.regs.brightness = 8;
+    }
+    for (name, frame) in [("red", &red), ("white", &white), ("faded", &faded)] {
+        let drawn = drawn_with(&overridden, frame);
+        assert_eq!(drawn, drawn_with(&reference, frame), "{name}");
+        assert_ne!(
+            pixel(&drawn, lower.0, lower.1),
+            pixel(&drawn_with(&pack, frame), lower.0, lower.1),
+            "{name}: the override is drawn"
+        );
+    }
+    let [r, g, b] = pixel(&drawn_with(&overridden, &red), lower.0, lower.1);
+    assert!(
+        r > 150 && r < 255 && g == 0 && b == 0,
+        "recoloured to red, still the darker: {r} {g} {b}"
+    );
+    let [r, g, b] = pixel(&drawn_with(&overridden, &white), lower.0, lower.1);
+    assert!(
+        r == g && g == b && r > 150 && r < 255,
+        "the hit's white, still the darker: {r} {g} {b}"
+    );
+}
+
+#[test]
+fn an_override_picture_of_another_size_or_none_leaves_the_packs_art() {
+    let (frame, pose) = fighter_log(40, 50);
+    // A picture of 32 x 32 for art of 64 x 64: left out, the pack's art is drawn
+    let (dir, overrides) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (pack, overridden, _) = override_packs(&dir, &overrides, &pose, 32);
+    assert_eq!(overridden.art.objects(), pack.art.objects());
+    assert_eq!(drawn_with(&overridden, &frame), drawn_with(&pack, &frame));
+    // No picture of the pose's name
+    let (dir, overrides) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (pack, _, _) = override_packs(&dir, &overrides, &pose, 64);
+    std::fs::remove_file(overrides.path().join("battle-x-000.png")).unwrap();
+    let none = Arc::new((*pack).clone().with_art_override(overrides.path()));
+    assert_eq!(drawn_with(&none, &frame), drawn_with(&pack, &frame));
+    assert_eq!(pixel(&drawn_with(&none, &frame), 41 * 4 + 1, 61 * 4 + 1), [0, 255, 0]);
+}
+
+/// The fighter of [`fighter_log`] (`battle-x-000`, blue art `art/o.png`) in three packs: `own`, with the pack's own `always`
+/// variant of it (green, margin 2 game pixels) and its Kaioken variant (yellow, margin 2); `overridden`, the same pack with
+/// the folder `overrides` whose `variants\battle-x-000.png` is red, `size` x `size` art pixels (216 is the fighter's 64 grown
+/// by 76 on each side); and `reference`, the pack whose own `always` variant is that red picture with the margin of 76 art
+/// pixels (19 game pixels), the Kaioken's left as it is.
+fn override_variant_packs(
+    dir: &tempfile::TempDir,
+    overrides: &tempfile::TempDir,
+    pose: &Pose,
+    size: u32,
+) -> (Arc<Pack>, Arc<Pack>, Arc<Pack>) {
+    let (always, kaioken) = (ssd_mod::pose::Condition::Always, ssd_mod::pose::Condition::Kaioken);
+    let mut own = variant_pack(dir, pose, None);
+    Arc::get_mut(&mut own).unwrap().pose_art = vec![
+        flat_variant(dir, "own", "battle-x-000", always, [0, 255, 0]),
+        flat_variant(dir, "own-kaioken", "battle-x-000", kaioken, [255, 255, 0]),
+    ];
+    let sub = overrides.path().join(crate::pack::VARIANTS_DIR);
+    std::fs::create_dir_all(&sub).unwrap();
+    let picture = sub.join("battle-x-000.png");
+    write_png(&picture, size, size, |_, _| [255, 0, 0, 255]);
+    let overridden = Arc::new((*own).clone().with_art_override(overrides.path()));
+    let mut reference = (*own).clone();
+    reference.pose_art = vec![
+        flat_variant(dir, "own-kaioken", "battle-x-000", kaioken, [255, 255, 0]),
+        PoseVariant {
+            art: "battle-x-000".to_owned(),
+            when: always,
+            margin: 19,
+            file: std::path::absolute(&picture).unwrap().to_string_lossy().into_owned(),
+        },
+    ];
+    (own, overridden, Arc::new(reference))
+}
+
+#[test]
+fn a_picture_of_the_variants_folder_is_drawn_over_its_box_and_a_margin_of_76_art_pixels_in_place_of_the_packs_own()
+ {
+    let (dir, overrides) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    // The 16 x 16 fighter at (40, 50): the picture covers 21 to 74, 31 to 84 (19 game pixels on each side)
+    let (frame, pose) = fighter_log(40, 50);
+    let (own, overridden, _) = override_variant_packs(&dir, &overrides, &pose, 216);
+    let red = [255, 0, 0];
+    let mut renderer = Renderer::new();
+    let plain = renderer.render_hd(&frame, options(4)).unwrap();
+    renderer.set_art(Some(Arc::clone(&own)));
+    let packs = renderer.render_hd(&frame, options(4)).unwrap();
+    assert_eq!(pixel(&packs, 41 * 4 + 1, 51 * 4 + 1), [0, 255, 0], "the pack's own variant");
+    renderer.set_art(Some(overridden));
+    for on in [false, true] {
+        renderer.set_conditions(Conditions::of_work_ram(&wram_with_kaioken(on, 0)));
+        let drawn = renderer.render_hd(&frame, options(4)).unwrap();
+        if on {
+            // A variant for a condition is drawn while it holds, over the `always` one, as over the pack's own
+            assert_eq!(pixel(&drawn, 41 * 4 + 1, 51 * 4 + 1), [255, 255, 0], "the Kaioken's");
+            continue;
+        }
+        assert_eq!(pixel(&drawn, 41 * 4 + 1, 51 * 4 + 1), red, "the sprite's pixels");
+        assert_eq!(pixel(&drawn, 21 * 4, 31 * 4), red, "the margin's first pixel");
+        assert_eq!(pixel(&drawn, 74 * 4 + 3, 84 * 4 + 3), red, "the margin's last pixel");
+        assert_ne!(pixel(&drawn, 20 * 4 + 3, 50 * 4), red, "nothing past the margin on the left");
+        assert_ne!(pixel(&drawn, 40 * 4, 30 * 4 + 3), red, "nor above it");
+        assert_eq!(pixel(&drawn, 5, 5), pixel(&plain, 5, 5), "away from the pose nothing changes");
+    }
+}
+
+#[test]
+fn a_picture_of_the_variants_folder_is_drawn_as_the_packs_own_variant_faded_and_over_blank_text_cells()
+ {
+    let (dir, overrides) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (frame, pose) = fighter_log(40, 50);
+    let (_, overridden, reference) = override_variant_packs(&dir, &overrides, &pose, 216);
+    // Another palette, the white of a hit and a fade of the screen: every frame as the pack's own variant of the picture
+    let mut red = frame.clone();
+    red.cgram_start[0x80 + 16 + 2] = 0x001F;
+    let mut white = frame.clone();
+    white.cgram_start[0x80 + 16 + 2] = 0x7FFF;
+    let mut faded = frame.clone();
+    for entry in &mut faded.entries {
+        entry.regs.brightness = 8;
+    }
+    for (name, frame) in [("plain", &frame), ("red", &red), ("white", &white), ("faded", &faded)] {
+        assert_eq!(drawn_with(&overridden, frame), drawn_with(&reference, frame), "{name}");
+    }
+    let [r, g, b] = pixel(&drawn_with(&overridden, &faded), 21 * 4, 31 * 4);
+    assert!(r > 0 && r < 255 && g == 0 && b == 0, "the fade shades the margin: {r} {g} {b}");
+    // In front of the white BG3 spaces of an aura: the HD text leaves the margin (the Super Saiyan's raised hair)
+    let spaces = fighter_on_spaces(false);
+    let drawn_on_spaces = |pack: &Arc<Pack>| {
+        let mut renderer = Renderer::new();
+        renderer.set_font(Some(space_font()));
+        renderer.set_art(Some(Arc::clone(pack)));
+        renderer.render_hd(&spaces, options(4)).unwrap()
+    };
+    let drawn = drawn_on_spaces(&overridden);
+    assert_eq!(pixel(&drawn, 21 * 4, 31 * 4), [255, 0, 0], "the margin's first pixel, on a space");
+    assert_eq!(pixel(&drawn, 45 * 4 + 2, 31 * 4 + 1), [255, 0, 0], "the margin above the sprite");
+    assert_eq!(
+        pixel(&drawn, 20 * 4 + 3, 50 * 4),
+        [0xFF; 3],
+        "past the margin the cells keep their white"
+    );
+    assert_eq!(drawn, drawn_on_spaces(&reference));
+}
+
+#[test]
+fn a_picture_of_the_variants_folder_of_another_size_or_none_leaves_the_packs_own_variant() {
+    let (frame, pose) = fighter_log(40, 50);
+    for on in [false, true] {
+        let conditions = Conditions::of_work_ram(&wram_with_kaioken(on, 0));
+        let drawn = |pack: &Arc<Pack>| {
+            let mut renderer = Renderer::new();
+            renderer.set_art(Some(Arc::clone(pack)));
+            renderer.set_conditions(conditions);
+            renderer.render_hd(&frame, options(4)).unwrap()
+        };
+        // 80 x 80 (the pack's own margin of 2 game pixels) and 220 x 216: left out, the pack's own variant is drawn
+        for size in [80, 220] {
+            let (dir, overrides) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+            let (own, overridden, _) = override_variant_packs(&dir, &overrides, &pose, size);
+            assert_eq!(overridden.pose_art, own.pose_art, "{size}");
+            assert_eq!(drawn(&overridden), drawn(&own), "{size}");
+        }
+        // No folder `variants`, an empty one, and no folder at all: every frame the same
+        let (dir, overrides) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let (own, _, _) = override_variant_packs(&dir, &overrides, &pose, 216);
+        let sub = overrides.path().join(crate::pack::VARIANTS_DIR);
+        std::fs::remove_file(sub.join("battle-x-000.png")).unwrap();
+        let empty = Arc::new((*own).clone().with_art_override(overrides.path()));
+        std::fs::remove_dir(&sub).unwrap();
+        let none = Arc::new((*own).clone().with_art_override(overrides.path()));
+        let absent = Arc::new((*own).clone().with_art_override(&overrides.path().join("absent")));
+        for pack in [&empty, &none, &absent] {
+            assert_eq!(pack.pose_art, own.pose_art);
+            assert_eq!(drawn(pack), drawn(&own), "Kaioken {on}");
+        }
+    }
+}
+
+/// The pose of [`fighter_log`] as a pose of Super Vegeta the pack has only Vegeta's art for (patch 0049): `name`, blue,
+/// in `vegeta` (his palette as the art has it); Super Vegeta's palette is known from the art of another pose
+/// (`battle-super-vegeta-000`, and his arm `battle-super-vegeta-001`, no hair), and `art-override\super-vegeta\` holds a
+/// picture of the pose's name, magenta. Returns the pack without the folder and the pack with it.
+fn super_vegeta_override_packs(
+    dir: &tempfile::TempDir,
+    overrides: &tempfile::TempDir,
+    pose: &Pose,
+    name: &str,
+    vegeta: Palette,
+) -> (Arc<Pack>, Arc<Pack>) {
+    write_png(&dir.path().join("art/vegeta.png"), 64, 64, |_, _| [0, 0, 255, 255]);
+    write_png(&overrides.path().join(format!("super-vegeta/{name}.png")), 64, 64, |_, _| {
+        [255, 0, 255, 255]
+    });
+    let vegeta =
+        Object { id: name.to_owned(), palette: vegeta, ..object(pose, "art/vegeta.png", false) };
+    let (yellow, orange) = (poses::rgb555(0x03FF), poses::rgb555(0x11DF));
+    let super_vegeta = Object {
+        id: "battle-super-vegeta-000".to_owned(),
+        key: pose.key ^ 1,
+        palette: vegeta_palette(Some((yellow, orange))),
+        width: 8,
+        height: 8,
+        ..object(pose, "art/vegeta.png", false)
+    };
+    // and a piece of him with no hair (his arm: the outline and colour 2), the same colours as Vegeta's there
+    let mut arm = Object {
+        id: "battle-super-vegeta-001".to_owned(),
+        key: pose.key ^ 2,
+        ..super_vegeta.clone()
+    };
+    arm.palette.mask = 1 << 1 | 1 << 2;
+    let pack =
+        pack_of(dir.path(), Vec::new(), ArtIndex::new(Vec::new(), vec![vegeta, super_vegeta, arm]));
+    let with = Arc::new((*pack).clone().with_art_override(overrides.path()));
+    (pack, with)
+}
+
+/// The fighter of [`fighter_log`] drawn from `pack`: the colour at its middle, the art drawn (an index of the pack), whether
+/// it was recoloured, and the whole picture.
+fn drawn_fighter(pack: &Arc<Pack>, frame: &FrameLog) -> ([u8; 3], Option<u32>, bool, Vec<u8>) {
+    let mut renderer = Renderer::new();
+    renderer.set_art(Some(Arc::clone(pack)));
+    let drawn = renderer.render_hd(frame, options(4)).unwrap();
+    let stats = renderer.art_stats();
+    let fighter = stats.poses.iter().find(|p| p.fighter).unwrap();
+    (pixel(&drawn, 41 * 4 + 1, 51 * 4 + 1), fighter.art, fighter.recoloured, drawn.rgba.clone())
+}
+
+/// Super Vegeta's palette in the frame of [`fighter_log`]: yellow and orange hair at 14 and 15.
+fn super_vegeta_colours(frame: &mut FrameLog) {
+    frame.cgram_start[0x80 + 16 + 14] = 0x03FF; // yellow
+    frame.cgram_start[0x80 + 16 + 15] = 0x11DF; // orange
+}
+
+#[test]
+fn super_vegeta_s_own_picture_of_a_pose_whose_art_shows_no_hair_is_drawn_in_his_colours_and_never_in_vegeta_s()
+ {
+    // `battle-vegeta-803` (both arms up, the head thrown back): the game draws Super Vegeta so with Vegeta's tiles in his
+    // own palette, and the pack's art is Vegeta's, with the shoulder pads. It uses no colour of the hair, so it was drawn
+    // in his colours as it is, pads and all. Ming's picture of the pose without the pads
+    // (`art-override\super-vegeta\battle-vegeta-803.png`) is drawn there; Vegeta in his own colours keeps the pack's art,
+    // the pads (the picture's name is his). Vegeta's colours and Super Vegeta's are the same on the colours the pose uses
+    // (and on those of his arm's art): only the hair of the frame's palette tells them apart
+    let dir = tempfile::tempdir().unwrap();
+    let overrides = tempfile::tempdir().unwrap();
+    let (mut frame, pose) = fighter_log(40, 50);
+    let mut no_hair = vegeta_palette(None);
+    no_hair.mask = 1 << 1 | 1 << 2;
+    let (pack, with) =
+        super_vegeta_override_packs(&dir, &overrides, &pose, "battle-vegeta-803", no_hair);
+    let added = &with.art.objects()[3];
+    assert_eq!(added.id, "battle-vegeta-803@super-vegeta");
+    assert_eq!(
+        with.art.objects()[..3],
+        pack.art.objects()[..],
+        "Vegeta's own pose is left as it was"
+    );
+    // Vegeta's colours (black hair): his art, the same picture to the pixel as without the folder
+    let (colour, art, _, vegeta) = drawn_fighter(&with, &frame);
+    assert_eq!(
+        (colour, art),
+        ([0, 0, 255], Some(0)),
+        "Vegeta: the pack's art, not Super Vegeta's picture"
+    );
+    assert_eq!(vegeta, drawn_fighter(&pack, &frame).3, "Vegeta: as without the folder");
+    // Super Vegeta's: the picture, in its own colours (it was made in them); without the folder Vegeta's art
+    super_vegeta_colours(&mut frame);
+    let (colour, art, recoloured, _) = drawn_fighter(&with, &frame);
+    assert_eq!(
+        (colour, art, recoloured),
+        ([255, 0, 255], Some(3), false),
+        "Super Vegeta: the picture"
+    );
+    assert_eq!(
+        drawn_fighter(&pack, &frame).1,
+        Some(0),
+        "without the folder: Vegeta's art, with the pads"
+    );
+    // Two other colours of hair (neither his nor Vegeta's): Vegeta's art, as without the folder
+    frame.cgram_start[0x80 + 16 + 15] = 0x7C00; // blue
+    let (_, art, _, other) = drawn_fighter(&with, &frame);
+    assert_eq!(art, Some(0), "not his palette: Vegeta's art");
+    assert_eq!(other, drawn_fighter(&pack, &frame).3, "other colours: as without the folder");
+}
+
+#[test]
+fn super_vegeta_s_own_picture_of_a_pose_whose_art_shows_the_hair_is_drawn_in_his_colours_only() {
+    // `gallery-party-vegeta-u80-056` (his upper body at the screen's top edge): Vegeta's art with his hair, a dark grey
+    // apart from the outline, so it recolours to Super Vegeta's yellow hair, pads and all. Ming's picture of it is drawn
+    // in Super Vegeta's colours, Vegeta's art in Vegeta's and in any other
+    let dir = tempfile::tempdir().unwrap();
+    let overrides = tempfile::tempdir().unwrap();
+    let (mut frame, pose) = fighter_log(40, 50);
+    let grey = Some(([40, 40, 40], [60, 60, 60]));
+    let name = "gallery-party-vegeta-u80-056";
+    let (pack, with) =
+        super_vegeta_override_packs(&dir, &overrides, &pose, name, vegeta_palette(grey));
+    let (_, art, _, vegeta) = drawn_fighter(&with, &frame);
+    assert_eq!(art, Some(0), "Vegeta: his art");
+    assert_eq!(vegeta, drawn_fighter(&pack, &frame).3, "as without the folder");
+    super_vegeta_colours(&mut frame);
+    let (colour, art, recoloured, _) = drawn_fighter(&with, &frame);
+    assert_eq!(
+        (colour, art, recoloured),
+        ([255, 0, 255], Some(3), false),
+        "Super Vegeta: the picture"
+    );
+    assert_eq!(
+        drawn_fighter(&pack, &frame).1,
+        Some(0),
+        "without the folder: Vegeta's art recoloured"
+    );
+}
+
+#[test]
+fn super_vegeta_s_keyed_picture_of_a_pose_of_no_art_is_drawn_in_his_colours_and_vegeta_keeps_the_game_s_sprite()
+ {
+    // Super Vegeta's back to Goku's Kamehameha (key `…9b50`, and the throw after it) is drawn with Vegeta's tiles the pack
+    // has no art for, so the game's sprite showed the pads. `art-override\super-vegeta\key-<key>.png` with the pose's
+    // pixels in `key-<key>.txt` is drawn in his colours; in Vegeta's (black hair), and in any other, the pose keeps the
+    // game's sprite, as without the folder
+    let dir = tempfile::tempdir().unwrap();
+    let overrides = tempfile::tempdir().unwrap();
+    let (mut frame, pose) = fighter_log(40, 50);
+    write_png(&dir.path().join("art/vegeta.png"), 32, 32, |_, _| [0, 0, 255, 255]);
+    let name = format!("super-vegeta/key-{:016x}", pose.key);
+    write_png(&overrides.path().join(format!("{name}.png")), 64, 64, |_, _| [255, 0, 255, 255]);
+    let row = "2".repeat(16) + "\n";
+    std::fs::write(overrides.path().join(format!("{name}.txt")), row.repeat(16)).unwrap();
+    // Super Vegeta's palette is known from his art of another pose
+    let (yellow, orange) = (poses::rgb555(0x03FF), poses::rgb555(0x11DF));
+    let super_vegeta = Object {
+        id: "battle-super-vegeta-000".to_owned(),
+        key: pose.key ^ 1,
+        palette: vegeta_palette(Some((yellow, orange))),
+        width: 8,
+        height: 8,
+        ..object(&pose, "art/vegeta.png", false)
+    };
+    let pack = pack_of(dir.path(), Vec::new(), ArtIndex::new(Vec::new(), vec![super_vegeta]));
+    let with = Arc::new((*pack).clone().with_art_override(overrides.path()));
+    assert_eq!(with.art.objects().len(), 2, "the pose added");
+    assert_eq!(with.art.objects()[1].id, format!("key-{:016x}@super-vegeta", pose.key));
+    // Vegeta's colours (black hair): the game's sprite, the same picture to the pixel as without the folder
+    let (colour, art, _, vegeta) = drawn_fighter(&with, &frame);
+    assert_eq!((colour, art), ([0, 255, 0], None), "Vegeta: the game's sprite");
+    assert_eq!(vegeta, drawn_fighter(&pack, &frame).3, "Vegeta: as without the folder");
+    // Super Vegeta's: the picture, in its own colours; without the folder the game's sprite
+    super_vegeta_colours(&mut frame);
+    let (colour, art, recoloured, _) = drawn_fighter(&with, &frame);
+    assert_eq!(
+        (colour, art, recoloured),
+        ([255, 0, 255], Some(1), false),
+        "Super Vegeta: the picture"
+    );
+    assert_eq!(drawn_fighter(&pack, &frame).1, None, "without the folder: the game's sprite");
+    // Two other colours of hair: the game's sprite, as without the folder
+    frame.cgram_start[0x80 + 16 + 15] = 0x7C00; // blue
+    let (_, art, _, other) = drawn_fighter(&with, &frame);
+    assert_eq!(art, None, "not his palette: the game's sprite");
+    assert_eq!(other, drawn_fighter(&pack, &frame).3, "other colours: as without the folder");
+}
+
+#[test]
+fn a_keyed_picture_with_its_pose_and_no_pixels_draws_every_frame_as_with_its_pixels() {
+    // A release ships `key-<key>.pose` in place of the original sprite's pixels `key-<key>.txt`. The frames are the
+    // same to the pixel: in Super Vegeta's colours (the picture), in Vegeta's and in others (the game's sprite), and with
+    // an effect behind him where his sprite is transparent (drawn from back to front)
+    let dir = tempfile::tempdir().unwrap();
+    let (with_pixels, with_pose) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+    let (mut frame, pose) = fighter_log(40, 50);
+    write_png(&dir.path().join("art/vegeta.png"), 32, 32, |_, _| [0, 0, 255, 255]);
+    let name = format!("super-vegeta/key-{:016x}", pose.key);
+    let pixels = ("2".repeat(16) + "\n").repeat(16);
+    for overrides in [&with_pixels, &with_pose] {
+        write_png(&overrides.path().join(format!("{name}.png")), 64, 64, |x, y| {
+            [255, (x * 4) as u8, (y * 4) as u8, 255]
+        });
+    }
+    std::fs::write(with_pixels.path().join(format!("{name}.txt")), &pixels).unwrap();
+    let pose_text = crate::pack::keyed_pose_text(&pixels).unwrap();
+    std::fs::write(with_pose.path().join(format!("{name}.pose")), pose_text).unwrap();
+    let (yellow, orange) = (poses::rgb555(0x03FF), poses::rgb555(0x11DF));
+    let super_vegeta = Object {
+        id: "battle-super-vegeta-000".to_owned(),
+        key: pose.key ^ 1,
+        palette: vegeta_palette(Some((yellow, orange))),
+        width: 8,
+        height: 8,
+        ..object(&pose, "art/vegeta.png", false)
+    };
+    let pack = pack_of(dir.path(), Vec::new(), ArtIndex::new(Vec::new(), vec![super_vegeta]));
+    let a = Arc::new((*pack).clone().with_art_override(with_pixels.path()));
+    let b = Arc::new((*pack).clone().with_art_override(with_pose.path()));
+    assert_eq!(b.art.objects().len(), 2, "the pose added without its pixels");
+    let vegeta = drawn_fighter(&b, &frame);
+    assert_eq!(vegeta.1, None, "Vegeta: the game's sprite");
+    assert_eq!(drawn_fighter(&a, &frame), vegeta, "Vegeta's colours");
+    super_vegeta_colours(&mut frame);
+    let his = drawn_fighter(&b, &frame);
+    assert_eq!(his.1, Some(1), "Super Vegeta: the picture");
+    assert_eq!(drawn_fighter(&a, &frame), his, "Super Vegeta's colours");
+    frame.cgram_start[0x80 + 16 + 15] = 0x7C00; // blue
+    assert_eq!(drawn_fighter(&a, &frame), drawn_fighter(&b, &frame), "other colours");
+    // an effect behind him where his sprite is transparent
+    let (frame, fighter, effect) = effect_behind_a_gap_log(true);
+    let drawn = |pose_only: bool| {
+        let (dir, overrides) = (tempfile::tempdir().unwrap(), tempfile::tempdir().unwrap());
+        let pack = super_vegeta_and_waves_pack_as(
+            &dir,
+            &overrides,
+            &fighter,
+            &[&effect],
+            |x, y| if x < 8 && y < 32 { [0, 0, 0, 0] } else { [255, 0, 255, 255] },
+            pose_only,
+        );
+        let mut renderer = Renderer::new();
+        renderer.set_art(Some(pack));
+        let drawn = renderer.render_hd(&frame, options(4)).unwrap();
+        let art = renderer.art_stats().poses.iter().find(|p| p.fighter).unwrap().art;
+        (art, drawn.rgba.clone())
+    };
+    let (pixels_art, pixels_frame) = drawn(false);
+    assert_eq!(pixels_art, Some(2), "his picture");
+    assert!(drawn(true) == (pixels_art, pixels_frame), "the effect behind him: the same frame");
+}
+
+/// The frame of [`fighter_log`] in Super Vegeta's colours with an effect behind the fighter: sprite 1, 16 x 16, palette 4,
+/// solid colour 3 (red), four pixels left of him (`x` 36 to 51, the fighter 40 to 55), and the effect's pose. The fighter
+/// is in front (sprite 0), so the original shows him where both are.
+fn effect_behind_log() -> (FrameLog, Pose, Pose) {
+    let (mut frame, _) = fighter_log(40, 50);
+    super_vegeta_colours(&mut frame);
+    let (frame, fighter, effect) = with_effect(frame, false, &[2, 3, 18, 19]);
+    assert_eq!((effect.org.0, effect.w, effect.h), (36, 16, 16));
+    (frame, fighter, effect)
+}
+
+/// `frame` (of [`fighter_log`] at `(40, 50)`) with an effect four pixels left of the fighter: a 16 x 16 sprite at `x` 36
+/// to 51, palette 4, solid colour 3 (red) in its characters `tiles` (2 and 3 its top half, 18 and 19 its bottom half), the
+/// others transparent. The effect is OAM entry 0 and the fighter entry 1 (the effect in front of him) with `in_front`,
+/// else the fighter 0 and the effect 1. Returns the frame and the poses of the fighter and of the effect found in it.
+fn with_effect(mut frame: FrameLog, in_front: bool, tiles: &[usize]) -> (FrameLog, Pose, Pose) {
+    let effect = [36, 50, 2, 4 << 1];
+    if in_front {
+        let fighter = [frame.oam_low[0], frame.oam_low[1], frame.oam_low[2], frame.oam_low[3]];
+        frame.oam_low[0..4].copy_from_slice(&effect);
+        frame.oam_low[4..8].copy_from_slice(&fighter);
+    } else {
+        frame.oam_low[4..8].copy_from_slice(&effect);
+    }
+    frame.oam_high[0] |= 0b10 << 2;
+    for &tile in tiles {
+        for row in 0..8 {
+            frame.vram[tile * 16 + row] = 0xFFFF;
+        }
+    }
+    frame.cgram_start[0x80 + 4 * 16 + 3] = 0x001F; // red
+    let sprites = poses::sprites(&frame);
+    let found: Vec<Pose> =
+        poses::poses(&frame, &sprites).into_iter().filter(|pose| !pose.field).collect();
+    let fighter = found.iter().find(|pose| pose.fighter).expect("the fighter").clone();
+    let effect = found.iter().find(|pose| !pose.fighter).expect("the effect").clone();
+    assert_eq!((fighter.first, effect.first), if in_front { (1, 0) } else { (0, 1) });
+    (frame, fighter, effect)
+}
+
+/// The pack of red art for `fighter` (in Super Vegeta's colours) and for `effect` (an energy wave), with the folder
+/// `overrides` whose `super-vegeta\key-<key>.png` is `picture` (with its pixels, the fighter's): his own picture of the
+/// pose, drawn in place of the game's sprite (patch 0049).
+fn super_vegeta_and_wave_pack(
+    dir: &tempfile::TempDir,
+    overrides: &tempfile::TempDir,
+    fighter: &Pose,
+    effect: &Pose,
+    picture: impl Fn(u32, u32) -> [u8; 4],
+) -> Arc<Pack> {
+    super_vegeta_and_waves_pack(dir, overrides, fighter, &[effect], picture)
+}
+
+/// [`super_vegeta_and_wave_pack`] with red art for each of `effects`.
+fn super_vegeta_and_waves_pack(
+    dir: &tempfile::TempDir,
+    overrides: &tempfile::TempDir,
+    fighter: &Pose,
+    effects: &[&Pose],
+    picture: impl Fn(u32, u32) -> [u8; 4],
+) -> Arc<Pack> {
+    super_vegeta_and_waves_pack_as(dir, overrides, fighter, effects, picture, false)
+}
+
+/// [`super_vegeta_and_waves_pack`], the picture's pose given by `key-<key>.pose` in place of its pixels with `pose_only`
+/// (what a release ships, `crate::pack::keyed_pose_text`).
+fn super_vegeta_and_waves_pack_as(
+    dir: &tempfile::TempDir,
+    overrides: &tempfile::TempDir,
+    fighter: &Pose,
+    effects: &[&Pose],
+    picture: impl Fn(u32, u32) -> [u8; 4],
+    pose_only: bool,
+) -> Arc<Pack> {
+    write_png(&dir.path().join("art/red.png"), 64, 64, |_, _| [255, 0, 0, 255]);
+    let name = format!("super-vegeta/key-{:016x}", fighter.key);
+    write_png(&overrides.path().join(format!("{name}.png")), 64, 64, picture);
+    let pixels: String = fighter
+        .arr
+        .chunks(fighter.w)
+        .map(|row| {
+            row.iter().map(|&c| char::from_digit(u32::from(c), 16).unwrap()).collect::<String>()
+                + "\n"
+        })
+        .collect();
+    if pose_only {
+        let pose = crate::pack::keyed_pose_text(&pixels).unwrap();
+        std::fs::write(overrides.path().join(format!("{name}.pose")), pose).unwrap();
+    } else {
+        std::fs::write(overrides.path().join(format!("{name}.txt")), pixels).unwrap();
+    }
+    let (yellow, orange) = (poses::rgb555(0x03FF), poses::rgb555(0x11DF));
+    let super_vegeta = Object {
+        id: "battle-super-vegeta-000".to_owned(),
+        key: fighter.key ^ 1,
+        palette: vegeta_palette(Some((yellow, orange))),
+        ..object(fighter, "art/red.png", false)
+    };
+    let mut objects = vec![super_vegeta];
+    for (n, effect) in effects.iter().enumerate() {
+        let id = format!("battle-fx-{n:03}");
+        objects.push(Object { id, ..object(effect, "art/red.png", false) });
+    }
+    let pack = pack_of(dir.path(), Vec::new(), ArtIndex::new(Vec::new(), objects));
+    Arc::new((*pack).clone().with_art_override(overrides.path()))
+}
+
+/// The frame of [`fighter_log`] with the fighter's top left two columns transparent in rows 0 to 7 (`x` 40 and 41) and
+/// the effect of [`with_effect`] behind him: the original shows the effect there, the fighter's art grows over it.
+fn effect_behind_a_gap_log(super_vegeta: bool) -> (FrameLog, Pose, Pose) {
+    let (mut frame, _) = fighter_log(40, 50);
+    if super_vegeta {
+        super_vegeta_colours(&mut frame);
+    }
+    for row in 0..8 {
+        frame.vram[row] = 0x3F00;
+    }
+    let (frame, fighter, effect) = with_effect(frame, false, &[2, 3, 18, 19]);
+    assert_eq!((fighter.org.0, fighter.w, fighter.h), (40, 16, 16));
+    assert_eq!(fighter.arr[3 * 16..3 * 16 + 3], [0, 0, 2], "the gap in his silhouette");
+    (frame, fighter, effect)
+}
+
+/// The fighter's art of [`super_vegeta_s_art_leaves_what_is_behind_it_shown_where_it_is_transparent`]: magenta, its top
+/// left transparent where the original's fighter covers the effect (columns 0 to 5, rows 0 to 7 of the pose), half
+/// transparent in columns 6 and 7 there, opaque elsewhere.
+fn part_transparent(x: u32, y: u32) -> [u8; 4] {
+    match (x / 4, y / 4) {
+        (0..=5, 0..=7) => [0, 0, 0, 0],
+        (6..=7, 0..=7) => [255, 0, 255, 128],
+        _ => [255, 0, 255, 255],
+    }
+}
+
+#[test]
+fn super_vegeta_s_art_leaves_what_is_behind_it_shown_where_it_is_transparent() {
+    // Super Vegeta's picture without the shoulder pads (`art-override\super-vegeta\`) does not cover the pixels of the
+    // game's sprite where the pads were: an energy wave behind him was hidden there by the sprite, and with the sprite
+    // hidden too nothing drew it, so the background showed through the wave in the pads' shape. Where his art is
+    // transparent the effect's art is drawn; where it is half transparent the two are mixed; where it is opaque it
+    // covers the effect as before
+    let dir = tempfile::tempdir().unwrap();
+    let overrides = tempfile::tempdir().unwrap();
+    let (frame, fighter, effect) = effect_behind_log();
+    write_png(&dir.path().join("art/red.png"), 64, 64, |_, _| [255, 0, 0, 255]);
+    let name = format!("super-vegeta/key-{:016x}", fighter.key);
+    write_png(&overrides.path().join(format!("{name}.png")), 64, 64, part_transparent);
+    let row = "2".repeat(16) + "\n";
+    std::fs::write(overrides.path().join(format!("{name}.txt")), row.repeat(16)).unwrap();
+    let (yellow, orange) = (poses::rgb555(0x03FF), poses::rgb555(0x11DF));
+    let super_vegeta = Object {
+        id: "battle-super-vegeta-000".to_owned(),
+        key: fighter.key ^ 1,
+        palette: vegeta_palette(Some((yellow, orange))),
+        ..object(&fighter, "art/red.png", false)
+    };
+    let wave = Object { id: "battle-fx-000".to_owned(), ..object(&effect, "art/red.png", false) };
+    let pack = pack_of(dir.path(), Vec::new(), ArtIndex::new(Vec::new(), vec![super_vegeta, wave]));
+    let with = Arc::new((*pack).clone().with_art_override(overrides.path()));
+    let mut renderer = Renderer::new();
+    renderer.set_art(Some(Arc::clone(&with)));
+    let drawn = renderer.render_hd(&frame, options(4)).unwrap();
+    let stats = renderer.art_stats();
+    let arts: Vec<Option<u32>> = stats.poses.iter().filter(|p| !p.field).map(|p| p.art).collect();
+    assert_eq!(arts, [Some(2), Some(1)], "his picture and the wave's art");
+    // (game pixel (x, row) of the fighter's pose, sampled in the middle of its 4 x 4 art pixels)
+    let at = |x: usize, row: usize| pixel(&drawn, (40 + x) * 4 + 2, (51 + row) * 4 + 2);
+    assert_eq!(at(2, 3), [255, 0, 0], "his art transparent: the wave behind him");
+    assert_eq!(at(2, 12), [255, 0, 255], "his art opaque: he covers the wave");
+    assert_eq!(at(10, 3), [255, 0, 255], "his art opaque where no wave is behind");
+    assert_eq!(at(6, 3), [255, 0, 128], "half transparent: the two mixed, no dark or light edge");
+    assert_eq!(pixel(&drawn, 37 * 4 + 2, 52 * 4 + 2), [255, 0, 0], "the wave beside him");
+}
+
+#[test]
+fn art_of_the_pack_still_hides_what_is_behind_its_sprites_where_it_is_transparent() {
+    // Only a picture of a folder of `art-override\` that adds poses (`super-vegeta\`, `goku\`, `ending-goku\`:
+    // `Object::override_only`) lets what is behind its sprites show: the pack's own art of the same pose, transparent in
+    // the same place, draws as it did, the frame unchanged
+    let dir = tempfile::tempdir().unwrap();
+    let (frame, fighter, effect) = effect_behind_log();
+    write_png(&dir.path().join("art/red.png"), 64, 64, |_, _| [255, 0, 0, 255]);
+    write_png(&dir.path().join("art/fighter.png"), 64, 64, part_transparent);
+    let own = object(&fighter, "art/fighter.png", false);
+    let wave = Object { id: "battle-fx-000".to_owned(), ..object(&effect, "art/red.png", false) };
+    let pack = pack_of(dir.path(), Vec::new(), ArtIndex::new(Vec::new(), vec![own, wave]));
+    let mut renderer = Renderer::new();
+    renderer.set_art(Some(pack));
+    let drawn = renderer.render_hd(&frame, options(4)).unwrap();
+    let at = |x: usize, row: usize| pixel(&drawn, (40 + x) * 4 + 2, (51 + row) * 4 + 2);
+    assert_ne!(at(2, 3), [255, 0, 0], "the wave is not drawn behind the pack's art");
+    assert_eq!(at(2, 12), [255, 0, 255]);
+}
+
+#[test]
+fn super_vegeta_s_art_past_the_game_s_silhouette_is_not_drawn_over_by_an_effect_behind_him() {
+    // Where his sprite is transparent next to its pixels and an effect behind him shows, his picture grows over the
+    // effect, as any pose's art over what is behind it: the poses are drawn from back to front, so the effect's art,
+    // drawn before his, does not cut his edge back (in the order the poses were found, the fighter first, it did)
+    let dir = tempfile::tempdir().unwrap();
+    let overrides = tempfile::tempdir().unwrap();
+    let (frame, fighter, effect) = effect_behind_a_gap_log(true);
+    let with =
+        super_vegeta_and_wave_pack(&dir, &overrides, &fighter, &effect, |_, _| [255, 0, 255, 255]);
+    let mut renderer = Renderer::new();
+    renderer.set_art(Some(with));
+    let drawn = renderer.render_hd(&frame, options(4)).unwrap();
+    let stats = renderer.art_stats();
+    assert_eq!(stats.poses.iter().find(|p| p.fighter).unwrap().art, Some(2), "his picture");
+    let at = |x: usize, row: usize| pixel(&drawn, (40 + x) * 4 + 2, (51 + row) * 4 + 2);
+    assert_eq!(at(0, 3), [255, 0, 255], "his art grown over the wave behind him");
+    assert_eq!(at(1, 3), [255, 0, 255]);
+    assert_eq!(pixel(&drawn, 37 * 4 + 2, 54 * 4 + 2), [255, 0, 0], "the wave past his reach");
+}
+
+#[test]
+fn art_of_the_pack_is_drawn_in_the_order_the_poses_were_found() {
+    // With no picture of a folder that adds poses in the frame the poses are drawn in the order they were found, as before
+    // patch 0049's back-to-front order: the fighter's art grown over the effect behind him is drawn over by the effect's,
+    // drawn after it
+    let dir = tempfile::tempdir().unwrap();
+    let (frame, fighter, effect) = effect_behind_a_gap_log(false);
+    write_png(&dir.path().join("art/red.png"), 64, 64, |_, _| [255, 0, 0, 255]);
+    write_png(&dir.path().join("art/fighter.png"), 64, 64, |_, _| [255, 0, 255, 255]);
+    let own = object(&fighter, "art/fighter.png", false);
+    let wave = Object { id: "battle-fx-000".to_owned(), ..object(&effect, "art/red.png", false) };
+    let pack = pack_of(dir.path(), Vec::new(), ArtIndex::new(Vec::new(), vec![own, wave]));
+    let mut renderer = Renderer::new();
+    renderer.set_art(Some(pack));
+    let drawn = renderer.render_hd(&frame, options(4)).unwrap();
+    let at = |x: usize, row: usize| pixel(&drawn, (40 + x) * 4 + 2, (51 + row) * 4 + 2);
+    assert_eq!(at(0, 3), [255, 0, 0], "the effect's art, drawn after the fighter's");
+    assert_eq!(at(2, 3), [255, 0, 255], "his own pixels");
+}
+
+#[test]
+fn an_effect_in_front_of_super_vegeta_s_picture_grows_over_it() {
+    // A spark of a hit on him, his own energy wave: an effect in front of the fighter (OAM entry 0) whose bottom right is
+    // transparent, where the original shows him. The effect's art grows past its pixels over him, as over any pose
+    // behind it: his picture, drawn before it (from back to front), does not draw over that edge
+    let dir = tempfile::tempdir().unwrap();
+    let overrides = tempfile::tempdir().unwrap();
+    let (mut frame, _) = fighter_log(40, 50);
+    super_vegeta_colours(&mut frame);
+    let (frame, fighter, effect) = with_effect(frame, true, &[2, 3, 18]);
+    assert_eq!((effect.org.0, effect.w, effect.h), (36, 16, 16));
+    let with =
+        super_vegeta_and_wave_pack(&dir, &overrides, &fighter, &effect, |_, _| [255, 0, 255, 255]);
+    let mut renderer = Renderer::new();
+    renderer.set_art(Some(with));
+    let drawn = renderer.render_hd(&frame, options(4)).unwrap();
+    let stats = renderer.art_stats();
+    assert_eq!(stats.poses.iter().find(|p| p.fighter).unwrap().art, Some(2), "his picture");
+    // (game pixel (x, row): `x` of the screen, `row` of the poses' box)
+    let at = |x: usize, row: usize| pixel(&drawn, x * 4 + 2, (51 + row) * 4 + 2);
+    assert_eq!(at(44, 12), [255, 0, 0], "the effect's art grown over him");
+    assert_eq!(at(45, 12), [255, 0, 0]);
+    assert_eq!(at(49, 12), [255, 0, 255], "his picture past the effect's reach");
+    assert_eq!(at(42, 3), [255, 0, 0], "the effect in front of him");
+}
+
+#[test]
+fn super_vegeta_between_two_effects_is_drawn_from_back_to_front_not_in_the_order_the_poses_were_found()
+ {
+    // An effect behind him (OAM entry 2) under the gap at his top left, and one in front of him (entry 0) over his bottom
+    // rows, its top right transparent. The poses are found the fighter first, then the effects in their OAM order (front,
+    // back): neither that order, nor its reverse, nor his picture drawn last is back to front. His art grows over the
+    // effect behind him (drawn after it), the front effect's grows over him (drawn after him)
+    let dir = tempfile::tempdir().unwrap();
+    let overrides = tempfile::tempdir().unwrap();
+    let (mut frame, _) = fighter_log(40, 50);
+    super_vegeta_colours(&mut frame);
+    for row in 0..8 {
+        frame.vram[row] = 0x3F00;
+    }
+    let fighter = [frame.oam_low[0], frame.oam_low[1], frame.oam_low[2], frame.oam_low[3]];
+    // (16 x 16, palette 4: the front one's characters 4 and 21 (5 and 20 transparent), x 40 to 55 and screen rows 63 to 78, four
+    // rows past the bottom of the one behind, characters 2 to 3 and 18 to 19, x 36 to 51 and screen rows 43 to 58: two
+    // poses, not one)
+    frame.oam_low[0..4].copy_from_slice(&[40, 62, 4, 4 << 1]);
+    frame.oam_low[4..8].copy_from_slice(&fighter);
+    frame.oam_low[8..12].copy_from_slice(&[36, 42, 2, 4 << 1]);
+    frame.oam_high[0] = 0b10_10_10;
+    for tile in [2_usize, 3, 18, 19, 4, 21] {
+        for row in 0..8 {
+            frame.vram[tile * 16 + row] = 0xFFFF;
+        }
+    }
+    frame.cgram_start[0x80 + 4 * 16 + 3] = 0x001F; // red
+    let sprites = poses::sprites(&frame);
+    let found: Vec<Pose> =
+        poses::poses(&frame, &sprites).into_iter().filter(|pose| !pose.field).collect();
+    let firsts: Vec<(bool, u8)> = found.iter().map(|pose| (pose.fighter, pose.first)).collect();
+    assert_eq!(
+        firsts,
+        [(true, 1), (false, 0), (false, 2)],
+        "found: him, the front effect, the back one"
+    );
+    let (fighter, front, behind) = (&found[0], &found[1], &found[2]);
+    assert_eq!(fighter.arr[3 * 16..3 * 16 + 3], [0, 0, 2], "the gap in his silhouette");
+    let with = super_vegeta_and_waves_pack(&dir, &overrides, fighter, &[front, behind], |_, _| {
+        [255, 0, 255, 255]
+    });
+    let mut renderer = Renderer::new();
+    renderer.set_art(Some(with));
+    let drawn = renderer.render_hd(&frame, options(4)).unwrap();
+    let stats = renderer.art_stats();
+    let art: Vec<Option<u32>> = stats.poses.iter().filter(|p| !p.field).map(|p| p.art).collect();
+    assert_eq!(art, [Some(3), Some(1), Some(2)], "his picture and the two effects' art");
+    let at = |x: usize, row: usize| pixel(&drawn, x * 4 + 2, (51 + row) * 4 + 2);
+    assert_eq!(at(40, 3), [255, 0, 255], "his art grown over the effect behind him");
+    assert_eq!(at(48, 12), [255, 0, 0], "the front effect's art grown over him");
+    assert_eq!(at(53, 12), [255, 0, 255], "his picture past the front effect's reach");
+    assert_eq!(at(37, 3), [255, 0, 0], "the effect behind him past his reach");
+}
+
+#[test]
+fn a_picture_of_goku_s_folder_leaves_what_is_behind_it_shown_where_it_is_transparent() {
+    // Any folder of `art-override\` that adds poses (`Object::override_only`), not Super Vegeta's alone: the normal Goku's
+    // picture of `art-override\goku\` (patch 0051), transparent where the game's sprite covers an energy wave behind him,
+    // shows the wave there and covers it where it is opaque. What this pins down is that a picture of `goku\` is one whose
+    // sprites are open (drawn behind, `cells_behind`), not the order the poses are drawn in: the pixels it checks are
+    // the same in any order (see `super_vegeta_between_two_effects_is_drawn_from_back_to_front_not_in_the_order_the_poses_were_found`)
+    let dir = tempfile::tempdir().unwrap();
+    let overrides = tempfile::tempdir().unwrap();
+    let (frame, _) = fighter_log(40, 50);
+    let (frame, fighter, effect) = with_effect(frame, false, &[2, 3, 18, 19]);
+    write_png(&dir.path().join("art/red.png"), 64, 64, |_, _| [255, 0, 0, 255]);
+    let mut objects = powering_up_pack(&dir, &fighter).art.objects().to_vec();
+    let wave = Object { id: "battle-fx-000".to_owned(), ..object(&effect, "art/red.png", false) };
+    objects.push(wave);
+    let pack = pack_of(dir.path(), Vec::new(), ArtIndex::new(Vec::new(), objects));
+    write_png(&overrides.path().join("goku/battle-goku-ssj-020.png"), 64, 64, part_transparent);
+    let with = Arc::new((*pack).clone().with_art_override(overrides.path()));
+    assert_eq!(with.art.objects()[3].id, "battle-goku-ssj-020@goku");
+    let mut renderer = Renderer::new();
+    renderer.set_art(Some(with));
+    let drawn = renderer.render_hd(&frame, options(4)).unwrap();
+    let stats = renderer.art_stats();
+    assert_eq!(stats.poses.iter().find(|p| p.fighter).unwrap().art, Some(3), "his picture");
+    let at = |x: usize, row: usize| pixel(&drawn, (40 + x) * 4 + 2, (51 + row) * 4 + 2);
+    assert_eq!(at(2, 3), [255, 0, 0], "his art transparent: the wave behind him");
+    assert_eq!(at(2, 12), [255, 0, 255], "his art opaque: he covers the wave");
+    assert_eq!(at(6, 3), [255, 0, 128], "half transparent: the two mixed");
+}
+
+#[test]
+fn super_vegeta_flying_through_space_is_drawn_from_his_picture_of_battle_vegeta_001_in_his_colours_only()
+ {
+    // After the party loses the hidden fight, the game draws Super Vegeta flying through space with the tiles of
+    // `battle-vegeta-001` in his colours, OAM palette 0: a field group with the key of that battle pose. Ming's picture
+    // of the pose (`art-override\super-vegeta\battle-vegeta-001.png`) is drawn there; in Vegeta's colours, another
+    // pose's field group in Super Vegeta's, or without the folder, nothing is found for the group, as before
+    let dir = tempfile::tempdir().unwrap();
+    let overrides = tempfile::tempdir().unwrap();
+    let (_, fighter) = fighter_log(40, 50);
+    let fighter = Pose { key: super::ENDING_SPACE_VEGETA, ..fighter };
+    let (pack, with) = super_vegeta_override_packs(
+        &dir,
+        &overrides,
+        &fighter,
+        "battle-vegeta-001",
+        vegeta_palette(None),
+    );
+    assert_eq!(with.art.objects()[3].id, "battle-vegeta-001@super-vegeta");
+    let group = Pose { field: true, fighter: false, ..fighter };
+    let (yellow, orange) = (poses::rgb555(0x03FF), poses::rgb555(0x11DF));
+    let mut vegeta = [[0_u8; 3]; 16];
+    vegeta[2] = [0, 255, 0];
+    let mut super_vegeta = vegeta;
+    super_vegeta[14] = yellow;
+    super_vegeta[15] = orange;
+    let found = |pack: &Arc<Pack>, pose: &Pose, row: &[[u8; 3]; 16]| {
+        let art = ArtState::new(Arc::clone(pack));
+        let unit = art.unit_for(pose, row);
+        art.exact_art(pose, row, unit.as_ref())
+    };
+    assert_eq!(found(&with, &group, &super_vegeta), (Some(3), false, false), "the picture");
+    assert_eq!(found(&with, &group, &vegeta), (None, false, false), "Vegeta's colours: as before");
+    assert_eq!(found(&pack, &group, &super_vegeta), (None, false, false), "no folder: as before");
+    // Another field group whose key has a picture of `art-override\super-vegeta\` too (`battle-vegeta-804`): it is not
+    // Super Vegeta in space, so nothing is found for it, as before
+    let second = Object {
+        id: "battle-vegeta-804".to_owned(),
+        key: super::ENDING_SPACE_VEGETA ^ 0xF0,
+        palette: vegeta_palette(None),
+        ..object(&group, "art/vegeta.png", false)
+    };
+    let mut objects = pack.art.objects().to_vec();
+    objects.push(second.clone());
+    let mut two = (*pack).clone();
+    two.art = ArtIndex::new(pack.art.pictures().to_vec(), objects);
+    write_png(&overrides.path().join("super-vegeta/battle-vegeta-804.png"), 64, 64, |_, _| {
+        [255, 0, 255, 255]
+    });
+    let two = Arc::new(two.with_art_override(overrides.path()));
+    assert!(
+        two.art
+            .objects_with(second.key)
+            .iter()
+            .any(|&at| two.art.objects()[at as usize].super_vegeta_only()),
+        "the other group's key has a picture"
+    );
+    let other = Pose { key: second.key, ..group.clone() };
+    assert_eq!(found(&two, &other, &super_vegeta), (None, false, false), "another field group");
+    assert_eq!(
+        found(&two, &group, &super_vegeta).0.map(|at| two.art.objects()[at as usize].id.as_str()),
+        Some("battle-vegeta-001@super-vegeta"),
+        "with both pictures: his in space"
+    );
+}
+
+#[test]
+fn a_piece_of_a_pose_vegeta_s_art_cannot_draw_in_super_vegeta_s_colours_is_drawn_from_his_picture()
+{
+    // Super Vegeta vanishing (`battle-vegeta-804`, the stripes of his teleport): the stripes are a piece that the index has
+    // no key for, held by Vegeta's art of the whole pose, which cannot be drawn in Super Vegeta's colours (black hair
+    // where he has two colours), so the stripes kept the game's sprite even with Ming's picture of the pose in
+    // `art-override\super-vegeta\` (found by its key only). The picture of the holder's key is drawn instead; in Vegeta's
+    // colours, where his art can draw them, without the folder, or where Vegeta's art draws the piece in Super Vegeta's
+    // colours too (a pose that shows no hair), the art is as before
+    let dir = tempfile::tempdir().unwrap();
+    let overrides = tempfile::tempdir().unwrap();
+    let (_, pose) = fighter_log(40, 50);
+    let (pack, with) = super_vegeta_override_packs(
+        &dir,
+        &overrides,
+        &pose,
+        "battle-vegeta-804",
+        vegeta_palette(None),
+    );
+    assert_eq!(with.art.objects()[3].id, "battle-vegeta-804@super-vegeta");
+    let piece = Pose { key: pose.key ^ 0xF0, ..pose.clone() };
+    let (yellow, orange) = (poses::rgb555(0x03FF), poses::rgb555(0x11DF));
+    let mut vegeta = [[0_u8; 3]; 16];
+    vegeta[2] = [0, 255, 0];
+    let mut super_vegeta = vegeta;
+    super_vegeta[14] = yellow;
+    super_vegeta[15] = orange;
+    let held = |pack: &Arc<Pack>, shaped: bool, row: &[[u8; 3]; 16]| {
+        ArtState::new(Arc::clone(pack)).held_override(0, shaped, &piece, &pose, row)
+    };
+    assert_eq!(held(&with, false, &super_vegeta), Some(3), "held: the picture");
+    assert_eq!(held(&with, true, &super_vegeta), Some(3), "same shape: the picture");
+    assert_eq!(held(&with, false, &vegeta), None, "Vegeta's colours: his art");
+    assert_eq!(held(&pack, false, &super_vegeta), None, "no folder: as before");
+    let dir = tempfile::tempdir().unwrap();
+    let overrides = tempfile::tempdir().unwrap();
+    let mut no_hair = vegeta_palette(None);
+    no_hair.mask = 1 << 1 | 1 << 2;
+    let (_, drawn) =
+        super_vegeta_override_packs(&dir, &overrides, &pose, "battle-vegeta-804", no_hair);
+    let art = ArtState::new(drawn);
+    assert_eq!(
+        art.held_override(0, false, &piece, &pose, &super_vegeta),
+        None,
+        "Vegeta's art draws it: as before"
+    );
+}
+
+#[test]
+fn super_vegeta_s_teleport_stripes_held_by_vegeta_s_art_are_drawn_from_his_picture_in_the_frame() {
+    // The frame's side of the test above: Super Vegeta vanishing (`battle-vegeta-804`) is drawn in stripes the index has
+    // no key for (in the game a pose of 25 x 39, key 93e8d0529ec1ea88), held by Vegeta's art of the whole pose, which
+    // cannot draw them in Super Vegeta's colours. Drawn, the stripes are his picture; in Vegeta's colours they are
+    // Vegeta's art, and without the folder they keep the game's sprite, as before
+    let dir = tempfile::tempdir().unwrap();
+    let overrides = tempfile::tempdir().unwrap();
+    let (mut striped, whole) = fighter_log(40, 50);
+    let (pack, _) = super_vegeta_override_packs(
+        &dir,
+        &overrides,
+        &whole,
+        "battle-vegeta-804",
+        vegeta_palette(None),
+    );
+    // Vegeta's art with the silhouette of the whole 16 x 16 box: what holds the stripes
+    let mut objects = pack.art.objects().to_vec();
+    objects[0].mask = vec![0xFF; 32];
+    let mut held = (*pack).clone();
+    held.art = ArtIndex::new(pack.art.pictures().to_vec(), objects);
+    let pack = Arc::new(held);
+    let with = Arc::new((*pack).clone().with_art_override(overrides.path()));
+    assert_eq!(with.art.objects()[3].id, "battle-vegeta-804@super-vegeta");
+    // Every other column left out: the stripes of the teleport
+    for tile in [0_usize, 1, 16, 17] {
+        for row in 0..8 {
+            striped.vram[tile * 16 + row] = 0xAA00;
+        }
+    }
+    assert_eq!(drawn_fighter(&with, &striped).1, Some(0), "Vegeta's colours: his art holds them");
+    super_vegeta_colours(&mut striped);
+    let art = drawn_fighter(&with, &striped).1;
+    assert_eq!(
+        art.map(|at| with.art.objects()[at as usize].id.as_str()),
+        Some("battle-vegeta-804@super-vegeta"),
+        "Super Vegeta's colours: his picture"
+    );
+    assert_eq!(drawn_fighter(&pack, &striped).1, None, "without the folder: the game's sprite");
+}
+
+#[test]
+fn an_effect_s_pose_found_by_its_shape_is_drawn_from_super_vegeta_s_picture_in_his_palette_of_game_over_only()
+ {
+    // Vegeta flying over GAME OVER (`gallery-fx-1118`, with the pads): an effect's art (palette mask 0), found by its
+    // shape and recoloured from the sprite's own colours, so it draws in any and the picture of `art-override\super-vegeta\`
+    // was never drawn in its place. Where the sprite's palette is his palette of GAME OVER (`GAME_OVER_SUPER_VEGETA`,
+    // every colour) the picture is drawn, in its own colours; with one colour off (one the pose does not even use), or
+    // without the folder, the effect's art, recoloured, as before
+    let dir = tempfile::tempdir().unwrap();
+    let overrides = tempfile::tempdir().unwrap();
+    write_png(&dir.path().join("art/b.png"), 64, 60, |_, y| match y / 4 + 1 {
+        0 => [0, 0, 0, 0],
+        1..=5 => [200, 40, 40, 255],
+        6..=10 => [40, 200, 40, 255],
+        _ => [40, 40, 200, 255],
+    });
+    write_png(&overrides.path().join("super-vegeta/gallery-fx-1118.png"), 64, 60, |_, _| {
+        [255, 0, 255, 255]
+    });
+    let words = super::GAME_OVER_SUPER_VEGETA;
+    let (mut frame, pose) = banded_log(40, 50, [words[1], words[2], words[3]]);
+    frame.cgram_start[0x80 + 4 * 16 + 4..0x80 + 4 * 16 + 16].copy_from_slice(&words[4..16]);
+    let mut shape = object(&pose, "art/b.png", false);
+    shape.id = "gallery-fx-1118".to_owned();
+    shape.key ^= 1;
+    shape.mask = vec![0; pose.arr.len().div_ceil(8)];
+    for n in (0..pose.arr.len()).filter(|&n| pose.arr[n] != 0) {
+        shape.mask[n / 8] |= 1 << (n % 8);
+    }
+    let pack = pack_of(dir.path(), Vec::new(), ArtIndex::new(Vec::new(), vec![shape]));
+    let with = Arc::new((*pack).clone().with_art_override(overrides.path()));
+    assert_eq!(with.art.objects()[1].id, "gallery-fx-1118@super-vegeta");
+    let drawn = |pack: &Arc<Pack>, frame: &FrameLog| {
+        let mut renderer = Renderer::new();
+        renderer.set_art(Some(Arc::clone(pack)));
+        let drawn = renderer.render_hd(frame, options(4)).unwrap();
+        let stats = renderer.art_stats();
+        let pose = &stats.poses[0];
+        (pose.art, pose.recoloured, pixel(&drawn, 41 * 4 + 1, 53 * 4 + 1), drawn.rgba.clone())
+    };
+    let (art, recoloured, colour, _) = drawn(&with, &frame);
+    assert_eq!(
+        (art, recoloured, colour),
+        (Some(1), false, [255, 0, 255]),
+        "his palette of GAME OVER: the picture, in its own colours"
+    );
+    let (art, recoloured, _, before) = drawn(&pack, &frame);
+    assert_eq!((art, recoloured), (Some(0), true), "without the folder: the effect's art");
+    // One colour off (15, which the pose does not use): the effect's art, as without the folder
+    frame.cgram_start[0x80 + 4 * 16 + 15] ^= 0x0001;
+    let (art, recoloured, _, off) = drawn(&with, &frame);
+    assert_eq!((art, recoloured), (Some(0), true), "one colour off: the effect's art");
+    assert_eq!(off, drawn(&pack, &frame).3, "one colour off: as without the folder");
+    assert_eq!(off, before, "(a colour the pose does not use: the same picture)");
+}
+
+#[test]
+fn without_super_vegeta_s_folder_every_frame_is_drawn_as_before() {
+    // No `art-override\super-vegeta\` (or an empty one): the pack is the same, so every frame is the same to the pixel,
+    // in Vegeta's colours, in Super Vegeta's and in any other
+    let dir = tempfile::tempdir().unwrap();
+    let overrides = tempfile::tempdir().unwrap();
+    let (mut frame, pose) = fighter_log(40, 50);
+    let (pack, _) = super_vegeta_override_packs(
+        &dir,
+        &overrides,
+        &pose,
+        "battle-vegeta-803",
+        vegeta_palette(None),
+    );
+    std::fs::remove_file(overrides.path().join("super-vegeta/battle-vegeta-803.png")).unwrap();
+    let empty = Arc::new((*pack).clone().with_art_override(overrides.path()));
+    let none = Arc::new((*pack).clone().with_art_override(&overrides.path().join("absent")));
+    assert_eq!(empty.art.objects(), pack.art.objects());
+    assert_eq!(none.art.objects(), pack.art.objects());
+    for hair in [None, Some((0x03FF, 0x11DF)), Some((0x03FF, 0x7C00))] {
+        if let Some((fourteen, fifteen)) = hair {
+            frame.cgram_start[0x80 + 16 + 14] = fourteen;
+            frame.cgram_start[0x80 + 16 + 15] = fifteen;
+        }
+        let before = drawn_fighter(&pack, &frame).3;
+        assert_eq!(drawn_fighter(&empty, &frame).3, before, "{hair:?}");
+        assert_eq!(drawn_fighter(&none, &frame).3, before, "{hair:?}");
+    }
+}
+
+/// The pose of [`fighter_log`] as Goku's whole body powering up (patch 0050): the pack has only Super Saiyan art for it
+/// (`battle-goku-ssj-020`, red, yellow and gold hair at 14 and 15); the normal Goku's palette (black hair) is known from
+/// the art of another pose (`battle-goku-000`).
+fn powering_up_pack(dir: &tempfile::TempDir, pose: &Pose) -> Arc<Pack> {
+    write_png(&dir.path().join("art/ssj.png"), 64, 64, |_, _| [255, 0, 0, 255]);
+    write_png(&dir.path().join("art/normal.png"), 64, 64, |_, _| [0, 0, 255, 255]);
+    let goku = |id: &str, key: u64, art: &str, hair: Option<([u8; 3], [u8; 3])>| {
+        let mut palette =
+            Palette { mask: 1 << 1 | 1 << 2 | 1 << 14 | 1 << 15, ..Palette::default() };
+        palette.colors[2] = [0, 255, 0];
+        if let Some((fourteen, fifteen)) = hair {
+            palette.colors[14] = fourteen;
+            palette.colors[15] = fifteen;
+        }
+        Object { id: id.to_owned(), key, palette, ..object(pose, art, false) }
+    };
+    let (yellow, gold) = (poses::rgb555(0x53FF), poses::rgb555(0x0A98));
+    let objects = vec![
+        goku("battle-goku-ssj-020", pose.key, "art/ssj.png", Some((yellow, gold))),
+        Object {
+            width: 8,
+            height: 8,
+            ..goku("battle-goku-000", pose.key ^ 1, "art/normal.png", None)
+        },
+    ];
+    pack_of(dir.path(), Vec::new(), ArtIndex::new(Vec::new(), objects))
+}
+
+/// Work RAM with `$0C36` = `state` and Goku's party record (slot 0) of unit `unit`.
+fn wram_with_goku(state: u8, unit: u8) -> Vec<u8> {
+    let mut wram = vec![0_u8; 0x20000];
+    wram[0x0C36] = state;
+    wram[0x0B00 + 1] = unit;
+    wram
+}
+
+/// The art drawn for the fighter of [`fighter_log`] from `pack` in `frame` with `conditions`, and its colour.
+fn drawn_goku(
+    pack: &Arc<Pack>,
+    frame: &FrameLog,
+    conditions: Conditions,
+) -> (Option<u32>, [u8; 3]) {
+    let mut renderer = Renderer::new();
+    renderer.set_art(Some(Arc::clone(pack)));
+    renderer.set_conditions(conditions);
+    let drawn = renderer.render_hd(frame, options(4)).unwrap();
+    let art = renderer.art_stats().poses.iter().find(|p| p.fighter).unwrap().art;
+    (art, pixel(&drawn, 41 * 4 + 1, 51 * 4 + 1))
+}
+
+#[test]
+fn goku_using_the_kaioken_in_a_pose_only_super_saiyan_art_exists_for_keeps_the_game_s_sprite() {
+    // "悟空的 N倍界王拳！": the close-up of Goku's whole body powering up, in his own palette (black hair, the outline's
+    // colour), with the Kaioken just chosen ($0C36 = $C0, unit $39). The pack has art of that pose for the Super Saiyan
+    // only (`battle-goku-ssj-020`): recoloured, it showed him with the Super Saiyan's yellow hair and gold aura. With the
+    // Kaioken on, the pose keeps the game's sprite (the green of the frame); without it, the art as before
+    let dir = tempfile::tempdir().unwrap();
+    let (frame, pose) = fighter_log(40, 50);
+    let pack = powering_up_pack(&dir, &pose);
+    let kaioken = Conditions::of_work_ram(&wram_with_goku(0xC0, 0x39));
+    assert_eq!(
+        drawn_goku(&pack, &frame, kaioken),
+        (None, [0, 255, 0]),
+        "the Kaioken: the game's sprite"
+    );
+    let (art, _) = drawn_goku(&pack, &frame, Conditions::default());
+    assert_eq!(art, Some(0), "no Kaioken: the Super Saiyan's art, as before");
+}
+
+#[test]
+fn goku_s_kaioken_with_the_kamehameha_keeps_the_game_s_sprite_in_the_pose_only_super_saiyan_art_exists_for()
+ {
+    // "界王拳＋龜派氣功" (command $34, unit $3A, the Kaioken on since an earlier turn: $0C36 = $80) draws the same
+    // close-up of his whole body powering up in his own palette and in the Kaioken's (the outline and the hair red): the
+    // game's sprite, not the Super Saiyan's art
+    let dir = tempfile::tempdir().unwrap();
+    let (mut frame, pose) = fighter_log(40, 50);
+    let pack = powering_up_pack(&dir, &pose);
+    let kaioken = Conditions::of_work_ram(&wram_with_goku(0x80, 0x3A));
+    assert_eq!(
+        drawn_goku(&pack, &frame, kaioken),
+        (None, [0, 255, 0]),
+        "the Kaioken on: the game's sprite"
+    );
+    for index in [1, 14, 15] {
+        frame.cgram_start[0x80 + 16 + index] = 0x001F; // red
+    }
+    assert_eq!(drawn_goku(&pack, &frame, kaioken).0, None, "red hair: the game's sprite");
+    let (art, _) = drawn_goku(&pack, &frame, Conditions::default());
+    assert_eq!(art, Some(0), "red hair without the Kaioken: the art, as before");
+}
+
+#[test]
+fn super_saiyan_goku_powering_up_keeps_his_art_with_or_without_the_kaioken_bit() {
+    // The same close-up in the Super Saiyan palette (Goku turning Super Saiyan, and the Super Saiyan's own moves; a mod
+    // that lets him use the Kaioken leaves the hair yellow): his art, whatever $0C36 says
+    let dir = tempfile::tempdir().unwrap();
+    let (mut frame, pose) = fighter_log(40, 50);
+    let pack = powering_up_pack(&dir, &pose);
+    frame.cgram_start[0x80 + 16 + 14] = 0x53FF; // yellow
+    frame.cgram_start[0x80 + 16 + 15] = 0x0A98; // gold
+    for conditions in [
+        Conditions::default(),
+        Conditions::of_work_ram(&wram_with_goku(0x80, 0x3B)),
+        Conditions::of_work_ram(&wram_with_goku(0xC0, 0x39)),
+    ] {
+        let (art, colour) = drawn_goku(&pack, &frame, conditions);
+        assert_eq!((art, colour), (Some(0), [255, 0, 0]), "{conditions:?}: the Super Saiyan's art");
+    }
+}
+
+#[test]
+fn with_the_kaioken_on_super_saiyan_art_of_a_pose_the_normal_goku_also_has_art_for_is_left_to_unit_for()
+ {
+    // The rule of patch 0050 is for the poses only Super Saiyan art exists for: where the normal Goku has art of his own
+    // for the pose, the Super Saiyan's art stays drawable and `unit_for` chooses between the sets (the ending's Goku
+    // holding Gohan is the Super Saiyan art whatever the colours, a choice of this branch)
+    let dir = tempfile::tempdir().unwrap();
+    let (_, pose) = fighter_log(40, 50);
+    let mut row = [[0_u8; 3]; 16];
+    row[2] = [0, 255, 0];
+    let kaioken = Conditions::of_work_ram(&wram_with_goku(0xC0, 0x39));
+    let only_super = powering_up_pack(&dir, &pose);
+    let mut art = ArtState::new(only_super);
+    art.conditions = kaioken;
+    assert!(!art.recolourable(&pose, 0, &row), "only the Super Saiyan's art: the game's sprite");
+    let (black, yellow, gold) = ([0, 0, 0], poses::rgb555(0x53FF), poses::rgb555(0x0A98));
+    let both = goku_pack(
+        &dir,
+        &pose,
+        &[(2, [0, 255, 0]), (14, black), (15, black)],
+        &[(2, [0, 255, 0]), (14, yellow), (15, gold)],
+    );
+    let ssj = both
+        .art
+        .objects()
+        .iter()
+        .position(|object| object.id.contains("goku-ssj") && object.key == pose.key)
+        .unwrap() as u32;
+    let mut art = ArtState::new(both);
+    art.conditions = kaioken;
+    assert!(art.recolourable(&pose, ssj, &row), "the normal Goku has art too: unit_for decides");
+}
+
+/// The pack of [`powering_up_pack`] without and with a folder `overrides` whose `goku\battle-goku-ssj-020.png` (patch 0051)
+/// is magenta: the normal Goku's own picture of the pose only Super Saiyan art exists for.
+fn normal_goku_override_packs(
+    dir: &tempfile::TempDir,
+    overrides: &tempfile::TempDir,
+    pose: &Pose,
+) -> (Arc<Pack>, Arc<Pack>) {
+    let pack = powering_up_pack(dir, pose);
+    write_png(&overrides.path().join("goku/battle-goku-ssj-020.png"), 64, 64, |_, _| {
+        [255, 0, 255, 255]
+    });
+    let with = Arc::new((*pack).clone().with_art_override(overrides.path()));
+    (pack, with)
+}
+
+#[test]
+fn the_normal_goku_s_own_picture_of_a_pose_only_super_saiyan_art_exists_for_is_drawn_where_his_hair_is_black()
+ {
+    // `art-override\goku\battle-goku-ssj-020.png`: the whole body powering up with black hair. In the normal Goku's colours
+    // (black hair, the outline's colour) it is drawn, with the Kaioken on (its close-up, which kept the game's sprite since
+    // patch 0050) and without it (Goku turning Super Saiyan before Frieza, the frames whose palette still has his black
+    // hair, drawn from the Super Saiyan art before); the pose of the name stays the Super Saiyan's
+    let dir = tempfile::tempdir().unwrap();
+    let overrides = tempfile::tempdir().unwrap();
+    let (frame, pose) = fighter_log(40, 50);
+    let (pack, with) = normal_goku_override_packs(&dir, &overrides, &pose);
+    let added = &with.art.objects()[2];
+    assert_eq!(added.id, "battle-goku-ssj-020@goku");
+    assert_eq!(
+        with.art.objects()[..2],
+        pack.art.objects()[..],
+        "the Super Saiyan's pose is left as it was"
+    );
+    let kaioken = Conditions::of_work_ram(&wram_with_goku(0xC0, 0x39));
+    for conditions in [kaioken, Conditions::default()] {
+        assert_eq!(
+            drawn_goku(&with, &frame, conditions),
+            (Some(2), [255, 0, 255]),
+            "{conditions:?}: the normal Goku's picture"
+        );
+    }
+    assert_eq!(
+        drawn_goku(&pack, &frame, kaioken),
+        (None, [0, 255, 0]),
+        "without the folder: 0050's sprite"
+    );
+    assert_eq!(
+        drawn_goku(&pack, &frame, Conditions::default()).0,
+        Some(0),
+        "without the folder: the Super Saiyan's art"
+    );
+}
+
+#[test]
+fn the_normal_goku_s_own_picture_is_never_drawn_in_the_super_saiyan_s_hair_and_in_the_kaioken_s_only_with_its_outline()
+ {
+    // The same pose in the Super Saiyan's colours (yellow and gold hair) is his art, as without the folder, whatever the
+    // conditions. In the Kaioken's colours (with the Kamehameha) the picture's black hair and outline are one colour: where
+    // the frame has them one colour too (the outline and the hair red) the picture is drawn in it; where it has two (red
+    // hair, a black outline) the picture's hair would stay black, so the pose keeps the game's sprite as in patch 0050
+    let dir = tempfile::tempdir().unwrap();
+    let overrides = tempfile::tempdir().unwrap();
+    let (frame, pose) = fighter_log(40, 50);
+    let (pack, with) = normal_goku_override_packs(&dir, &overrides, &pose);
+    let mut gold = frame.clone();
+    gold.cgram_start[0x80 + 16 + 14] = 0x53FF; // yellow
+    gold.cgram_start[0x80 + 16 + 15] = 0x0A98; // gold
+    for conditions in [
+        Conditions::default(),
+        Conditions::of_work_ram(&wram_with_goku(0x80, 0x3B)),
+        Conditions::of_work_ram(&wram_with_goku(0xC0, 0x39)),
+    ] {
+        assert_eq!(
+            drawn_goku(&with, &gold, conditions),
+            (Some(0), [255, 0, 0]),
+            "{conditions:?}: the Super Saiyan's art"
+        );
+        assert_eq!(drawn_goku(&with, &gold, conditions), drawn_goku(&pack, &gold, conditions));
+    }
+    let kaioken = Conditions::of_work_ram(&wram_with_goku(0x80, 0x3A));
+    let mut red = frame.clone();
+    for index in [1, 14, 15] {
+        red.cgram_start[0x80 + 16 + index] = 0x001F; // red
+    }
+    assert_eq!(
+        drawn_goku(&with, &red, kaioken).0,
+        Some(2),
+        "red outline and hair: the picture, in red"
+    );
+    assert_eq!(
+        drawn_goku(&pack, &red, kaioken),
+        (None, [0, 255, 0]),
+        "without the folder: 0050's sprite"
+    );
+    let mut red_hair = frame.clone();
+    for index in [14, 15] {
+        red_hair.cgram_start[0x80 + 16 + index] = 0x001F; // red
+    }
+    assert_eq!(
+        drawn_goku(&with, &red_hair, kaioken),
+        (None, [0, 255, 0]),
+        "red hair, black outline: the game's sprite"
+    );
+    assert_eq!(drawn_goku(&with, &red_hair, kaioken), drawn_goku(&pack, &red_hair, kaioken));
+}
+
+#[test]
+fn the_normal_goku_s_own_picture_is_drawn_in_a_fade_whose_colours_are_nearer_the_super_saiyan_s() {
+    // A fade whitens the normal Goku's colours: his outline and black hair become a light grey, nearer the Super Saiyan's
+    // yellow than the black of the picture's palette, yet not his hair. The picture is the unit drawn from (`unit_for`),
+    // not the Super Saiyan's art the nearest palette would give
+    let dir = tempfile::tempdir().unwrap();
+    let overrides = tempfile::tempdir().unwrap();
+    let (mut frame, pose) = fighter_log(40, 50);
+    let (pack, with) = normal_goku_override_packs(&dir, &overrides, &pose);
+    for index in [1, 14, 15] {
+        frame.cgram_start[0x80 + 16 + index] = 0x6318; // light grey
+    }
+    assert_eq!(
+        drawn_goku(&with, &frame, Conditions::default()).0,
+        Some(2),
+        "the normal Goku's picture"
+    );
+    assert_eq!(
+        drawn_goku(&pack, &frame, Conditions::default()).0,
+        Some(0),
+        "without the folder: the Super Saiyan's art"
+    );
+}
+
+#[test]
+fn without_the_goku_folder_every_frame_is_drawn_as_before() {
+    // No `art-override\goku\` (or an empty one): the pack is the same, and so is every frame, in the normal Goku's colours,
+    // the Super Saiyan's and the Kaioken's, with and without the Kaioken on
+    let dir = tempfile::tempdir().unwrap();
+    let overrides = tempfile::tempdir().unwrap();
+    let (frame, pose) = fighter_log(40, 50);
+    let (pack, _) = normal_goku_override_packs(&dir, &overrides, &pose);
+    std::fs::remove_file(overrides.path().join("goku/battle-goku-ssj-020.png")).unwrap();
+    let empty = Arc::new((*pack).clone().with_art_override(overrides.path()));
+    let none = Arc::new((*pack).clone().with_art_override(&overrides.path().join("absent")));
+    assert_eq!(empty.art.objects(), pack.art.objects());
+    assert_eq!(none.art.objects(), pack.art.objects());
+    for hair in [None, Some((0x53FF, 0x0A98)), Some((0x001F, 0x001F))] {
+        let mut frame = frame.clone();
+        if let Some((fourteen, fifteen)) = hair {
+            frame.cgram_start[0x80 + 16 + 14] = fourteen;
+            frame.cgram_start[0x80 + 16 + 15] = fifteen;
+        }
+        for conditions in
+            [Conditions::default(), Conditions::of_work_ram(&wram_with_goku(0xC0, 0x39))]
+        {
+            assert_eq!(
+                drawn_goku(&empty, &frame, conditions),
+                drawn_goku(&pack, &frame, conditions),
+                "{hair:?}"
+            );
+            assert_eq!(
+                drawn_goku(&none, &frame, conditions),
+                drawn_goku(&pack, &frame, conditions),
+                "{hair:?}"
+            );
+        }
+    }
+}
+
+/// A fighter (sprite 0, 16 x 16 at (40, 10), OAM priority bits `priority`) over the BG4 layer of
+/// [`background_frame`], and a pack with the layer's art and the fighter's: its art is clear on its
+/// left half (columns 40..48) and blue on its right half.
+fn fighter_over_background(dir: &std::path::Path, priority: u8) -> (FrameLog, Arc<Pack>) {
+    let mut log = background_frame(0);
+    for entry in &mut log.entries {
+        entry.regs.main_obj = true;
+    }
+    log.oam_low[0..4].copy_from_slice(&[40, 10, 0, 1 << 1 | priority << 4]);
+    log.oam_high[0] = 0b10;
+    for tile in [0_usize, 1, 16, 17] {
+        for row in 0..8 {
+            log.vram[tile * 16 + row] = 0xFF00;
+        }
+    }
+    log.cgram_start[0x80 + 16 + 2] = 0x03E0;
+    let sprites = poses::sprites(&log);
+    let found: Vec<Pose> =
+        poses::poses(&log, &sprites).into_iter().filter(|pose| !pose.field).collect();
+    assert_eq!(found.len(), 1);
+    let clear_left = |x: u32, _| if x < 32 { [0, 0, 0, 0] } else { [0, 0, 255, 255] };
+    write_png(&dir.join("art/o.png"), 64, 64, clear_left);
+    let mut pack = Arc::try_unwrap(background_pack(dir, &log.vram, true)).unwrap();
+    pack.art = ArtIndex::new(Vec::new(), vec![object(&found[0], "art/o.png", false)]);
+    (log, Arc::new(pack))
+}
+
+/// The pixel at the middle of game pixel `(x, y)` of the window, drawn with `pack` by the 256 wide
+/// renderer and by the wide view (372 wide: the window starts at 58).
+fn both_views(pack: &Arc<Pack>, frame: &FrameLog, (x, y): (usize, usize)) -> [[u8; 3]; 2] {
+    let mut renderer = Renderer::new();
+    renderer.set_art(Some(Arc::clone(pack)));
+    let drawn = renderer.render_hd(frame, options(4)).unwrap();
+    let mut wide = WideRenderer::new();
+    wide.set_art(Some(Arc::clone(pack)));
+    let wide_options = WideOptions { width: 372, hud: HudPlacement::Window };
+    let wide_drawn = wide.render_hd(Rom(&[]), 0x02, None, frame, wide_options, options(4)).unwrap();
+    [pixel(&drawn, x * 4 + 1, y * 4 + 1), pixel(&wide_drawn.picture, (58 + x) * 4 + 1, y * 4 + 1)]
+}
+
+#[test]
+fn where_a_poses_art_is_clear_the_layer_with_art_shows_though_a_window_could_hide_it() {
+    let dir = tempfile::tempdir().unwrap();
+    let (mut frame, pack) = fighter_over_background(dir.path(), 0);
+    // The main screen hides BG4 inside window 1, which is far to the right (columns 200..250):
+    // BG4 shows all around the fighter, and the original's sprite hides it where the art is clear
+    for entry in &mut frame.entries {
+        entry.regs.main_bg_window_off[3] = true;
+        entry.regs.bg_window_area[0][3] = 1;
+        entry.regs.window_left[0] = 200;
+        entry.regs.window_right[0] = 250;
+    }
+    // Frame row 15 is the layer's row 16; the layer's art is (x, row, 0) at game pixel x
+    let clear = both_views(&pack, &frame, (42, 15));
+    assert_eq!(clear, [[42, 16, 0]; 2], "the layer's art, not its look");
+    assert_eq!(both_views(&pack, &frame, (50, 15)), [[0, 0, 255]; 2], "the fighter's art");
+    assert_eq!(both_views(&pack, &frame, (30, 15)), [[30, 16, 0]; 2], "beside the fighter");
+    // Inside the window BG4 is hidden: the backdrop
+    assert_eq!(both_views(&pack, &frame, (220, 15)), [[0, 0, 0]; 2]);
+}
+
+#[test]
+fn where_a_poses_art_is_clear_a_layer_without_art_in_front_of_the_background_shows() {
+    let dir = tempfile::tempdir().unwrap();
+    // The fighter has the highest priority: in front of BG2, whose white tiles (no art) are in
+    // front of BG4 over the columns 32..56 and the frame rows 7..31 (an explosion's ground)
+    let (mut frame, pack) = fighter_over_background(dir.path(), 3);
+    for entry in &mut frame.entries {
+        entry.regs.main_bg[1] = true;
+        entry.regs.bg_map_base[1] = 0x0800;
+        entry.regs.bg_char_base[1] = 0x2000;
+    }
+    for word in 0..8 {
+        frame.vram[0x2000 + 8 + word] = 0x00FF;
+    }
+    for row in 1..4 {
+        for column in 4..7 {
+            frame.vram[0x0800 + row * 32 + column] = 1;
+        }
+    }
+    frame.cgram_start[0x21] = 0x7FFF;
+    assert_eq!(both_views(&pack, &frame, (42, 15)), [[255; 3]; 2], "BG2's white, not BG4's art");
+    assert_eq!(both_views(&pack, &frame, (50, 15)), [[0, 0, 255]; 2], "the fighter's art in front");
+    assert_eq!(both_views(&pack, &frame, (34, 15)), [[255; 3]; 2], "BG2 beside the fighter");
+    assert_eq!(both_views(&pack, &frame, (60, 15)), [[60, 16, 0]; 2], "BG4's art past BG2");
+}
+
+#[test]
+fn the_record_under_a_pose_is_taken_for_its_hidden_sprites_pixels_alone() {
+    use crate::bgart::Kind;
+    let width = 8;
+    let mut pixels = vec![super::ArtPixel::NONE; width * 4];
+    let mut under = vec![super::ArtPixel::NONE; width * 4];
+    for pixel in &mut under {
+        pixel.bg.kind = Kind::Layer;
+        pixel.bg.shadow = 7;
+    }
+    // Row 1: a pixel of sprite 3 (hidden), of sprite 4 (not hidden) and of a layer; row 3: sprite 3
+    // again, past the rows the poses reach
+    for (at, oam) in [(width + 1, 3), (width + 2, 4), (3 * width + 1, 3)] {
+        pixels[at].oam = oam;
+        pixels[at].prio = 5;
+        pixels[at].bg.kind = Kind::Object;
+    }
+    super::merge_under(&mut pixels, &under, width, 1 << 3, Some((1, 3)));
+    assert_eq!((pixels[width + 1].bg.kind, pixels[width + 1].bg.shadow), (Kind::Layer, 7));
+    assert_eq!((pixels[width + 1].oam, pixels[width + 1].prio), (3, 5), "the sprite's own");
+    assert_eq!(pixels[width + 2].bg.kind, Kind::Object, "a sprite that is not hidden");
+    assert_eq!(pixels[width + 3].bg.kind, Kind::Hidden, "a layer's pixel");
+    assert_eq!(pixels[3 * width + 1].bg.kind, Kind::Object, "a row the poses do not reach");
+    let before = pixels.iter().map(|pixel| pixel.bg.kind).collect::<Vec<_>>();
+    super::merge_under(&mut pixels, &under, width, 1 << 3, None);
+    assert_eq!(pixels.iter().map(|pixel| pixel.bg.kind).collect::<Vec<_>>(), before, "no poses");
+}
+
+/// One frame where a pose variant's margin runs over blank text cells
+/// behind the fighter (the HD text leaves those pixels to the art, `ArtState::uncover`) and the
+/// variant's art is clear over a layer with art that a window hides elsewhere (the layer is drawn
+/// as it is with the sprite gone, `merge_under`). The fighter (16 x 16 at (40, 16), priority 0)
+/// stands on BG4 of [`background_frame`] (mode 0), under BG3 spaces in white on tile row 1 (frame
+/// rows 8..16, where the variant's top margin is); the variant (80 x 80, margin 2) and the pose's
+/// art are clear over the sprite's left half (columns 40..48) and magenta / blue elsewhere.
+#[test]
+fn a_variants_margin_over_text_cells_and_its_clear_art_over_a_layer_hold_in_one_frame() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut frame = background_frame(0);
+    for entry in &mut frame.entries {
+        entry.regs.main_obj = true;
+        entry.regs.main_bg[2] = true;
+        entry.regs.bg_map_base[2] = 0x0800;
+        entry.regs.bg_char_base[2] = 0x2000;
+        // BG4 hidden inside window 1, far to the right
+        entry.regs.main_bg_window_off[3] = true;
+        entry.regs.bg_window_area[0][3] = 1;
+        entry.regs.window_left[0] = 200;
+        entry.regs.window_right[0] = 250;
+    }
+    frame.oam_low[0..4].copy_from_slice(&[40, 16, 0, 1 << 1]);
+    frame.oam_high[0] = 0b10;
+    for tile in [0_usize, 1, 16, 17] {
+        for row in 0..8 {
+            frame.vram[tile * 16 + row] = 0xFF00;
+        }
+    }
+    frame.cgram_start[0x80 + 16 + 2] = 0x03E0;
+    // BG3: the font's space (tile 1, colour 1 on every pixel) on tile row 1 only, in white
+    for row in 0..8 {
+        frame.vram[0x2000 + 8 + row] = 0x00FF;
+    }
+    frame.vram[0x0800 + 32..0x0800 + 64].fill(1);
+    // (mode 0: BG3's colours are 64..96)
+    frame.cgram_start[0x41] = 0x7FFF;
+    let sprites = poses::sprites(&frame);
+    let found: Vec<Pose> =
+        poses::poses(&frame, &sprites).into_iter().filter(|pose| !pose.field).collect();
+    assert_eq!(found.len(), 1);
+    let clear_left = |x: u32, _| if x < 32 { [0, 0, 0, 0] } else { [0, 0, 255, 255] };
+    write_png(&dir.path().join("art/o.png"), 64, 64, clear_left);
+    let variant = dir.path().join("art/v.png");
+    // The variant's box starts 2 game pixels (8 art pixels) in: clear over columns 40..48, rows 16..32
+    write_png(&variant, 80, 80, |x, y| {
+        if (8..40).contains(&x) && (8..72).contains(&y) { [0, 0, 0, 0] } else { [255, 0, 255, 255] }
+    });
+    let mut pack = Arc::try_unwrap(background_pack(dir.path(), &frame.vram, true)).unwrap();
+    pack.art = ArtIndex::new(Vec::new(), vec![object(&found[0], "art/o.png", false)]);
+    pack.variants = vec![PoseVariant {
+        art: "battle-x-000".to_owned(),
+        when: ssd_mod::pose::Condition::Always,
+        margin: 2,
+        file: variant.to_string_lossy().into_owned(),
+    }];
+    let pack = Arc::new(pack);
+    let mut renderer = Renderer::new();
+    renderer.set_font(Some(space_font()));
+    renderer.set_art(Some(Arc::clone(&pack)));
+    let drawn = renderer.render_hd(&frame, options(4)).unwrap();
+    let mut wide = WideRenderer::new();
+    wide.set_font(Some(space_font()));
+    wide.set_art(Some(pack));
+    let wide_options = WideOptions { width: 372, hud: HudPlacement::Window };
+    let wide_drawn =
+        wide.render_hd(Rom(&[]), 0x02, None, &frame, wide_options, options(4)).unwrap();
+    let both = |x: usize, y: usize| {
+        [
+            pixel(&drawn, x * 4 + 1, y * 4 + 1),
+            pixel(&wide_drawn.picture, (58 + x) * 4 + 1, y * 4 + 1),
+        ]
+    };
+    // (magenta: BG4's look is red)
+    let magenta = [255, 0, 255];
+    // ssj-hair-fix: the variant's margin over the spaces is the variant's, beside it the cells' white
+    assert_eq!(both(45, 14), [magenta; 2], "the margin above the sprite, on a space");
+    assert_eq!(both(38, 15), [magenta; 2], "the margin's first column, on a space");
+    assert_eq!(both(37, 14), [[0xFF; 3]; 2], "past the margin the cells keep their white");
+    // halo-fix: where the variant is clear, BG4's art (a layer the window hides elsewhere)
+    assert_eq!(both(42, 20), [[42, 21, 0]; 2], "the layer's art under the clear variant");
+    assert_eq!(both(50, 20), [magenta; 2], "the variant over the sprite's right half");
+    assert_eq!(both(30, 20), [[30, 21, 0]; 2], "beside the fighter");
+}
+
+/// The bytes of the files of background entry `at` of `pack` (its art and its source).
+fn bg_file_bytes(pack: &Pack, at: usize) -> u64 {
+    let entry = &pack.bg.layer[at];
+    [&entry.art, &entry.source]
+        .into_iter()
+        .filter(|file| !file.is_empty())
+        .map(|file| std::fs::metadata(pack.dir.join(file)).unwrap().len())
+        .sum()
+}
+
+#[test]
+fn the_cost_counts_the_background_art_asked_for_received_and_evicted() {
+    let dir = tempfile::tempdir().unwrap();
+    let mut pack = Arc::try_unwrap(background_pack(dir.path(), &vec![0; 0x8000], false)).unwrap();
+    let entry = pack.bg.layer[0].clone();
+    pack.bg.layer =
+        (0..5).map(|n| crate::bgart::Entry { id: format!("test-{n}"), ..entry.clone() }).collect();
+    let pack = Arc::new(pack);
+    let files = bg_file_bytes(&pack, 0);
+    let mut art = ArtState::new(Arc::clone(&pack));
+    art.begin(256, 224, 4);
+    for at in 0..5 {
+        assert!(art.bg_image(at).is_some(), "entry {at} has its art");
+    }
+    let cost = art.cost();
+    assert_eq!(
+        (cost.requests, cost.bg_loads, cost.received()),
+        (5, 5, 5),
+        "five files asked for and read"
+    );
+    assert_eq!(cost.load_bytes, 5 * files, "the bytes of the files read");
+    assert!(cost.loads > std::time::Duration::ZERO, "{cost:?}");
+    assert_eq!(cost.bg_evicted, 0, "five layers are within the budget");
+    art.bg_image(4);
+    assert_eq!(art.cost().requests, 5, "the one kept is not asked for again");
+    // Past a budget the layer used longest ago goes, and the frame's cost counts it
+    let layer = art.bg_image(0);
+    art.bg_images.insert(9, layer.clone(), 1);
+    art.bg_images.insert(8, layer, 1);
+    assert_eq!(art.cost().bg_evicted, 6, "the five, then the ninth");
+    art.begin(256, 224, 4);
+    assert_eq!(art.cost(), crate::DrawCost::default(), "a frame starts its cost over");
+}
+
+#[test]
+fn the_cost_of_art_read_on_its_own_thread_is_its_asking_and_receiving_not_its_reading() {
+    let dir = tempfile::tempdir().unwrap();
+    let pack = background_pack(dir.path(), &vec![0; 0x8000], false);
+    let files = bg_file_bytes(&pack, 0);
+    let mut art = ArtState::new(pack);
+    art.set_async(true);
+    if !art.loads_async() {
+        // (SSD_HD_SERIAL keeps the art read by the frames)
+        return;
+    }
+    art.begin(256, 224, 4);
+    assert!(art.bg_image(0).is_none(), "asked of the thread, not read");
+    assert!(art.bg_image(0).is_none());
+    let cost = art.cost();
+    assert_eq!(
+        (cost.requests, cost.received(), cost.load_bytes),
+        (1, 0, 0),
+        "asked once a frame: {cost:?}"
+    );
+    assert!(art.wait_read(), "the thread reads it");
+    art.begin(256, 224, 4);
+    let cost = art.cost();
+    assert_eq!(
+        (cost.requests, cost.bg_loads, cost.received()),
+        (0, 1, 1),
+        "received when a frame starts"
+    );
+    assert_eq!(cost.load_bytes, files, "with the bytes of its files");
+    assert_eq!(
+        cost.loads,
+        std::time::Duration::ZERO,
+        "the thread's reading is not the frame's time"
+    );
+    assert!(art.bg_image(0).is_some(), "and drawn");
+    assert_eq!(art.cost().requests, 0, "not asked for again");
+}
+
+/// The work RAM of a frame of the ending's loop: game mode `mode`, the loop's frame `frames` (`$73`), who is in the ending
+/// `party` (`$82`), and Super Saiyan Goku's unit in a party record, as in the ending.
+fn wram_of_ending(mode: u8, frames: u16, party: u8) -> Vec<u8> {
+    let mut wram = vec![0_u8; 0x20000];
+    wram[0x0024] = mode;
+    wram[0x0073..0x0075].copy_from_slice(&frames.to_le_bytes());
+    wram[0x0082] = party;
+    wram[0x0B00 + 1] = 0x3B;
+    wram
+}
+
+#[test]
+fn the_ending_flight_is_mode_11_until_goku_crouches_before_vegeta() {
+    // `00:B0EE` draws Goku from the flight's sprites while `$73` is under `$1F40`, and from the crouch's from then on with
+    // Vegeta in the ending (`$82` bit 7); without him Goku flies on. Super Saiyan Goku's unit in a party record (outside
+    // the ending too, in every fight after Frieza's) is not the flight
+    let flight = |mode, frames, party| {
+        Conditions::of_work_ram(&wram_of_ending(mode, frames, party)).ending_flight
+    };
+    assert!(flight(0x11, 0x0080, 0x87), "the first frame of the flight");
+    assert!(flight(0x11, 0x1F3F, 0x87), "its last frame with Vegeta");
+    assert!(!flight(0x11, 0x1F40, 0x87), "Goku crouching with Gohan before Vegeta");
+    assert!(!flight(0x11, 0x290C, 0x87), "Vegeta's speech");
+    assert!(flight(0x11, 0x1F40, 0x07), "without Vegeta he flies on");
+    assert!(flight(0x91, 0x0100, 0x87), "bit 7 of the mode aside");
+    for mode in [0x00, 0x02, 0x04, 0x07, 0x0C, 0x12] {
+        assert!(!flight(mode, 0x0100, 0x87), "mode {mode:02X} is not the flight");
+    }
+    assert!(!Conditions::of_work_ram(&[0x11; 0x40]).ending_flight, "too short: no");
+    assert!(!Conditions::default().ending_flight);
+}
+
+#[test]
+fn goku_s_picture_of_the_ending_folder_is_drawn_in_the_ending_flight_only() {
+    // `art-override\ending-goku\battle-goku-000.png` (magenta): Goku in torn clothes, drawn in place of the normal art of
+    // its name while the ending's flight is on screen; in a fight (the same art, before Namek or with `$3B` after Frieza),
+    // with Goku crouching before Vegeta and without the folder, the art as before
+    let dir = tempfile::tempdir().unwrap();
+    let overrides = tempfile::tempdir().unwrap();
+    let (frame, pose) = fighter_log(40, 50);
+    let pack = goku_pack(
+        &dir,
+        &pose,
+        &[(2, [0, 255, 0]), (3, [0, 0, 0])],
+        &[(2, [255, 198, 0]), (3, [0, 0, 0])],
+    );
+    std::fs::create_dir_all(overrides.path().join("ending-goku")).unwrap();
+    let empty = Arc::new((*pack).clone().with_art_override(overrides.path()));
+    assert_eq!(empty.art.objects(), pack.art.objects(), "an empty folder adds nothing");
+    write_png(&overrides.path().join("ending-goku/battle-goku-000.png"), 64, 64, |_, _| {
+        [255, 0, 255, 255]
+    });
+    let with = Arc::new((*pack).clone().with_art_override(overrides.path()));
+    assert_eq!(
+        with.art.objects()[..3],
+        pack.art.objects()[..],
+        "the art of the name is left as it was"
+    );
+    assert_eq!(with.art.objects()[3].id, "battle-goku-000@ending-goku");
+    let flight = Conditions::of_work_ram(&wram_of_ending(0x11, 0x0100, 0x87));
+    assert_eq!(
+        drawn_goku(&with, &frame, flight),
+        (Some(3), [255, 0, 255]),
+        "the flight: the folder's picture"
+    );
+    assert_eq!(drawn_goku(&pack, &frame, flight).0, Some(0), "without the folder: the normal art");
+    for (conditions, what) in [
+        (Conditions::default(), "a fight before Namek"),
+        (
+            Conditions::of_work_ram(&wram_of_ending(0x02, 0x0100, 0x87)),
+            "a fight with $3B in the party",
+        ),
+        (Conditions::of_work_ram(&wram_of_ending(0x11, 0x1F40, 0x87)), "crouching before Vegeta"),
+    ] {
+        assert_eq!(drawn_goku(&with, &frame, conditions).0, Some(0), "{what}: the normal art");
+        assert_eq!(
+            drawn_goku(&with, &frame, conditions),
+            drawn_goku(&pack, &frame, conditions),
+            "{what}: as without the folder"
+        );
+    }
 }

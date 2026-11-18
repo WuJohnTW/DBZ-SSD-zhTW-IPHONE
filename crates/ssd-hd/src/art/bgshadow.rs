@@ -99,6 +99,15 @@ pub(crate) fn find(frame: &Frame, pixels: &mut [ArtPixel]) -> Vec<BgShadow> {
         for at in shown.iter().flatten() {
             pixels[*at].bg.kind = Kind::Layer;
         }
+        // A pixel of a sprite an HD pose hides has the record of the picture under the poses
+        // (`art::merge_under`): where that is the shadow, the art draws under it too, and the
+        // shadow over the art, as beside the pose (the pose's sprite pixels are never `Under`
+        // otherwise)
+        for &at in &cells {
+            if pixels[at].bg.kind == Kind::Under && pixels[at].oam != NO_OBJECT {
+                pixels[at].bg.kind = Kind::Layer;
+            }
+        }
         out.push(BgShadow { x0: left as i32, y0: top as i32, w, h, arr, shown });
     }
     out
@@ -222,6 +231,25 @@ mod tests {
         assert_eq!(found[0].arr.iter().filter(|&&c| c != 0).count(), 76);
         assert_eq!(found[0].shown.iter().flatten().count(), 73, "the foot's pixels are not BG1's");
         assert_eq!(pixels[12 * 64 + 21].bg.kind, Kind::Object, "left to the pose's art");
+    }
+
+    #[test]
+    fn the_shadow_under_a_hidden_sprite_is_drawn_over_the_art_too() {
+        let (frame, mut pixels) = frame_of(&[(4, 12), (1, 15), (0, 16), (0, 16), (1, 15), (4, 12)]);
+        // A foot an HD pose hides: its pixels have the record of the picture under the poses,
+        // which shows the shadow there
+        for x in 20..23 {
+            pixels[12 * 64 + x].oam = 3;
+        }
+        // Another sprite's pixel over the shadow keeps its own record
+        pixels[13 * 64 + 20].oam = 4;
+        pixels[13 * 64 + 20].bg.kind = Kind::Object;
+        let found = find(&frame, &mut pixels);
+        assert_eq!(found.len(), 1);
+        let shown = found[0].shown.iter().flatten().count();
+        assert_eq!(shown, 72, "the sprites' pixels are not BG1's");
+        assert!((20..23).all(|x| pixels[12 * 64 + x].bg.kind == Kind::Layer), "the art under it");
+        assert_eq!(pixels[13 * 64 + 20].bg.kind, Kind::Object);
     }
 
     #[test]

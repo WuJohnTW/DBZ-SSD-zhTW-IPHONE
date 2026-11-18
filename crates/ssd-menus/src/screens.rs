@@ -960,6 +960,18 @@ fn mods_details(list: &mut DrawList, view: &ModsView, window: Rect) {
     let x = window.x + 40.0;
     list.text(x, window.y + 36.0, "-- Details --", MODS_LINE_TEXT, palette::DARK_RED, Align::Left);
     let mut lines: Vec<(String, f32, Color)> = Vec::new();
+    // The wrapped paragraphs among `lines`: the index of the first line, how many, and the text they wrap (marked as whole
+    // lines once drawn, so that a translation of the whole sentence takes their place, `DrawList::mark_lines`)
+    let mut paragraphs: Vec<(usize, usize, String)> = Vec::new();
+    let mut wrapped = |lines: &mut Vec<(String, f32, Color)>, text: &str| {
+        let first = lines.len();
+        for line in wrap(text, MODS_DETAIL_CHARS) {
+            lines.push((line, MODS_LINE_TEXT, palette::BLACK));
+        }
+        if lines.len() > first {
+            paragraphs.push((first, lines.len() - first, text.to_owned()));
+        }
+    };
     let mut button = None;
     if let Some(pack) = view.packs.get(view.cursor) {
         lines.push((
@@ -971,9 +983,7 @@ fn mods_details(list: &mut DrawList, view: &ModsView, window: Rect) {
             lines.push((format!("by {}", pack.author), MODS_LINE_TEXT, palette::GREY));
         }
         lines.push((String::new(), MODS_LINE_TEXT, palette::BLACK));
-        for line in wrap(&pack.description, MODS_DETAIL_CHARS) {
-            lines.push((line, MODS_LINE_TEXT, palette::BLACK));
-        }
+        wrapped(&mut lines, &pack.description);
         lines.push((String::new(), MODS_LINE_TEXT, palette::BLACK));
         lines.push((format!("Needs: {}", pack.needs), MODS_LINE_TEXT, palette::BLACK));
         lines.push((
@@ -984,32 +994,21 @@ fn mods_details(list: &mut DrawList, view: &ModsView, window: Rect) {
         if let Some(reason) = &pack.reason {
             lines.push((String::new(), MODS_LINE_TEXT, palette::BLACK));
             lines.push(("REFUSED:".to_owned(), MODS_LINE_TEXT, palette::STORY));
-            for line in wrap(reason, MODS_DETAIL_CHARS) {
-                lines.push((line, MODS_LINE_TEXT, palette::BLACK));
-            }
+            wrapped(&mut lines, reason);
             lines.push((String::new(), MODS_LINE_TEXT, palette::BLACK));
-            for line in wrap(
-                "It stays off. Remove it or ask its author for a new version.",
-                MODS_DETAIL_CHARS,
-            ) {
-                lines.push((line, MODS_LINE_TEXT, palette::BLACK));
-            }
+            wrapped(&mut lines, "It stays off. Remove it or ask its author for a new version.");
         }
     } else if view.cursor == view.install_line() {
         lines.push(("Install a pack".to_owned(), MODS_NAME_TEXT, palette::BLACK));
         lines.push((String::new(), MODS_LINE_TEXT, palette::BLACK));
-        for line in wrap(
+        wrapped(
+            &mut lines,
             "A picks a pack file (.ssdpack) and copies it into the mods folder. It is listed off: switch it on and apply.",
-            MODS_DETAIL_CHARS,
-        ) {
-            lines.push((line, MODS_LINE_TEXT, palette::BLACK));
-        }
+        );
     } else if let Some(chapter) = view.chapter_at_cursor() {
         lines.push((fit(&chapter.name, MODS_NAME_TEXT, 500.0), MODS_NAME_TEXT, palette::BLACK));
         lines.push((String::new(), MODS_LINE_TEXT, palette::BLACK));
-        for line in wrap(&chapter.description, MODS_DETAIL_CHARS) {
-            lines.push((line, MODS_LINE_TEXT, palette::BLACK));
-        }
+        wrapped(&mut lines, &chapter.description);
         if chapter.locked {
             lines.push((String::new(), MODS_LINE_TEXT, palette::BLACK));
             lines.push((
@@ -1022,9 +1021,15 @@ fn mods_details(list: &mut DrawList, view: &ModsView, window: Rect) {
         }
     }
     let mut y = window.y + 80.0;
-    for (text, size, colour) in &lines {
+    for (at, (text, size, colour)) in lines.iter().enumerate() {
         list.text(x, y, text, *size, *colour, Align::Left);
         y += 26.0;
+        // (a paragraph's translation takes no more lines than its English: the lines after it keep their places)
+        for (_, count, whole) in
+            paragraphs.iter().filter(|(first, count, _)| first + count - 1 == at)
+        {
+            list.mark_lines(whole, *count, MODS_DETAIL_CHARS, 26.0, *count);
+        }
     }
     if let Some(label) = button {
         let rect = Rect::new(x, y + 14.0, 150.0, 36.0);
@@ -1041,10 +1046,12 @@ fn mods_details(list: &mut DrawList, view: &ModsView, window: Rect) {
     if let Some(notice) = &view.notice {
         let texts = wrap(notice, MODS_DETAIL_CHARS);
         let mut at = window.bottom() - 30.0 - 26.0 * texts.len() as f32;
+        let runs = texts.len();
         for text in texts {
             list.text(x, at, &text, MODS_LINE_TEXT, palette::STORY, Align::Left);
             at += 26.0;
         }
+        list.mark_lines(notice, runs, MODS_DETAIL_CHARS, 26.0, runs);
     }
 }
 
@@ -1257,7 +1264,8 @@ fn next_card(list: &mut DrawList, view: &CheatsView, window: Rect) {
         (false, false) => "A card as the game deals it",
     };
     let first = card.bottom() + 6.0 + CAPTION_TEXT / 2.0;
-    for (line, text) in wrap(caption, CAPTION_CHARS).iter().enumerate() {
+    let lines = wrap(caption, CAPTION_CHARS);
+    for (line, text) in lines.iter().enumerate() {
         let y = first + 16.0 * line as f32;
         list.text(
             window.x + window.w / 2.0,
@@ -1268,6 +1276,7 @@ fn next_card(list: &mut DrawList, view: &CheatsView, window: Rect) {
             Align::Centre,
         );
     }
+    list.mark_lines(caption, lines.len(), CAPTION_CHARS, 16.0, usize::MAX);
 }
 
 /// The card of the preview drawn in the pixel style, for a backend that has no card art: a black line
@@ -1337,10 +1346,12 @@ fn on_window(list: &mut DrawList, view: &CheatsView, window: Rect) {
     let lines = view.cheats.lines(&view.names);
     if lines.is_empty() {
         let text = "None. The game plays as the original.";
-        for (line, part) in wrap(text, EMPTY_CHARS).iter().enumerate() {
+        let parts = wrap(text, EMPTY_CHARS);
+        for (line, part) in parts.iter().enumerate() {
             let middle = first + 11.0 + 22.0 * line as f32;
             list.text(left, middle, part, SMALL_TEXT, palette::BLACK, Align::Left);
         }
+        list.mark_lines(text, parts.len(), EMPTY_CHARS, 22.0, usize::MAX);
     } else {
         // The lines take the room above the button, 24 px apart at most and closer when there are many.
         let room = button.y - 6.0 - first;
@@ -1832,7 +1843,8 @@ fn options_help(list: &mut DrawList, view: &OptionsView) {
         refusal.map_or_else(|| row.map_or("", |row| row.help), |refusal| refusal.message.as_str());
     let chars = ((window.w - 2.0 * (FRAME + 22.0)) / (ADVANCE * OPT_HELP_TEXT)).floor() as usize;
     let top = window.y + FRAME + 10.0;
-    for (line, text) in wrap(help, chars).iter().take(3).enumerate() {
+    let lines = wrap(help, chars);
+    for (line, text) in lines.iter().take(3).enumerate() {
         list.text(
             left,
             top + 13.0 + 26.0 * line as f32,
@@ -1842,6 +1854,7 @@ fn options_help(list: &mut DrawList, view: &OptionsView) {
             Align::Left,
         );
     }
+    list.mark_lines(help, lines.len().min(3), chars, 26.0, 3);
     let hints = if view.controls.as_ref().is_some_and(|state| state.listening) {
         let shortcut = view.row > 0
             && (view.row - 1) % crate::options::controls::ACTIONS
@@ -1851,19 +1864,20 @@ fn options_help(list: &mut DrawList, view: &OptionsView) {
         if shortcut {
             hints.push("Backspace  Clear");
         }
-        hints.join("   ")
+        hints
     } else {
-        view.category.hints(row).join("   ")
+        view.category.hints(row)
     };
     let y = window.bottom() - FRAME - 10.0 - 9.0;
     list.text(
         window.right() - FRAME - 22.0,
         y,
-        &hints,
+        &hints.join("   "),
         SMALL_TEXT,
         palette::DARK_RED,
         Align::Right,
     );
+    list.mark_parts(&hints, "   ");
 }
 
 /// Reset all's question over a veil: the words, Yes and No (the cursor on `choice`, 0 Yes and 1 No), and the hint.
@@ -1891,11 +1905,13 @@ fn options_question(list: &mut DrawList, choice: u8) {
     );
     // The second line wraps inside the window (the design's text is wider than its box), and the buttons move down.
     let chars = ((window.w - 2.0 * (FRAME + 28.0)) / (ADVANCE * ROW_TEXT)).floor() as usize;
-    let lines = wrap("Difficulty, Gameplay, Video, Audio, Controls and Accessibility.", chars);
+    let pages = "Difficulty, Gameplay, Video, Audio, Controls and Accessibility.";
+    let lines = wrap(pages, chars);
     for (line, text) in lines.iter().enumerate() {
         let y = top + 81.0 + 22.0 * line as f32;
         list.text(left, y, text, ROW_TEXT, palette::BLACK, Align::Left);
     }
+    list.mark_lines(pages, lines.len(), chars, 22.0, lines.len());
     let buttons = top + 110.0 + 22.0 * (lines.len() as f32 - 1.0);
     for (index, text) in ["Yes", "No"].into_iter().enumerate() {
         let rect = Rect::new(left + index as f32 * 224.0, buttons, 200.0, 52.0);
@@ -1938,6 +1954,7 @@ fn options_video_question(list: &mut DrawList, ask: &VideoAsk) {
         let y = top + 81.0 + 22.0 * line as f32;
         list.text(left, y, text, ROW_TEXT, palette::BLACK, Align::Left);
     }
+    list.mark_lines(&ask.summary, lines.len(), chars, 22.0, lines.len());
     let extra = 22.0 * (lines.len() as f32 - 1.0).max(0.0);
     let buttons = top + 110.0 + extra;
     for (index, text) in ["Keep", "Revert"].into_iter().enumerate() {
@@ -2287,10 +2304,10 @@ mod tests {
             .iter()
             .position(|row| row.key == crate::language::Language::KEY)
             .expect("the Language row");
-        // English, then the translations by code: the long name is the first of them.
+        // The translations by code (no Taiwan here), then English: the long name is the first.
         let label = Category::Accessibility.rows()[row].label;
         let mut view = options_view(Category::Accessibility, row, None);
-        view.values[row] = 1;
+        view.values[row] = 0;
         let list = options_screen(&view);
         let value = list
             .texts()
@@ -3084,6 +3101,86 @@ mod tests {
     }
 
     #[test]
+    fn the_wrapped_sentences_of_the_data_packs_details_and_the_reset_question_are_translated_whole()
+    {
+        // The details' sentences (the install line's help, a refused pack's "It stays off...", a pack's or a
+        // chapter's description, the notice) and Reset all's list of pages are drawn wrapped; a translation table has
+        // them whole, so each was looked up line by line and stayed English. They are marked as whole lines: the whole
+        // sentence's translation takes the lines' place, in no more lines than the English
+        let install = "A picks a pack file (.ssdpack) and copies it into the mods folder. It is listed off: switch it on and apply.";
+        let off = "It stays off. Remove it or ask its author for a new version.";
+        let pages = "Difficulty, Gameplay, Video, Audio, Controls and Accessibility.";
+        let table = |text: &str| -> Option<String> {
+            if text == install {
+                Some("按 A 選擇資料包檔，並複製到 mods 資料夾。".to_owned())
+            } else if text == off {
+                Some("會維持關閉。".to_owned())
+            } else if text == pages {
+                Some("難度、遊玩、畫面、聲音、操作與輔助功能。".to_owned())
+            } else if text == "A room with a Kaioken master." {
+                Some("有界王拳師父的房間。".to_owned())
+            } else {
+                None
+            }
+        };
+        let english = mods_screen(&mods_view(2, None));
+        assert!(texts(&english).len() > 3, "{:?}", texts(&english));
+        let wrapped =
+            texts(&english).iter().filter(|run| install.contains(**run) && run.len() > 5).count();
+        assert!(wrapped >= 2, "the help is wrapped: {:?}", texts(&english));
+        let mut zh = english.clone();
+        zh.map_text(table);
+        let shown = texts(&zh);
+        assert!(shown.contains(&"按 A 選擇資料包檔，並複製到 mods 資料夾。"), "{shown:?}");
+        assert!(
+            !shown.iter().any(|run| run.contains("ssdpack) and") || run.contains("switch it on")),
+            "{shown:?}"
+        );
+        assert_eq!(
+            shown.len(),
+            texts(&english).len() - (wrapped - 1),
+            "one line in place of the wrapped ones: {shown:?}"
+        );
+        let mut refused = mods_screen(&mods_view(1, None));
+        refused.map_text(table);
+        let shown = texts(&refused);
+        assert!(shown.contains(&"會維持關閉。"), "{shown:?}");
+        assert!(!shown.iter().any(|run| run.contains("ask its author")), "{shown:?}");
+        let mut chapter = mods_screen(&mods_view(4, None));
+        chapter.map_text(table);
+        assert!(texts(&chapter).contains(&"有界王拳師父的房間。"), "{:?}", texts(&chapter));
+        // the notice at the foot
+        let mut view = mods_view(0, None);
+        view.notice = Some(off.to_owned());
+        let mut noticed = mods_screen(&view);
+        noticed.map_text(table);
+        assert!(
+            !texts(&noticed).iter().any(|run| run.contains("ask its author")),
+            "{:?}",
+            texts(&noticed)
+        );
+        // Reset all's question
+        let options = |confirm| OptionsView {
+            category: crate::options::Category::Difficulty,
+            row: 0,
+            values: vec![0; crate::options::Category::Difficulty.rows().len()],
+            confirm,
+            video: None,
+            controls: None,
+        };
+        let mut asked = options_screen(&options(Some(0)));
+        assert!(
+            texts(&asked).iter().any(|run| run.starts_with("Difficulty, Gameplay")),
+            "{:?}",
+            texts(&asked)
+        );
+        asked.map_text(table);
+        let shown = texts(&asked);
+        assert!(shown.contains(&"難度、遊玩、畫面、聲音、操作與輔助功能。"), "{shown:?}");
+        assert!(!shown.iter().any(|run| run.contains("Accessibility.")), "{shown:?}");
+    }
+
+    #[test]
     fn a_question_is_drawn_over_the_screen_with_its_two_buttons() {
         let apply_list = mods_screen(&mods_view(0, Some((ModsAsk::Apply, 1))));
         let apply = texts(&apply_list);
@@ -3119,5 +3216,176 @@ mod tests {
         let (cancel, apply) = (cursor_at(&on_cancel), cursor_at(&on_apply));
         assert_eq!(cancel.len(), 1, "one cursor in the question");
         assert!(cancel[0].0 > apply[0].0, "Cancel is to the right of Apply: {cancel:?} {apply:?}");
+    }
+
+    // 0009: the HD menus' texts drawn as more than one run (a wrapped help, caption or note; the key hints joined
+    // from parts) are translated whole. The rows are the translation table's.
+    const TABLE_0009: &str = "A card as the game deals it\t遊戲發下的卡牌\n\
+        None. The game plays as the original.\t無。遊戲照原版進行。\n\
+        Sets enemy power, EXP and money together. Normal is the original game. Easy and Hard mark the save with the CHEATS badge.\t一次設定敵人強度、經驗值與金錢。「一般」是原版。「簡單」與「困難」會在存檔標上作弊標記。\n\
+        A  Open\tA  開啟\nLeft/Right  Change\tLeft/Right  切換\nB  Back\tB  返回\nY  Reset page\tY  重設本頁\n\
+        Select  Reset all\tSelect  全部重設\nL/R  Page\tL/R  換頁\n";
+
+    /// The English runs of the HD menus that were left in English before 0009 (`v13_english_residue.tsv`).
+    const LEFT_IN_ENGLISH: [&str; 9] = [
+        "A card as the",
+        "game deals it",
+        "None. The game",
+        "plays as the",
+        "original.",
+        "Sets enemy power, EXP and money together. Normal is the original game. Easy and Hard mark the save with",
+        "the CHEATS badge.",
+        "A  Open   B  Back   Y  Reset page   Select  Reset all   L/R  Page",
+        "Left/Right  Change   B  Back   Y  Reset page   Select  Reset all   L/R  Page",
+    ];
+
+    fn translated_0009(mut list: DrawList) -> DrawList {
+        let table = crate::ui_text::UiText::parse(TABLE_0009);
+        list.map_text(|text| table.get(text));
+        list
+    }
+
+    /// The width in pixels of a translated run: ASCII in Share Tech Mono, the rest a full em (the CJK face).
+    fn wide_width(text: &str, size: f32) -> f32 {
+        text.chars().map(|c| if c.is_ascii() { ADVANCE * size } else { size }).sum()
+    }
+
+    /// The runs of `list` with their size, after translation.
+    fn runs(list: &DrawList) -> Vec<(f32, f32, String, f32)> {
+        list.ops()
+            .iter()
+            .filter_map(|op| match op {
+                Op::Text { x, y, text, size, .. } => Some((*x, *y, text.clone(), *size)),
+                _ => None,
+            })
+            .collect()
+    }
+
+    fn assert_no_english_left(list: &DrawList) {
+        for (_, _, text, _) in runs(list) {
+            assert!(!LEFT_IN_ENGLISH.contains(&text.as_str()), "still English: {text:?}");
+        }
+    }
+
+    #[test]
+    fn the_cheats_screen_caption_and_empty_note_are_translated_whole_and_wrapped_to_their_width() {
+        let list = translated_0009(cheats_screen(&cheats_view(Row::Damage, Cheats::neutral())));
+        assert_no_english_left(&list);
+        let runs = runs(&list);
+        // The caption fits one line of its 15 characters (98 px of 113): one run, where the first English line was.
+        let caption: Vec<_> = runs.iter().filter(|run| run.2.contains("卡牌")).collect();
+        assert_eq!(caption.len(), 1, "{runs:?}");
+        assert_eq!(caption[0].2, "遊戲發下的卡牌");
+        assert!(
+            wide_width(&caption[0].2, caption[0].3)
+                <= CAPTION_CHARS as f32 * ADVANCE * caption[0].3
+        );
+        // The note is wider than its 14 characters: two lines 22 px apart that read the whole translation.
+        let note: Vec<_> =
+            runs.iter().filter(|run| run.2.contains('無') || run.2.contains("進行")).collect();
+        assert_eq!(note.len(), 2, "{runs:?}");
+        assert_eq!(format!("{}{}", note[0].2, note[1].2), "無。遊戲照原版進行。");
+        assert!((note[1].1 - note[0].1 - 22.0).abs() < 1e-3);
+        assert!((note[0].0 - note[1].0).abs() < 1e-3, "the lines start at the same x");
+        for line in &note {
+            assert!(
+                wide_width(&line.2, line.3) <= EMPTY_CHARS as f32 * ADVANCE * line.3,
+                "{line:?}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_difficulty_help_is_translated_whole_in_one_line_of_the_help_strip() {
+        let list = translated_0009(options_screen(&options_view(Category::Difficulty, 0, None)));
+        assert_no_english_left(&list);
+        let help: Vec<_> =
+            runs(&list).into_iter().filter(|run| run.2.contains("敵人強度")).collect();
+        assert_eq!(help.len(), 1);
+        assert_eq!(
+            help[0].2,
+            "一次設定敵人強度、經驗值與金錢。「一般」是原版。「簡單」與「困難」會在存檔標上作弊標記。"
+        );
+        let english = options_screen(&options_view(Category::Difficulty, 0, None));
+        let first = english.texts().find(|run| run.2.starts_with("Sets enemy power")).unwrap();
+        assert!(
+            (help[0].0 - first.0).abs() < 1e-3 && (help[0].1 - first.1).abs() < 1e-3,
+            "where line 1 was"
+        );
+        let room = WIDTH - 2.0 * MARGIN - 2.0 * (FRAME + 22.0);
+        assert!(wide_width(&help[0].2, help[0].3) <= room);
+        assert!(
+            !runs(&list).iter().any(|run| run.2 == "the CHEATS badge."),
+            "the second English line is gone"
+        );
+    }
+
+    #[test]
+    fn the_key_hints_are_translated_part_by_part_and_end_where_the_english_ends() {
+        let difficulty = Category::Difficulty.rows();
+        let button = difficulty.iter().position(|row| matches!(row.kind, Kind::Button(_))).unwrap();
+        let hint = |row: usize| {
+            let english = options_screen(&options_view(Category::Difficulty, row, None));
+            let english = english
+                .texts()
+                .find(|run| run.2.contains("Select  Reset all"))
+                .map(|run| run.2.to_owned());
+            let list =
+                translated_0009(options_screen(&options_view(Category::Difficulty, row, None)));
+            assert_no_english_left(&list);
+            let zh = runs(&list).into_iter().find(|run| run.2.contains("全部重設")).unwrap();
+            (english.unwrap(), zh)
+        };
+        let (open_en, open) = hint(button);
+        let (change_en, change) = hint(0);
+        assert_eq!(open.2, "A  開啟   B  返回   Y  重設本頁   Select  全部重設   L/R  換頁");
+        assert_eq!(
+            change.2,
+            "Left/Right  切換   B  返回   Y  重設本頁   Select  全部重設   L/R  換頁"
+        );
+        // Right-aligned at the same x as the English, never wider than it: the shared parts line up on both rows.
+        assert!((open.0 - change.0).abs() < 1e-3);
+        assert!(wide_width(&open.2, open.3) <= text_width(&open_en, open.3));
+        assert!(wide_width(&change.2, change.3) <= text_width(&change_en, change.3));
+        assert!(open.2.ends_with("B  返回   Y  重設本頁   Select  全部重設   L/R  換頁"));
+        assert!(change.2.ends_with("B  返回   Y  重設本頁   Select  全部重設   L/R  換頁"));
+    }
+
+    #[test]
+    fn a_row_for_the_whole_joined_run_wins_and_a_part_without_a_row_keeps_its_english() {
+        let whole = crate::ui_text::UiText::parse(
+            "Left/Right  Change   B  Back   Y  Reset page   Select  Reset all   L/R  Page\t整列\nB  Back\tB  返回\n",
+        );
+        let mut list = options_screen(&options_view(Category::Difficulty, 0, None));
+        list.map_text(|text| whole.get(text));
+        assert!(texts(&list).contains(&"整列"));
+        let parts = crate::ui_text::UiText::parse("B  Back\tB  返回\n");
+        let mut list = options_screen(&options_view(Category::Difficulty, 0, None));
+        list.map_text(|text| parts.get(text));
+        assert!(texts(&list).contains(
+            &"Left/Right  Change   B  返回   Y  Reset page   Select  Reset all   L/R  Page"
+        ));
+    }
+
+    #[test]
+    fn without_a_row_for_the_whole_text_each_line_is_asked_for_as_before() {
+        let table = crate::ui_text::UiText::parse("A card as the\t第一列\n");
+        let mut list = cheats_screen(&cheats_view(Row::Damage, Cheats::neutral()));
+        list.map_text(|text| table.get(text));
+        let texts = texts(&list);
+        assert!(texts.contains(&"第一列") && texts.contains(&"game deals it"), "{texts:?}");
+    }
+
+    #[test]
+    fn the_whole_texts_are_still_translated_after_an_accessibility_style() {
+        for style in [
+            crate::Style { contrast: true, ..crate::Style::default() },
+            crate::Style { large_text: true, safe_cursor: true, ..crate::Style::default() },
+        ] {
+            let cheats = style.apply(cheats_screen(&cheats_view(Row::Damage, Cheats::neutral())));
+            assert_no_english_left(&translated_0009(cheats));
+            let options = style.apply(options_screen(&options_view(Category::Difficulty, 0, None)));
+            assert_no_english_left(&translated_0009(options));
+        }
     }
 }

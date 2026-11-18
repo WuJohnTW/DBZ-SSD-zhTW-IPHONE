@@ -1,7 +1,7 @@
 # Dragon Ball Z: Super Saiya Densetsu Recompiled - developer guide
 
 This is the reference for building, running and checking the project: the command line of the game and
-the `xtask` developer commands. The overview, the install steps and the roadmap are in the main README.
+the `xtask` developer commands. The overview, the install steps and the roadmap are in [`ENGINE.en.md`](ENGINE.en.md).
 
 A native Windows reimplementation of *Dragon Ball Z: Super Saiya Densetsu* (SNES, 1992) in Rust:
 faithful first (verified against the original running in an emulator), enhanced on top.
@@ -540,10 +540,11 @@ Test on a headless emulator (`emulator -avd NAME -no-window -no-audio -gpu swift
     adb push canonical.sfc /data/local/tmp/r.sfc
     adb shell "run-as io.github.dbz_ssd_recompiled sh -c 'mkdir -p files/cache/rom && cp /data/local/tmp/r.sfc files/cache/rom/canonical.sfc'"
 
-The launcher icon is pixel art (`assets/icon/sfera-4-stelle-54.png`, 54 x 54, a pixel for 2 dp of the adaptive icon's
-108 dp): `python tools/android-icon.py` writes it as vector drawables in `android/app/src/main/res/` (the four-star ball as the
-foreground, the starry blue as the background, and the ball with its stars cut out as the monochrome layer of themed icons),
-so it is sharp at every density and the repository holds no picture outside `assets/`. `build-apk.sh` builds the game's crates
+The launcher icon is Super Saiyan Goku's head over the installer's speed lines, the same two pictures the Windows
+icon is cut from: `python tools/android-icon.py GOKU_PNG BG_PNG` writes the adaptive icon's two layers as 432 px pictures
+in `android/app/src/main/res/drawable-xxxhdpi/` (Goku as the foreground, his head in the middle 66 dp; the speed lines as
+the background; no monochrome layer, so a themed icon shows it as it is). Earlier builds used the four-star ball of
+`assets/icon/sfera-4-stelle-54.png`, written as vector drawables. `build-apk.sh` builds the game's crates
 optimised even for a debug APK (the HD renderer at the dev profile's level 1 is too slow on a phone) and deletes the last APK
 first (Gradle packages over it and keeps the room of a bigger old library).
 
@@ -560,8 +561,9 @@ Refresh rate and sound: an adaptive (LTPO) screen drops to about 24 Hz while not
 it. `GameActivity` asks for the lowest display mode of the current resolution that is a multiple of 60 Hz and sets the
 surface's frame rate to 60 (Android 11+), at start and on each focus (a fold or an unfold is another display); and at speed 1
 the pacer runs the frames the clock owes, up to four a window frame (`CATCH_UP`), each with its sound, so a slow screen costs
-smoothness only. The sound queue is kept near 60 ms by bending the playback speed by at most 0.5%
-(`SDL_SetAudioStreamFrequencyRatio`, on every platform: on a desktop it stays near 1.0), and every 5 s the log gets the
+smoothness only. The sound queue is kept near 120 ms by bending the playback speed by at most 0.5%
+(`SDL_SetAudioStreamFrequencyRatio`, on every platform: on a desktop it stays near 1.0), so a stall of the window of up to
+about 100 ms does not run it dry; the queue is capped at the target and 90 ms over it (210 ms), and every 5 s the log gets the
 sound's health (samples made per second, flushes that found the queue dry, the least and most queue).
 
 Lifecycle: the activity follows the sensor (landscape and portrait), keeps the screen on and hides the system bars (immersive, sticky;
@@ -1490,7 +1492,10 @@ screen are in `docs/re/data/text-engine.md`.
 A translation is the player's files in the data folder (or beside the executable), named by the language's code:
 `<code>.tsv`, the game's text keyed as `text-dump` writes it (a `key` and a `zh` column), `ui-<code>.tsv`, the HD menus'
 words (optional), and a font in `fonts/`. Every `<code>.tsv` there is offered on the first launch and in Options >
-Accessibility > Language, after English and sorted by code, and `--lang <code>` picks it for a run. The file may start
+Accessibility > Language, and `--lang <code>` picks it for a run. With a translation, the first launch's Language page
+lists the translations alone, `zh-tw` first and the others by code; the Options' Language row lists them in the same
+order, then English last. Until the player chooses a language (and without `--lang`), the game uses the first
+translation of the Language page, or English when there is none. The file may start
 with lines that say how to present it, before its columns:
 
     #name<TAB>the language's name in itself (without it, the code; zh-hk keeps 繁體中文（香港）)
@@ -1563,5 +1568,5 @@ the reverse-engineering scripts only (see its README); everything they produce f
 
 ## Design
 
-The main README describes the architecture: the crates, how the lockstep verification works and how the
+[`ENGINE.en.md`](ENGINE.en.md) describes the architecture: the crates, how the lockstep verification works and how the
 recompiler works.

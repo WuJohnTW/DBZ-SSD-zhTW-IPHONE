@@ -116,6 +116,9 @@ pub struct Hd {
     notice: CheatNotice,
     /// The names and texts of the menus in English, as the catalogue has them: a translation is made from them.
     labels: ssd_menus::Labels,
+    /// The names and texts of the menus in the language of the text, as the driver shows them: the save editor opens
+    /// with them.
+    shown_labels: ssd_menus::Labels,
     /// The language the PC file held when it was last seen: a change of the Options' row is measured from it, so
     /// another row's change does not undo `--lang`.
     language_saved: Option<Language>,
@@ -217,9 +220,11 @@ impl Hd {
                 let mut wide = WideRun::new(&crate::hd_art::world(rom));
                 wide.set_art(crate::hd_art::pack(rom));
                 wide.set_font(crate::hd_art::font(rom));
+                wide.set_lightning(crate::hd_art::lightning());
                 wide
             },
             notice: CheatNotice::default(),
+            shown_labels: labels.clone(),
             labels,
             language_saved,
             ui_text: None,
@@ -236,21 +241,23 @@ impl Hd {
     /// Draws the game's text in `language` from the next frame on.
     pub fn set_language(&mut self, language: Language) {
         let table = crate::lang::translation(language);
-        self.driver.set_labels(match &table {
+        self.shown_labels = match &table {
             Some(table) => ssd_catalogue::translated_labels(&self.labels, table),
             None => self.labels.clone(),
-        });
+        };
+        self.driver.set_labels(self.shown_labels.clone());
         self.wide.set_overlay(crate::lang::overlay(language, &self.rom));
         self.ui_text = crate::lang::ui_text(language);
     }
 
     /// The PC file now holds `values` (the Options changed a row): a new choice of the Language row takes effect at
-    /// once, and wins over `--lang` from then on.
+    /// once, and wins over `--lang` from then on; a reset row takes the language a run starts in
+    /// ([`crate::lang::followed`]). The tables are read again only when the stored language changed.
     pub fn follow_language(&mut self, values: &ssd_menus::options::Values) {
         let saved = Language::from_values(values);
         if saved != self.language_saved {
             self.language_saved = saved;
-            self.set_language(saved.unwrap_or_default());
+            self.set_language(crate::lang::followed(values));
         }
     }
 
@@ -357,7 +364,7 @@ impl Hd {
         {
             match ssd_menus::saveedit::Editor::open(
                 sram,
-                &self.labels,
+                &self.shown_labels,
                 self.driver.sidecar(),
                 self.driver.marked_slots(sram),
             ) {
@@ -532,6 +539,13 @@ impl Hd {
         self.driver.add_pack(info);
     }
 
+    /// `list` as the HD's own windows over the field are shown: its words in the language of the text, in the
+    /// Accessibility page's style (Esc's question, see [`crate::quit_confirm`]).
+    #[must_use]
+    pub fn dressed(&self, list: DrawList) -> DrawList {
+        crate::options::access::restyle(&self.driver.options().pc, self.translated(list, None))
+    }
+
     /// A line the Data packs screen shows until the next key (see [`Driver::set_mods_alert`]).
     pub fn set_mods_alert(&mut self, text: String) {
         self.driver.set_mods_alert(text);
@@ -572,6 +586,13 @@ impl Hd {
         self.wide.note_hd_shared(wram, log, options)
     }
 
+    /// The frames since Goku's first Super Saiyan transformation started, while it goes on (`None`: it does not), for the
+    /// frame noted next: the lightning of `art-override\ssj-lightning\` is drawn over its Enhanced picture (see
+    /// [`WideRun::set_ssj_lightning`]).
+    pub fn set_ssj_lightning(&mut self, frames: Option<u32>) {
+        self.wide.set_ssj_lightning(frames);
+    }
+
     /// A frame that ran and is not drawn (a fast-forward's frame the window never shows): the 16:9
     /// view only follows its work RAM, so the frame drawn next starts from the right state.
     pub fn skip_frame(&mut self, wram: &[u8]) {
@@ -598,6 +619,17 @@ impl Hd {
         options: ssd_hd::HdOptions,
     ) -> Option<WideHd> {
         self.wide.redraw_hd_next(log, options)
+    }
+
+    /// Reads the pack's art on a thread of its own (see [`WideRun::set_art_async`]).
+    pub fn set_art_async(&mut self, on: bool) {
+        self.wide.set_art_async(on);
+    }
+
+    /// What the Enhanced pictures drawn since the last call cost, and whether the last was drawn in the background
+    /// (see [`WideRun::take_cost`]).
+    pub fn take_draw_cost(&mut self) -> Option<(ssd_hd::DrawCost, bool)> {
+        self.wide.take_cost()
     }
 
     /// Whether a picture is being drawn in the background (or is done and not taken).
@@ -720,9 +752,14 @@ impl Art {
     }
 
     /// Keeps an Enhanced picture as the backdrop: nothing is copied, and a picture that is the backdrop already
-    /// is not kept again (its texture stays).
+    /// is not kept again (its texture stays). A picture that lacks art still being read (the art read on its own
+    /// thread) does not take the place of a backdrop: the menu would keep it, the original's pixels where the art goes,
+    /// as long as it is open. The next picture with its art does.
     fn note_field_shared(&mut self, picture: &SharedHd) {
         if self.field.as_ref().is_some_and(|field| field.generation == picture.serial) {
+            return;
+        }
+        if picture.picture.art_pending && self.field.is_some() {
             return;
         }
         self.keep_field(picture.serial, FieldSource::Picture(picture.clone()));
@@ -1273,6 +1310,50 @@ fn portrait(
 mod tests {
     use super::*;
     use ssd_menus::Style;
+
+    /// A 16:9 Enhanced picture of one colour, lacking art still being read (`pending`) or not.
+    fn wide_picture(colour: u8, pending: bool) -> SharedHd {
+        let rect = ssd_hd::Rect { x: 0, y: 0, width: 4, height: 2 };
+        SharedHd::new(WideHd {
+            picture: ssd_hd::HdFrame {
+                rgba: vec![colour; 4 * 2 * 4],
+                width: 4,
+                height: 2,
+                scale: 1,
+                logical: rect,
+            },
+            scene: ssd_hd::world::Scene::Field,
+            logical: ssd_hd::world::Rect { x: 0, y: 0, width: 4, height: 2 },
+            hud: ssd_hd::world::Rect { x: 0, y: 0, width: 4, height: 2 },
+            stats: ssd_hd::world::WideStats::default(),
+            art_pending: pending,
+        })
+    }
+
+    /// The colour of the backdrop's first pixel.
+    fn backdrop_colour(art: &Art) -> Option<u8> {
+        match &art.field.as_ref()?.source {
+            FieldSource::Picture(shared) => Some(shared.picture.picture.rgba[0]),
+            FieldSource::Pixels { rgba, .. } => Some(rgba[0]),
+        }
+    }
+
+    #[test]
+    fn a_picture_that_lacks_art_being_read_takes_the_place_of_no_backdrop_and_the_next_with_its_art_does()
+     {
+        let mut art = Art::empty();
+        // With no backdrop yet, the picture is the backdrop, art or not
+        art.note_field_shared(&wide_picture(1, true));
+        assert_eq!(backdrop_colour(&art), Some(1));
+        art.note_field_shared(&wide_picture(2, false));
+        assert_eq!(backdrop_colour(&art), Some(2));
+        // A picture that lacks art leaves the backdrop drawn with all its art
+        art.note_field_shared(&wide_picture(3, true));
+        assert_eq!(backdrop_colour(&art), Some(2));
+        // The next picture with its art takes its place
+        art.note_field_shared(&wide_picture(4, false));
+        assert_eq!(backdrop_colour(&art), Some(4));
+    }
 
     #[test]
     fn the_cards_screen_names_each_kanji_as_the_battles_tooltip_does() {

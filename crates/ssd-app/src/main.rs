@@ -19,6 +19,7 @@ mod packs;
 mod panel;
 mod paths;
 mod perf_hint;
+mod quit_confirm;
 mod replay_io;
 mod replays;
 mod rom_setup;
@@ -38,6 +39,7 @@ mod turbo;
 mod ui;
 mod ui_script;
 mod video;
+mod voice;
 
 use clap::error::ErrorKind;
 use clap::{CommandFactory, Parser};
@@ -199,6 +201,24 @@ struct Cli {
     /// choice, else English]. For this run only: the Options' choice is not changed.
     #[arg(long, value_parser = parse_lang)]
     lang: Option<ssd_menus::Language>,
+    /// Turn the debug tools on in the window: the F1 panel, the "F1 debug" pill and the touch Show FPS. Also on with
+    /// the environment variable `SSD_DEBUG=1`. Off by default.
+    #[arg(long)]
+    debug: bool,
+}
+
+/// The environment variable that turns the debug tools on, like `--debug`, when it is `1`.
+const DEBUG_ENV: &str = "SSD_DEBUG";
+
+/// Whether the window has the debug tools: `--debug` (`flag`), or [`DEBUG_ENV`] set to `1` (`env`, its value). Off
+/// otherwise: a public build shows no debug panel.
+fn debug_enabled(flag: bool, env: Option<&std::ffi::OsStr>) -> bool {
+    flag || env.is_some_and(|value| value == "1")
+}
+
+/// [`debug_enabled`] for this run: `--debug` (`flag`) and this process's [`DEBUG_ENV`].
+fn window_debug(flag: bool) -> bool {
+    debug_enabled(flag, std::env::var_os(DEBUG_ENV).as_deref())
 }
 
 /// `--lang`: a language's code (see `ssd_menus::Language::from_code`).
@@ -435,6 +455,7 @@ pub fn run(args: Vec<std::ffi::OsString>) -> ExitCode {
                 session,
                 enhanced,
                 video_start,
+                window_debug(cli.debug),
             )
         }
     };
@@ -698,6 +719,34 @@ mod tests {
 
     fn parse(args: &[&str]) -> Cli {
         Cli::try_parse_from(std::iter::once("ssd-recompiled").chain(args.iter().copied())).unwrap()
+    }
+
+    #[test]
+    fn the_debug_tools_are_off_unless_debug_or_ssd_debug_1_asks() {
+        use std::ffi::OsStr;
+        assert!(!parse(&[]).debug, "no --debug by default");
+        assert!(parse(&["--debug"]).debug);
+        assert!(!debug_enabled(false, None), "off by default: a public run has no debug panel");
+        assert!(debug_enabled(true, None), "--debug");
+        assert!(debug_enabled(false, Some(OsStr::new("1"))), "SSD_DEBUG=1");
+        for other in ["0", "", "true", "yes"] {
+            assert!(!debug_enabled(false, Some(OsStr::new(other))), "SSD_DEBUG={other:?}");
+        }
+        assert_eq!(DEBUG_ENV, "SSD_DEBUG");
+    }
+
+    #[test]
+    fn a_window_run_reads_ssd_debug_from_its_environment() {
+        let _guard = paths::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        // SAFETY: serialised by ENV_LOCK.
+        unsafe { std::env::remove_var(DEBUG_ENV) };
+        assert!(!window_debug(false), "no flag, no variable: off");
+        assert!(window_debug(true), "--debug");
+        unsafe { std::env::set_var(DEBUG_ENV, "1") };
+        assert!(window_debug(false), "SSD_DEBUG=1");
+        unsafe { std::env::set_var(DEBUG_ENV, "0") };
+        assert!(!window_debug(false), "SSD_DEBUG=0");
+        unsafe { std::env::remove_var(DEBUG_ENV) };
     }
 
     #[test]

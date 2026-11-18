@@ -29,6 +29,7 @@ KEYS
   Tab           speed x1 / x2 / x4 / x8           P  pause           Esc  quit
   F5 / F9       save state / load state           1-4  state slot
   F1            debug panel (routines, memory, debugger, replays)
+                only works with --debug (or in a build packed with your own ROM)
   A gamepad works too (SNES layout by position).
 
 WHERE THINGS ARE

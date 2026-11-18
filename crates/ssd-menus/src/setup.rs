@@ -108,13 +108,15 @@ pub struct Setup {
 }
 
 impl Setup {
-    /// The screen of `page`, nothing said yet.
+    /// The screen of `page`, nothing said yet; its Language page offers the languages of
+    /// [`first_launch_languages`].
     #[must_use]
     pub fn new(page: Page) -> Self {
-        Self::with_languages(page, crate::options::offered_languages())
+        Self::with_languages(page, first_launch_languages(&crate::options::offered_languages()))
     }
 
-    /// The screen of `page`, its Language page offering `languages` (English first, as the Options offer them).
+    /// The screen of `page`, its Language page offering `languages` in the order given ([`Self::new`] gives
+    /// [`first_launch_languages`]: with a translation, the translations alone, Traditional Chinese (Taiwan) first).
     #[must_use]
     pub fn with_languages(page: Page, languages: Vec<Locale>) -> Self {
         let mut setup = Self { page, status: Status::Idle, focus: 0, languages };
@@ -333,6 +335,18 @@ impl Setup {
     /// backend measures it in the font it draws with).
     #[must_use]
     pub fn scene_with(&self, cut: &dyn Fn(&str, f32, f32) -> String) -> DrawList {
+        self.scene_in(cut, &|_| None)
+    }
+
+    /// [`Setup::scene_with`] in another language: `translate` gives a text's translation (the HD menus' table,
+    /// `crate::ui_text`), `None` keeps the English. A button's label is translated before it is cut to its button,
+    /// the other runs as [`DrawList::map_text`] does (a wrapped text whole, then wrapped again).
+    #[must_use]
+    pub fn scene_in(
+        &self,
+        cut: &dyn Fn(&str, f32, f32) -> String,
+        translate: &dyn Fn(&str) -> Option<String>,
+    ) -> DrawList {
         let mut list = DrawList::new();
         ground(&mut list);
         window(&mut list);
@@ -354,8 +368,13 @@ impl Setup {
             Page::Pack => self.pack_page(&mut list),
             Page::Language => language_page(&mut list, &self.languages),
         }
+        list.map_text(translate);
         for (index, button) in self.buttons().iter().enumerate() {
-            draw_button(&mut list, button, index == self.focus, cut);
+            let mut button = button.clone();
+            if let Some(label) = translate(&button.label) {
+                button.label = label;
+            }
+            draw_button(&mut list, &button, index == self.focus, cut);
         }
         list
     }
@@ -415,9 +434,11 @@ impl Setup {
             Status::Error(text) => (text.clone(), palette::DARK_RED),
         };
         let chars = (440.0 / (ADVANCE * 14.0)) as usize;
-        for (line, part) in wrap(&message, chars).iter().take(3).enumerate() {
+        let lines = wrap(&message, chars);
+        for (line, part) in lines.iter().take(3).enumerate() {
             text(list, 24.0, 304.0 + 20.0 * line as f32, 14.0, part, color, Align::Left);
         }
+        list.mark_lines(&message, lines.len().min(3), chars, 20.0, 3);
     }
 
     fn pack_page(&self, list: &mut DrawList) {
@@ -456,10 +477,12 @@ impl Setup {
                 let colour =
                     if matches!(self.status, Status::Error(_)) { palette::DARK_RED } else { INK };
                 let chars = (650.0 / (ADVANCE * 14.0)) as usize;
-                for (line, part) in wrap(message, chars).iter().take(4).enumerate() {
+                let lines = wrap(message, chars);
+                for (line, part) in lines.iter().take(4).enumerate() {
                     let top = 190.0 + 20.0 * line as f32;
                     text(list, 24.0, top, 14.0, part, colour, Align::Left);
                 }
+                list.mark_lines(message, lines.len().min(4), chars, 20.0, 4);
             }
         }
         text(
@@ -493,9 +516,11 @@ fn mode_page(list: &mut DrawList) {
     }
     let note = "Change it later: Options > Game in Enhanced, or hold Select and Start for 2 seconds in Classic.";
     let chars = (650.0 / (ADVANCE * 13.0)) as usize;
-    for (n, line) in wrap(note, chars).iter().enumerate() {
+    let lines = wrap(note, chars);
+    for (n, line) in lines.iter().enumerate() {
         text(list, 24.0, 268.0 + 19.0 * n as f32, 13.0, line, QUIET, Align::Left);
     }
+    list.mark_lines(note, lines.len(), chars, 19.0, lines.len());
 }
 
 /// Where the Language page's buttons go: one column of buttons as tall as the other pages' with a line beside each
@@ -530,6 +555,37 @@ impl LanguageGrid {
     }
 }
 
+/// The code of the language the first launch's Language page puts first, where the player has it.
+const FIRST_LANGUAGE: &str = "zh-tw";
+
+/// The languages the first launch's Language page offers, of those `offered` (in any order, English among them or
+/// not): with a translation, the translations alone (English is still in the Options' Language row, after them),
+/// Traditional Chinese (Taiwan) first, then the others by code; without one, `offered` as it is (as upstream: English
+/// alone). The one order of the translations: the Options' Language row takes it too
+/// ([`crate::options::offered_languages`]).
+#[must_use]
+pub fn first_launch_languages(offered: &[Locale]) -> Vec<Locale> {
+    let mut languages: Vec<Locale> =
+        offered.iter().filter(|locale| !locale.language.is_english()).cloned().collect();
+    if languages.is_empty() {
+        return offered.to_vec();
+    }
+    languages.sort_by_key(|locale| (locale.language.code() != FIRST_LANGUAGE, locale.language));
+    languages
+}
+
+/// The language of the text before the player chooses one (and without `--lang`), of the languages `offered`: the
+/// first translation of the first launch's Language page ([`first_launch_languages`]), English without one. The app's
+/// `lang::effective` takes it, and the Options' Language row shows it while nothing is stored.
+#[must_use]
+pub fn language_before_a_choice(offered: &[Locale]) -> Language {
+    first_launch_languages(offered)
+        .into_iter()
+        .map(|locale| locale.language)
+        .find(|language| !language.is_english())
+        .unwrap_or_default()
+}
+
 /// What the Language page says beside a language's button (one column only).
 fn language_lines(language: Language) -> [String; 2] {
     let enhanced = "in the HD windows of Enhanced.".to_owned();
@@ -556,9 +612,11 @@ fn language_page(list: &mut DrawList, languages: &[Locale]) {
     let below = (last + grid.height + 16.0).max(280.0);
     let note = "Change it later: Options > Accessibility > Language. 之後可在「選項」中更改。";
     let chars = (650.0 / (ADVANCE * 13.0)) as usize;
-    for (n, line) in wrap(note, chars).iter().enumerate() {
+    let lines = wrap(note, chars);
+    for (n, line) in lines.iter().enumerate() {
         text(list, 24.0, below + 19.0 * n as f32, 13.0, line, QUIET, Align::Left);
     }
+    list.mark_lines(note, lines.len(), chars, 19.0, lines.len());
 }
 
 /// A rectangle given in window coordinates, as a rectangle of the space.
@@ -575,9 +633,11 @@ fn text(list: &mut DrawList, x: f32, top: f32, size: f32, text: &str, color: Col
 /// Wrapped text of `width` pixels from `top`.
 fn paragraph(list: &mut DrawList, x: f32, top: f32, width: f32, size: f32, words: &str) {
     let chars = (width / (ADVANCE * size)) as usize;
-    for (line, part) in wrap(words, chars).iter().enumerate() {
+    let lines = wrap(words, chars);
+    for (line, part) in lines.iter().enumerate() {
         text(list, x, top + size * 1.45 * line as f32, size, part, INK, Align::Left);
     }
+    list.mark_lines(words, lines.len(), chars, size * 1.45, lines.len());
 }
 
 fn ground(list: &mut DrawList) {
@@ -664,6 +724,164 @@ mod tests {
 
     fn texts(list: &DrawList) -> Vec<String> {
         list.texts().map(|(_, _, t)| t.to_owned()).collect()
+    }
+
+    /// The pages and states a player meets in the first launch (Android), with the messages `android_setup.rs` puts
+    /// on them, the Language page offering English and Traditional Chinese (Taiwan), and the Language page the first
+    /// launch shows with Taiwan's and Hong Kong's tables ([`first_launch_languages`]).
+    fn every_screen() -> Vec<Setup> {
+        let taiwan = Locale {
+            language: Language::from_code("zh-tw").unwrap(),
+            name: "繁體中文（台灣）".into(),
+        };
+        let hong_kong =
+            Locale { language: Language::ZH_HK, name: "繁體中文（香港）".into() };
+        let mut out: Vec<Setup> = [Page::Rom, Page::Patch, Page::Mode, Page::Pack]
+            .into_iter()
+            .map(|page| Setup::with_languages(page, vec![Locale::english(), taiwan.clone()]))
+            .collect();
+        out.push(Setup::with_languages(Page::Language, vec![Locale::english(), taiwan.clone()]));
+        let both = first_launch_languages(&[Locale::english(), hong_kong, taiwan]);
+        out.push(Setup::with_languages(Page::Language, both));
+        let statuses = [
+            (Page::Rom, Status::Busy { text: "Reading the file...".into(), percent: None }),
+            (Page::Rom, Status::Done("ROM accepted.".into())),
+            (
+                Page::Rom,
+                Status::Error(
+                    "This file was not accepted: unknown ROM (CRC32 0F1E2D3C): expected the Klepto v1.02 English \
+                     translation or the Japanese Rev 1 ROM"
+                        .into(),
+                ),
+            ),
+            (Page::Rom, Status::Error("This file was not accepted: no ROM in this file".into())),
+            (Page::Patch, Status::Busy { text: "Applying the patch...".into(), percent: None }),
+            (Page::Pack, Status::Busy { text: "Copying hd-pack.zip...".into(), percent: Some(10) }),
+            (Page::Pack, Status::Busy { text: "Unpacking the art...".into(), percent: Some(62) }),
+            (Page::Pack, Status::Busy { text: "Building the graphics from your ROM...".into(), percent: None }),
+            (Page::Pack, Status::Busy { text: "Putting the art in place...".into(), percent: None }),
+            (Page::Pack, Status::Busy { text: "Starting...".into(), percent: Some(100) }),
+            (Page::Pack, Status::Done("Installed.".into())),
+            (Page::Pack, Status::Error("The HD pack was not installed: this is not an HD pack".into())),
+            (
+                Page::Pack,
+                Status::Note(
+                    "The mod 自由成長 is installed: switch it on in Options > Gameplay > Data packs.".into(),
+                ),
+            ),
+        ];
+        for (page, status) in statuses {
+            let mut setup = Setup::new(page);
+            setup.set_status(status);
+            out.push(setup);
+        }
+        out
+    }
+
+    /// The rows of `table` whose English (two words at least) is in `text`, with their translations.
+    fn table_rows(table: &crate::ui_text::UiText, text: &str) -> Vec<(String, String)> {
+        let sentences = [
+            "This game needs your own copy of Super Saiya Densetsu. The file stays on this device and is never uploaded.",
+            "This is the Japanese Rev 1 ROM. It needs the English v1.02 patch, the file dbz102.ips. Pick it to go on.",
+            "Enhanced mode uses the HD art pack. Pick the file hd-pack.zip. It takes about 0.9 GB of free space once \
+             installed.",
+            "How do you want to play? Your saves stay either way.",
+            "Change it later: Options > Game in Enhanced, or hold Select and Start for 2 seconds in Classic.",
+            "Change it later: Options > Accessibility > Language. 之後可在「選項」中更改。",
+            "The language of the story's text. 故事文字的語言。",
+        ];
+        sentences
+            .iter()
+            .filter(|sentence| text.contains(*sentence))
+            .map(|sentence| {
+                ((*sentence).to_owned(), table.get(sentence).expect("a row of the table"))
+            })
+            .collect()
+    }
+
+    #[test]
+    fn in_chinese_the_first_launch_has_the_tables_words_and_no_english_left() {
+        let table =
+            crate::ui_text::UiText::parse(include_str!("../../../translations/zh-tw/ui-zh-tw.tsv"));
+        // Kept as written: names of files, versions, the button of English, the pad's Select and Start. The modes' names
+        // are translated (Classic 經典模式, Enhanced 加強模式).
+        let kept = [
+            "hd-pack.zip",
+            "dbz102.ips",
+            "CRC-32",
+            "A8CF4F2A",
+            "CRC32",
+            "0F1E2D3C",
+            "Klepto",
+            "v1.02",
+            "Rev",
+            "ROM",
+            "GB",
+            "HD",
+            "English",
+            "Select",
+            "Start",
+        ];
+        let english = |text: &str| {
+            let mut text = text.to_owned();
+            for word in kept {
+                text = text.replace(word, "");
+            }
+            text.chars().any(|c| c.is_ascii_alphabetic())
+        };
+        let spaceless = |text: &str| text.replace(' ', "");
+        let mut checked = std::collections::BTreeSet::new();
+        for setup in every_screen() {
+            let english_runs = texts(&setup.scene());
+            let shown = texts(&setup.scene_in(&fit, &|text| table.get(text)));
+            for text in &shown {
+                assert!(!english(text), "{:?}: English left: {text:?} in {shown:?}", setup.page());
+            }
+            // A wrapped text is translated whole and wrapped again in as many lines: none of it is cut off.
+            let all = spaceless(&shown.concat());
+            for whole in [english_runs.join(" "), english_runs.concat()] {
+                for (english, chinese) in table_rows(&table, &whole) {
+                    assert!(all.contains(&spaceless(&chinese)), "{english:?} cut: {shown:?}");
+                    checked.insert(english);
+                }
+            }
+        }
+        assert_eq!(checked.len(), 7, "every wrapped text was looked at: {checked:?}");
+        let rom = texts(&Setup::new(Page::Rom).scene_in(&fit, &|text| table.get(text)));
+        assert_eq!(rom[..2], ["選擇 ROM", "步驟 1／2"]);
+        assert!(rom.iter().any(|t| t == "選擇 ROM 檔……"), "a button's label: {rom:?}");
+        assert!(
+            rom.iter().any(|t| t.starts_with("這個遊戲需要你自己的")),
+            "a wrapped paragraph, whole: {rom:?}"
+        );
+        let mode = texts(&Setup::new(Page::Mode).scene_in(&fit, &|text| table.get(text)));
+        for name in ["經典模式", "加強模式"] {
+            assert!(mode.iter().any(|t| t == name), "the mode's button {name:?}: {mode:?}");
+        }
+    }
+
+    #[test]
+    fn in_english_the_first_launch_says_exactly_what_it_always_said() {
+        for setup in every_screen() {
+            assert_eq!(setup.scene_in(&fit, &|_| None), setup.scene_with(&fit));
+        }
+        let rom = texts(&Setup::new(Page::Rom).scene());
+        assert_eq!(
+            rom,
+            [
+                "CHOOSE YOUR ROM",
+                "STEP 1 OF 2",
+                "This game needs your own copy of Super Saiya Densetsu. The file stays on this",
+                "device and is never uploaded.",
+                "Opens the system file picker.",
+                "Accepted ROMs",
+                "English v1.02 - CRC-32 A8CF4F2A",
+                "Japanese Rev 1 + patch",
+                "No file selected yet.",
+                "Select ROM file...",
+                "Continue"
+            ]
+        );
     }
 
     #[test]
@@ -823,6 +1041,60 @@ mod tests {
         assert!(cut.chars().count() > 20, "as much of the name as fits is kept: {cut}");
         assert!(shown.iter().any(|t| t == "Short"), "a short name is unchanged");
         assert!(shown.iter().any(|t| t == "English"));
+    }
+
+    #[test]
+    fn the_language_page_lists_taiwan_then_hong_kong_without_english() {
+        let _guard = crate::options::LANGUAGES_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        let named = |code: &str, name: &str| Locale {
+            language: Language::from_code(code).unwrap(),
+            name: name.to_owned(),
+        };
+        let taiwan = Language::from_code("zh-tw").unwrap();
+        crate::options::offer_languages(vec![
+            named("zh-hk", "繁體中文（香港）"),
+            named("zh-tw", "繁體中文（台灣）"),
+        ]);
+        let mut setup = Setup::new(Page::Language);
+        crate::options::offer_languages(Vec::new());
+        let labels: Vec<String> = setup.buttons().into_iter().map(|button| button.label).collect();
+        assert_eq!(labels, ["繁體中文（台灣）", "繁體中文（香港）"], "Taiwan first, no English");
+        assert_eq!(
+            setup.key(Key::Confirm),
+            Some(Command::Language(taiwan)),
+            "the cursor on the first"
+        );
+        let codes = |offered: &[Locale]| -> Vec<&'static str> {
+            first_launch_languages(offered).iter().map(|locale| locale.language.code()).collect()
+        };
+        let made_up = [
+            Locale::english(),
+            named("zz", "Zed"),
+            named("zh-hk", "HK"),
+            named("xx", "Made up"),
+            named("zh-tw", "TW"),
+        ];
+        assert_eq!(
+            codes(&made_up),
+            ["zh-tw", "xx", "zh-hk", "zz"],
+            "Taiwan, then the others by code"
+        );
+        assert_eq!(codes(&made_up[..4]), ["xx", "zh-hk", "zz"], "without Taiwan: by code");
+    }
+
+    #[test]
+    fn with_no_translation_the_page_is_as_upstream() {
+        let _guard = crate::options::LANGUAGES_LOCK
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner);
+        crate::options::offer_languages(Vec::new());
+        let mut setup = Setup::new(Page::Language);
+        let labels: Vec<String> = setup.buttons().into_iter().map(|button| button.label).collect();
+        assert_eq!(labels, ["English"], "English alone, as upstream");
+        assert_eq!(setup.key(Key::Confirm), Some(Command::Language(Language::ENGLISH)));
+        assert_eq!(first_launch_languages(&[Locale::english()]), [Locale::english()]);
     }
 
     #[test]

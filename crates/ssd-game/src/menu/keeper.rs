@@ -31,6 +31,14 @@ const IMAGE_EXTRA: usize = (EXTRA - 0x7E_2800) as usize;
 const LIST_BYTES: usize = 2 * LIST_FULL;
 /// Objects of the game (ids 0 to 39).
 const OBJECTS: usize = 40;
+/// `game_mode` (`$24`, without its "just entered" bit 7) of the Continue screen. It draws the slots by
+/// copying each slot's page into `$0100`, one slot a frame (an empty slot's page is all zeros), before
+/// the load: the lists it shows are the saves', not the game's, so the bag neither binds to them nor
+/// takes them as a change (a zero page after a good slot read as every entry used, one unit of every
+/// stack lost at each Continue). Seen on the Continue of a crafted save, with slots 2 and 3 empty.
+const CONTINUE_MODE: u8 = 0x0E;
+/// `game_mode` of the menus (`$03`): the Continue's slot list and the Status screen (`docs/re/data/scenes.md`).
+const MENUS_MODE: u8 = 0x03;
 
 /// One entry of the list as the keeper last wrote it.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -60,13 +68,24 @@ pub struct Keeper {
     front: Option<u32>,
     /// A sale of the shop was under way at the last frame ([`Keeper::sync_shop`]).
     sale: bool,
+    /// A load may still copy a save into work RAM: set by a bind and by the Continue screen, it lasts until the
+    /// first list kept after the menus of the Continue ([`loading`]), the list where the game copied the save in.
+    continued: bool,
 }
 
 impl Keeper {
     /// A keeper with no bag yet: it binds when the game has a save or a list to keep.
     #[must_use]
     pub fn new(rules: Rules) -> Self {
-        Self { rules, bag: None, save: None, shown: Vec::new(), front: None, sale: false }
+        Self {
+            rules,
+            bag: None,
+            save: None,
+            shown: Vec::new(),
+            front: None,
+            sale: false,
+            continued: false,
+        }
     }
 
     /// Whether the bag is bound.
@@ -101,7 +120,7 @@ impl Keeper {
         sidecar: &Sidecar,
         fresh: bool,
     ) -> Vec<HostEvent> {
-        if self.bag.is_some() {
+        if self.bag.is_some() || on_continue(wram) {
             return Vec::new();
         }
         let listed = read_list(wram);
@@ -130,6 +149,8 @@ impl Keeper {
         };
         let payload = bag.to_bytes();
         self.bag = Some(bag);
+        // A Continue binds on its slot list, and the game copies the save in again as it enters the map.
+        self.continued = true;
         let mut events = vec![HostEvent::App { tag: BIND_TAG, payload }];
         events.extend(self.project(wram, labels, None));
         events
@@ -148,6 +169,8 @@ impl Keeper {
         labels: &Labels,
     ) -> Result<Vec<HostEvent>, String> {
         self.bag = Some(Bag::from_bytes(payload)?);
+        // As at a bind of the saves: the bind of a Continue is followed by the save copied in at the map.
+        self.continued = true;
         Ok(self.project(wram, labels, None))
     }
 
@@ -166,6 +189,10 @@ impl Keeper {
         self.bag = Some(bag);
         self.save = save.map(|(slot, checksum)| Save { slot, checksum });
         self.front = None;
+        // A state loaded is not a load of a save: the bag is the state's, and no copy of a save follows, so a
+        // window a bind or a Continue opened before the state is closed (a use that leaves another save's list
+        // after the state is a use).
+        self.continued = false;
         let mut events = vec![HostEvent::App { tag: BIND_TAG, payload }];
         events.extend(self.project(wram, labels, None));
         events
@@ -186,8 +213,16 @@ impl Keeper {
         }
         // The game clears or loads the list in steps (a save being loaded, for one, passes through
         // a list of 255s): an insane list is not a change of the bag, so the bag waits for it.
+        if on_continue(wram) {
+            self.continued = true;
+            return Vec::new();
+        }
         if !list_is_sane(wram, labels) {
             return Vec::new();
+        }
+        let continued = self.continued;
+        if !loading(wram) {
+            self.continued = false;
         }
         let listed = read_list(wram);
         let same = listed.len() == self.shown.len()
@@ -202,7 +237,13 @@ impl Keeper {
         // the title screen again). Of the save the bag is bound to, the list is written back as the
         // bag has it. Of another save, the game now holds that save, so the bag is the save's (the
         // sidecar's bag for its checksum, else a rebuild from its list), as at the first bind.
-        let copied = sram.and_then(|sram| {
+        // Only a list of a load can be a copy: the game copies the save in as it leaves the Continue's
+        // menus for the map (seen on a Continue from the title: modes `$0E`, `$03`, then `$00` with the
+        // copied list). Any other list is the game's own change, also when it happens to be a
+        // save's list and money (a unit used in a fight after a save made before the purchase, with
+        // the max zeni cheat keeping the money at 999): taken as a copy, that save's bag replaced the
+        // run's, and the stack was gone.
+        let copied = continued.then_some(sram).flatten().and_then(|sram| {
             (0..3_u8)
                 .find(|&slot| good(sram, slot) && slot_matches(sram, slot, wram))
                 .map(|slot| Save { slot, checksum: checksum_of(sram, slot) })
@@ -440,6 +481,18 @@ fn list_is_sane(wram: &[u8], labels: &Labels) -> bool {
     let count = usize::from(wram.get(d::ITEM_COUNT as usize - 0x7E_0000).copied().unwrap_or(0));
     let objects = labels.objects.len().max(OBJECTS);
     count <= LIST_FULL && read_list(wram).iter().all(|&(object, _)| usize::from(object) < objects)
+}
+
+/// Whether the game is on the Continue screen ([`CONTINUE_MODE`]): the list holds the page of the slot it shows.
+fn on_continue(wram: &[u8]) -> bool {
+    wram.get(d::GAME_MODE as usize - 0x7E_0000).is_some_and(|mode| mode & 0x7F == CONTINUE_MODE)
+}
+
+/// Whether the game is still in a load: the Continue screen ([`CONTINUE_MODE`]) or the menus it goes through
+/// before the map ([`MENUS_MODE`]).
+fn loading(wram: &[u8]) -> bool {
+    let mode = wram.get(d::GAME_MODE as usize - 0x7E_0000).copied().unwrap_or(0) & 0x7F;
+    mode == CONTINUE_MODE || mode == MENUS_MODE
 }
 
 /// The list's entries in work RAM: the count (at most 24) and each entry's object and state word.
@@ -871,6 +924,51 @@ mod tests {
     }
 
     #[test]
+    fn the_pages_the_continue_screen_shows_are_not_a_change_of_the_bag() {
+        let labels = Labels::default();
+        let mut ram = wram_with(&[2, 2, 2, 16], 40);
+        let mut keeper = Keeper::new(Rules::default());
+        let events = keeper.bind(&ram, &labels, None, &Sidecar::empty(), true);
+        apply(&mut ram, &events);
+        assert_eq!(read_list(&ram), [(2, 0), (16, 0)]);
+        // A game over goes back to the Continue screen: it shows an empty slot (its page is all zeros), then the
+        // bound save's page.
+        let mode = d::GAME_MODE as usize - 0x7E_0000;
+        let mut empty = wram_with(&[], 0);
+        empty[mode] = CONTINUE_MODE;
+        assert!(keeper.sync(&empty, &labels, None, &Sidecar::empty()).is_empty(), "the bag waits");
+        let mut shown = wram_with(&[2, 16], 40);
+        shown[mode] = CONTINUE_MODE | 0x80;
+        assert_eq!(keeper.sync(&shown, &labels, None, &Sidecar::empty()), Vec::<HostEvent>::new());
+        let bag = keeper.bag().unwrap();
+        assert_eq!((bag.units_of(2), bag.units_of(16)), (3, 1), "no unit is taken");
+        // An empty list on the map is a change: the last entries were used.
+        let events = keeper.sync(&wram_with(&[], 40), &labels, None, &Sidecar::empty());
+        assert_ne!(events, Vec::<HostEvent>::new());
+        let bag = keeper.bag().unwrap();
+        assert_eq!((bag.units_of(2), bag.units_of(16)), (2, 0));
+    }
+
+    #[test]
+    fn a_bag_is_not_bound_on_the_continue_screen() {
+        let labels = Labels::default();
+        let mut ram = wram_with(&[2, 16], 40);
+        ram[d::GAME_MODE as usize - 0x7E_0000] = CONTINUE_MODE;
+        let mut keeper = Keeper::new(Rules::default());
+        assert_eq!(
+            keeper.bind(&ram, &labels, None, &Sidecar::empty(), true),
+            Vec::<HostEvent>::new()
+        );
+        assert!(!keeper.bound());
+        ram[d::GAME_MODE as usize - 0x7E_0000] = 0;
+        assert_ne!(
+            keeper.bind(&ram, &labels, None, &Sidecar::empty(), true),
+            Vec::<HostEvent>::new()
+        );
+        assert!(keeper.bound(), "the load is over: the bag binds");
+    }
+
+    #[test]
     fn a_bag_is_not_bound_before_the_game_has_a_list_to_keep() {
         let labels = Labels::default();
         let ram = wram_with(&[], 0);
@@ -889,5 +987,203 @@ mod tests {
         let writes = keeper.bind_recorded(&bag.to_bytes(), &ram, &labels).unwrap();
         assert_eq!(keeper.bag(), Some(&bag));
         assert_eq!(writes.len(), 3, "the list of the one Dragon Ball is written");
+    }
+
+    /// A battery save with a good save in each slot of `slots`: its list of `objects` (state words zero) and its money.
+    fn sram_with(slots: &[(u8, &[u8], u16)]) -> Vec<u8> {
+        let mut sram = vec![0_u8; ssd_save::SRAM_SIZE];
+        for &(slot, objects, zeni) in slots {
+            let base = SLOT_BASES[usize::from(slot)];
+            let page = base + IMAGE_LEN;
+            sram[page + PAGE_COUNT] = objects.len() as u8;
+            for (i, &object) in objects.iter().enumerate() {
+                sram[page + 2 * i] = object;
+            }
+            sram[page + PAGE_ZENI..page + PAGE_ZENI + 2].copy_from_slice(&zeni.to_le_bytes());
+            sram[base + ssd_save::MARK_OFFSET..][..ssd_save::MARK.len()]
+                .copy_from_slice(&ssd_save::MARK);
+            let bytes: [u8; ssd_save::SLOT_LEN] =
+                sram[base..base + ssd_save::SLOT_LEN].try_into().expect("a slot");
+            let at = base + CHECKSUM_OFFSET;
+            sram[at..at + 2].copy_from_slice(&ssd_save::checksum(&bytes).to_le_bytes());
+        }
+        sram
+    }
+
+    #[test]
+    fn a_use_that_leaves_the_list_of_another_save_is_a_use_and_not_that_save_copied_in() {
+        // The run is on slot 1's save: a Bulma and 13 units of object 16. Slot 2 holds an earlier save of the same run
+        // with only the Bulma, and the same money (the max zeni cheat keeps it at 999).
+        let labels = Labels::default();
+        let mut stack = vec![2_u8];
+        stack.extend([16; 13]);
+        let sram = sram_with(&[(0, &stack, 999), (1, &[2], 999)]);
+        let mut ram = wram_with(&stack, 999);
+        let mut keeper = Keeper::new(Rules::default());
+        let events = keeper.bind(&ram, &labels, Some(&sram), &Sidecar::empty(), false);
+        apply(&mut ram, &events);
+        assert_eq!(keeper.bound_save().map(|(slot, _)| slot), Some(0));
+        assert_eq!(keeper.bag().unwrap().units_of(16), 13);
+        assert_eq!(read_list(&ram), [(2, 0), (16, 0)]);
+        assert_eq!(
+            keeper.sync(&ram, &labels, Some(&sram), &Sidecar::empty()),
+            Vec::<HostEvent>::new(),
+            "the run goes on"
+        );
+        // A battle's use of one unit: the original compacts the entry out, and the list is now slot 2's.
+        ram[d::ITEM_COUNT as usize - 0x7E_0000] = 1;
+        let events = keeper.sync(&ram, &labels, Some(&sram), &Sidecar::empty());
+        apply(&mut ram, &events);
+        assert_eq!(keeper.bag().unwrap().units_of(16), 12, "one unit is used, the stack stays");
+        assert_eq!(
+            keeper.bound_save().map(|(slot, _)| slot),
+            Some(0),
+            "the run keeps its own save"
+        );
+        assert_eq!(read_list(&ram), [(2, 0), (16, 0)]);
+    }
+
+    #[test]
+    fn a_use_after_a_state_is_loaded_is_a_use_and_not_another_save_copied_in() {
+        // As above, but a save state of the run is loaded at once after the bind, while the bind's window of a load
+        // is still open: the state's bag is bound again, and the use that follows is a use.
+        let labels = Labels::default();
+        let mut stack = vec![2_u8];
+        stack.extend([16; 13]);
+        let sram = sram_with(&[(0, &stack, 999), (1, &[2], 999)]);
+        let mut ram = wram_with(&stack, 999);
+        let mut keeper = Keeper::new(Rules::default());
+        let events = keeper.bind(&ram, &labels, Some(&sram), &Sidecar::empty(), false);
+        apply(&mut ram, &events);
+        let bag = keeper.bag().cloned().expect("the bag is bound");
+        let save = keeper.bound_save();
+        let events = keeper.restore(bag, save, &ram, &labels);
+        apply(&mut ram, &events);
+        ram[d::ITEM_COUNT as usize - 0x7E_0000] = 1;
+        let events = keeper.sync(&ram, &labels, Some(&sram), &Sidecar::empty());
+        apply(&mut ram, &events);
+        assert_eq!(keeper.bag().unwrap().units_of(16), 12, "one unit is used, the stack stays");
+        assert_eq!(
+            keeper.bound_save().map(|(slot, _)| slot),
+            Some(0),
+            "the run keeps its own save"
+        );
+    }
+
+    #[test]
+    fn a_use_that_leaves_the_list_of_the_bound_save_takes_its_unit() {
+        // Saved with only the Bulma, then 13 units bought: a use gives back the saved list, and is still a use.
+        let labels = Labels::default();
+        let sram = sram_with(&[(0, &[2], 999)]);
+        let mut ram = wram_with(&[2], 999);
+        let mut keeper = Keeper::new(Rules::default());
+        let events = keeper.bind(&ram, &labels, Some(&sram), &Sidecar::empty(), false);
+        apply(&mut ram, &events);
+        assert_eq!(
+            keeper.sync(&ram, &labels, Some(&sram), &Sidecar::empty()),
+            Vec::<HostEvent>::new(),
+            "the run goes on"
+        );
+        for _ in 0..13 {
+            // A purchase: the original adds an entry after the list it sees.
+            let count = usize::from(ram[d::ITEM_COUNT as usize - 0x7E_0000]);
+            ram[d::ITEM_LIST as usize - 0x7E_0000 + 2 * count] = 16;
+            ram[d::ITEM_COUNT as usize - 0x7E_0000] = count as u8 + 1;
+            let events = keeper.sync(&ram, &labels, Some(&sram), &Sidecar::empty());
+            apply(&mut ram, &events);
+        }
+        assert_eq!(keeper.bag().unwrap().units_of(16), 13);
+        ram[d::ITEM_COUNT as usize - 0x7E_0000] = 1;
+        let events = keeper.sync(&ram, &labels, Some(&sram), &Sidecar::empty());
+        apply(&mut ram, &events);
+        assert_eq!(keeper.bag().unwrap().units_of(16), 12, "the use takes one unit");
+    }
+
+    #[test]
+    fn a_save_copied_in_after_the_continue_screen_is_still_that_saves_bag() {
+        let labels = Labels::default();
+        let mut stack = vec![2_u8];
+        stack.extend([16; 13]);
+        let sram = sram_with(&[(0, &stack, 999), (1, &[2], 999)]);
+        let mut ram = wram_with(&stack, 999);
+        let mut keeper = Keeper::new(Rules::default());
+        let events = keeper.bind(&ram, &labels, Some(&sram), &Sidecar::empty(), false);
+        apply(&mut ram, &events);
+        assert_eq!(
+            keeper.sync(&ram, &labels, Some(&sram), &Sidecar::empty()),
+            Vec::<HostEvent>::new(),
+            "the run goes on"
+        );
+        // A Continue of slot 2: the screen shows the pages, the menus, then the map with slot 2's save copied in.
+        let mode = d::GAME_MODE as usize - 0x7E_0000;
+        let mut shown = wram_with(&[2], 999);
+        shown[mode] = CONTINUE_MODE;
+        assert_eq!(
+            keeper.sync(&shown, &labels, Some(&sram), &Sidecar::empty()),
+            Vec::<HostEvent>::new()
+        );
+        let mut menus = ram.clone();
+        menus[mode] = MENUS_MODE;
+        assert_eq!(
+            keeper.sync(&menus, &labels, Some(&sram), &Sidecar::empty()),
+            Vec::<HostEvent>::new()
+        );
+        let loaded = wram_with(&[2], 999);
+        keeper.sync(&loaded, &labels, Some(&sram), &Sidecar::empty());
+        assert_eq!(keeper.bound_save().map(|(slot, _)| slot), Some(1), "the bag is slot 2's");
+        assert_eq!(keeper.bag().unwrap().units_of(16), 0);
+    }
+
+    #[test]
+    fn the_save_copied_in_again_as_a_continue_enters_the_map_adds_no_unit() {
+        // A Continue from the title binds on the menus after the slot list, and the game copies the save in again
+        // as it enters the map: that list (one entry a unit) is the bound save's, not a pickup of 13 more.
+        let labels = Labels::default();
+        let mut stack = vec![2_u8];
+        stack.extend([16; 13]);
+        let sram = sram_with(&[(0, &stack, 999)]);
+        let mode = d::GAME_MODE as usize - 0x7E_0000;
+        let mut ram = wram_with(&stack, 999);
+        ram[mode] = MENUS_MODE;
+        let mut keeper = Keeper::new(Rules::default());
+        let events = keeper.bind(&ram, &labels, Some(&sram), &Sidecar::empty(), false);
+        apply(&mut ram, &events);
+        assert_eq!(
+            keeper.sync(&ram, &labels, Some(&sram), &Sidecar::empty()),
+            Vec::<HostEvent>::new()
+        );
+        let mut map = wram_with(&stack, 999);
+        map[mode] = 0;
+        let events = keeper.sync(&map, &labels, Some(&sram), &Sidecar::empty());
+        apply(&mut map, &events);
+        assert_eq!(keeper.bag().unwrap().units_of(16), 13, "the copy adds nothing");
+        assert_eq!(keeper.bag().unwrap().units_of(2), 1);
+        assert_eq!(read_list(&map), [(2, 0), (16, 0)]);
+    }
+
+    #[test]
+    fn a_replay_bound_on_the_continue_takes_the_copy_at_the_map_as_its_save_too() {
+        // The replay binds by its recorded event where the run bound on the saves: the copy that follows is the same.
+        let labels = Labels::default();
+        let mut stack = vec![2_u8];
+        stack.extend([16; 13]);
+        let sram = sram_with(&[(0, &stack, 999)]);
+        let mode = d::GAME_MODE as usize - 0x7E_0000;
+        let mut ram = wram_with(&stack, 999);
+        ram[mode] = MENUS_MODE;
+        let mut run = Keeper::new(Rules::default());
+        run.bind(&ram, &labels, Some(&sram), &Sidecar::empty(), false);
+        let payload = run.bag().unwrap().to_bytes();
+        let mut keeper = Keeper::new(Rules::default());
+        let events = keeper.bind_recorded(&payload, &ram, &labels).unwrap();
+        apply(&mut ram, &events);
+        assert_eq!(
+            keeper.sync(&ram, &labels, Some(&sram), &Sidecar::empty()),
+            Vec::<HostEvent>::new()
+        );
+        let mut map = wram_with(&stack, 999);
+        map[mode] = 0;
+        keeper.sync(&map, &labels, Some(&sram), &Sidecar::empty());
+        assert_eq!(keeper.bag().unwrap().units_of(16), 13, "the copy adds nothing");
     }
 }

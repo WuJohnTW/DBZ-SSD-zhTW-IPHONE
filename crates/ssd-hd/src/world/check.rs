@@ -75,6 +75,7 @@ pub fn check_tiles(rom: Rom<'_>, state: &FieldState, log: &FrameLog) -> TileChec
     // the map, and the game's ring then holds its own tiles over the whole picture (not only
     // beyond the edge), so no tile is judged
     let mut overhang = false;
+    let mut inside_matching = 0_u64;
     let mut work = Vec::new();
     if !log.vram_writes.is_empty() {
         work.extend_from_slice(&log.vram);
@@ -116,6 +117,10 @@ pub fn check_tiles(rom: Rom<'_>, state: &FieldState, log: &FrameLog) -> TileChec
             }
             check.tiles += 1;
             check.outside += u64::from(!state.map.contains(x, y));
+            // (two empty words, 0 in the game's ring and in the lookup, match by chance)
+            if state.map.contains(x, y) && game == lookup && game != 0 {
+                inside_matching += 1;
+            }
             let row = rows.entry(y >> 3).or_default();
             row.1 += u32::from(game != 0);
             if game != lookup {
@@ -123,6 +128,10 @@ pub fn check_tiles(rom: Rom<'_>, state: &FieldState, log: &FrameLog) -> TileChec
             }
         }
     }
+    // The ring excuse is for a picture of the map with the game's own tiles around it: when not
+    // one tile inside the map is the lookup's, BG2 is a picture of the scene's own (the starfield
+    // of a flight through space, its scroll taken for a camera past the map's edge), not the map
+    let overhang = overhang && inside_matching > 0;
     for (differences, filled) in rows.into_values() {
         if filled == 0 {
             check.unbuilt += differences.len() as u64;

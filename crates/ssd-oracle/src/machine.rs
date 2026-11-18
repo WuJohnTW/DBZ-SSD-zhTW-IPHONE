@@ -2526,6 +2526,26 @@ impl Machine {
         self.emu.set_audio_resampling(on);
     }
 
+    /// Runs the sound chip at `num / den` of its clock relative to the CPU and the PPU (1/1, the
+    /// hardware's, by default): with 2/3, three frames take the sound chip's time and samples of
+    /// two, so at 1.5 frames to one frame of the screen the music and the effects keep their
+    /// tempo and pitch. The ratio changes what the CPU sees of the sound chip (its answers come
+    /// at other CPU cycles), so a run with another ratio is not the hardware's: a replay is only
+    /// played back and recorded at 1/1. It survives a state load, and a snapshot keeps it.
+    ///
+    /// # Panics
+    ///
+    /// If `num` or `den` is 0.
+    pub fn set_apu_clock_ratio(&mut self, num: u32, den: u32) {
+        self.emu.set_apu_clock_ratio(num, den);
+    }
+
+    /// The sound chip's clock ratio ([`Machine::set_apu_clock_ratio`]), as set.
+    #[must_use]
+    pub fn apu_clock_ratio(&self) -> (u64, u64) {
+        self.emu.apu_clock_ratio()
+    }
+
     /// What the PPU read to render the last frame it completed: per scanline registers, the
     /// CGRAM writes, and VRAM and OAM as they were when the display ended. `None` with the log
     /// off, or before a frame was logged from its start. Read it right after the run that

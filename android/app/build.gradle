@@ -5,13 +5,16 @@ plugins {
 android {
     namespace 'io.github.dbz_ssd_recompiled'
     compileSdk 34
+    // The NDK android/build-apk.sh builds with; Gradle strips the libraries' symbols with its llvm-strip (without an
+    // installed NDK of its own default version it packages them unstripped).
+    ndkVersion '25.2.9519653'
 
     defaultConfig {
         applicationId 'io.github.dbz_ssd_recompiled'
         minSdk 26
         targetSdk 34
-        versionCode 18
-        versionName '0.3.15'
+        versionCode 24
+        versionName 'RC2'
     }
 
     // A release build is signed when SSD_KEYSTORE_PROPERTIES names a properties file (storeFile, storePassword,
@@ -43,9 +46,15 @@ android {
     }
 
     // libmain.so and libSDL3.so, put in jniLibs/<abi>/ by android/build-apk.sh.
+    // The Traditional Chinese translations (Taiwan's tables, font, licences; Hong Kong's tables, which share the font)
+    // as the APK's assets; the game writes the files it reads into its data folder at start
+    // (crates/ssd-app/src/android.rs, install_bundled). build/bundled-assets holds the desktop launcher's art overrides
+    // and voice with their list bundled-files.txt, copied there by android/build-apk.sh from the folder
+    // SSD_APK_ASSETS_DIR names (they are not in the repository).
     sourceSets {
         main {
             jniLibs.srcDirs = ['src/main/jniLibs']
+            assets.srcDirs = ['../../translations/zh-tw', '../../translations/zh-hk', 'build/bundled-assets']
         }
     }
 }

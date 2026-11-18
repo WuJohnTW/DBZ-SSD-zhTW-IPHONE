@@ -51,13 +51,19 @@ pub struct Index {
 pub struct Entry {
     /// The name of the art (its folder), for reports.
     pub id: String,
-    /// [`plane_key`] of the plane's VRAM, 16 hexadecimal digits.
+    /// [`plane_key`] of the plane's VRAM, 16 hexadecimal digits; or [`CONTENT_PREFIX`] and the 16 hexadecimal digits of
+    /// its [`content_key`], for art found by what the plane shows whatever else VRAM holds (see [`Index::find_plane`]).
     pub key: String,
     /// The art tiles (RGBA, `TILE * SCALE` pixels square: a pixel with alpha 0 has no art), relative to the index's folder, with
     /// `{x}` and `{y}` the tile's column and row.
     pub tiles: String,
     /// The 256 colours of the palette the art was made in, `RRGGBB` each (index 0 included).
     pub palette: Vec<String>,
+    /// Where the art is transparent and the plane is not, what is under the plane shows rather than the game's pixel of
+    /// the plane: a picture of the art override with a file `replace` (see `Pack::with_art_override`). Never read from
+    /// `mode7.toml`.
+    #[serde(skip)]
+    pub replace: bool,
 }
 
 impl Entry {
@@ -65,6 +71,13 @@ impl Entry {
     #[must_use]
     pub fn key_value(&self) -> u64 {
         u64::from_str_radix(&self.key, 16).unwrap_or(0)
+    }
+
+    /// The content key as a number, when the entry is found by its content ([`CONTENT_PREFIX`]).
+    #[must_use]
+    pub fn content_value(&self) -> Option<u64> {
+        let digits = self.key.strip_prefix(CONTENT_PREFIX)?;
+        (digits.len() == 16).then(|| u64::from_str_radix(digits, 16).ok()).flatten()
     }
 
     /// The file of the tile in column `x` and row `y`, relative to the index's folder.
@@ -110,9 +123,103 @@ impl Index {
     /// The plane whose content is `key`, if the index has art for it.
     #[must_use]
     pub fn find(&self, key: u64) -> Option<usize> {
-        self.plane.iter().position(|entry| entry.key_value() == key)
+        self.plane
+            .iter()
+            .position(|entry| entry.content_value().is_none() && entry.key_value() == key)
+    }
+
+    /// The plane to draw for the VRAM `vram` and the colours `cgram`: the art found by its [`content_key`] (the last entry
+    /// of it: a picture of the art override comes after the pack's own), else the pack's art for its [`plane_key`] (what
+    /// was found before), else the pack's art of the plane key [`CONTENT_ALIASES`] gives its content. Art found by the
+    /// content is drawn only in the colours it was made in ([`colours_agree`] at least [`CONTENT_COLOURS_AGREE`]): the
+    /// game shows one content in other colours too (Super Saiyan Goku is the normal Goku's plane with yellow hair), and
+    /// the art of the one is not the picture of the other; those keep the game's pixels.
+    #[must_use]
+    pub fn find_plane(&self, vram: &[u16], cgram: &[u16]) -> Option<usize> {
+        self.find_plane_with(vram, cgram, CONTENT_ALIASES)
+    }
+
+    /// [`Self::find_plane`] with the aliases `aliases` (`(content, plane key, whose)`).
+    #[must_use]
+    pub fn find_plane_with(
+        &self,
+        vram: &[u16],
+        cgram: &[u16],
+        aliases: &[(u64, u64, &str)],
+    ) -> Option<usize> {
+        let content = content_key(vram);
+        let agrees = |at: usize| {
+            self.plane[at].colours().is_some_and(|palette| {
+                colours_agree(vram, cgram, &palette) >= CONTENT_COLOURS_AGREE
+            })
+        };
+        (0..self.plane.len())
+            .rev()
+            .find(|&at| self.plane[at].content_value() == Some(content) && agrees(at))
+            .or_else(|| self.find(plane_key(vram)))
+            .or_else(|| {
+                let &(_, key, _) = aliases.iter().find(|&&(alias, _, _)| alias == content)?;
+                self.find(key).filter(|&at| agrees(at))
+            })
     }
 }
+
+/// The least [`colours_agree`] (in thousandths) with which art found by a plane's content is drawn: all its colours, so
+/// that such art is never drawn recoloured (`bgart::adapt`). In 29 replays the planes found by their content agreed
+/// 1000 in every frame, but Super Saiyan Goku's (732: the normal Goku's art, his hair yellow in the game).
+pub const CONTENT_COLOURS_AGREE: u32 = 1000;
+
+/// Of the plane's pixels of a colour other than 0 (the 64 of each character the map uses, once for each map entry that
+/// uses it), the share in thousandths whose colour in `cgram` is the art's colour in `palette` within 3 on each channel
+/// (as `bgart::adapt` draws the art unchanged; the 15-bit colour made 8-bit as the art's palettes are); 1000 when the
+/// plane has no such pixel.
+#[must_use]
+pub fn colours_agree(vram: &[u16], cgram: &[u16], palette: &[[u8; 3]; 256]) -> u32 {
+    let words = &vram[..PLANE_WORDS.min(vram.len())];
+    let mut uses = [0_u64; 256];
+    for &word in words {
+        uses[usize::from(word as u8)] += 1;
+    }
+    let expand = |value: u16| {
+        let channel = |shift: u16| ((u32::from(value >> shift) & 31) * 255 + 15) / 31;
+        [channel(0) as u8, channel(5) as u8, channel(10) as u8]
+    };
+    let (mut all, mut same) = (0_u64, 0_u64);
+    for (character, &count) in uses.iter().enumerate().filter(|&(_, &count)| count > 0) {
+        for at in 64 * character..64 * character + 64 {
+            let index = usize::from(words.get(at).map_or(0, |&word| (word >> 8) as u8));
+            if index == 0 {
+                continue;
+            }
+            all += count;
+            let current = cgram.get(index).map_or([0; 3], |&word| expand(word));
+            if (0..3).all(|c| current[c].abs_diff(palette[index][c]) <= 3) {
+                same += count;
+            }
+        }
+    }
+    (same * 1000).checked_div(all).map_or(1000, |share| share as u32)
+}
+
+/// The start of the key of a plane found by its content ([`Entry::content_value`]).
+pub const CONTENT_PREFIX: &str = "content:";
+
+/// The planes of the pack's art (`mode7.toml`, by their [`plane_key`]) that the game shows with other characters left in
+/// VRAM, by what they show ([`content_key`]): `(content, plane key, whose)`. The flights at the start of a battle (game
+/// mode `$0C`) load the flier's plane over the characters the battle before left, so the pack's art of a flier was found
+/// in few of the battles (8 of the 90 plane keys of the battles' flights in 29 replays). Each content was seen in the
+/// replays; the plane key is the pack's art of that flier, one the replays showed with that content (Goku, Frieza,
+/// Piccolo) or, for the fliers the replays never showed with a key of the pack, the
+/// pack's art of the same flier, compared picture by picture (Super Vegeta, Gohan, Burter). A flier the pack has no art
+/// for (Krillin, the green fighter of the false Nail's battle) is not here, and keeps the game's pixels.
+pub const CONTENT_ALIASES: &[(u64, u64, &str)] = &[
+    (0xcd83_cbee_861e_14ad, 0xb96e_cb15_72d8_8908, "Goku"),
+    (0x8542_d962_a902_04f5, 0x1f84_2a37_f703_d3fe, "Frieza"),
+    (0xeaab_c317_4d0f_006d, 0xddf5_23c3_0fae_b0ea, "Piccolo"),
+    (0x1239_827f_e73e_508f, 0x08f4_3fc7_851f_0e36, "Super Vegeta"),
+    (0xa60b_9c3e_c679_e0b6, 0xcbf4_5e18_cae6_93c4, "Gohan"),
+    (0xc549_2591_4f96_5e7a, 0xb188_4f01_fa04_5ab2, "Burter"),
+];
 
 /// The key of a plane: a hash (FNV-1a, 64 bits) of the words of VRAM the plane is made of.
 #[must_use]
@@ -121,6 +228,30 @@ pub fn plane_key(vram: &[u16]) -> u64 {
     for &word in &vram[..PLANE_WORDS.min(vram.len())] {
         for byte in word.to_le_bytes() {
             hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01B3);
+        }
+    }
+    hash
+}
+
+/// The key of what a plane shows (FNV-1a, 64 bits): its tile map (the low bytes of the plane's words) and the eight-bit
+/// characters the map uses (the high bytes of each used character's 64 words), each once, in the order of their numbers.
+/// The characters no map entry uses are left out: the game loads the plane of a battle's opening flight (game mode
+/// `$0C`) over what the battle before left in the other characters, so one plane had as many [`plane_key`]s as the
+/// battles it was seen in, and the pack's art was found in a few of them only.
+#[must_use]
+pub fn content_key(vram: &[u16]) -> u64 {
+    let words = &vram[..PLANE_WORDS.min(vram.len())];
+    let mut hash = 0xCBF2_9CE4_8422_2325_u64;
+    let mut eat = |byte: u8| hash = (hash ^ u64::from(byte)).wrapping_mul(0x0000_0100_0000_01B3);
+    let mut used = [false; 256];
+    for &word in words {
+        let character = word as u8;
+        used[usize::from(character)] = true;
+        eat(character);
+    }
+    for (character, _) in used.iter().enumerate().filter(|&(_, &used)| used) {
+        for at in 64 * character..64 * character + 64 {
+            eat(words.get(at).map_or(0, |&word| (word >> 8) as u8));
         }
     }
     hash
@@ -340,12 +471,111 @@ mod tests {
     }
 
     #[test]
+    fn the_content_key_follows_the_map_and_the_characters_it_uses_only() {
+        // The map uses the characters 0 and 1 (the high bytes of words 0 to 127): the character 2 is not used
+        let mut vram = vec![0_u16; 0x8000];
+        vram[5] = 1;
+        let (content, key) = (content_key(&vram), plane_key(&vram));
+        vram[128] = 7 << 8;
+        assert_ne!(plane_key(&vram), key, "the plane key follows every word");
+        assert_eq!(content_key(&vram), content, "a character no map entry uses is left out");
+        vram[0x4000] = 3;
+        assert_eq!(content_key(&vram), content, "nor a word past the plane");
+        vram[64 + 9] = 4 << 8;
+        assert_ne!(content_key(&vram), content, "a used character's pixel changes it");
+        vram[64 + 9] = 0;
+        vram[6] = 1;
+        assert_ne!(content_key(&vram), content, "and the map");
+    }
+
+    #[test]
+    fn a_plane_is_found_by_its_content_key_then_its_plane_key_then_an_alias() {
+        let entry = |id: &str, key: String| Entry {
+            id: id.to_owned(),
+            key,
+            tiles: format!("{id}/t{{x}}_{{y}}.png"),
+            palette: vec!["000000".to_owned(); 256],
+            replace: false,
+        };
+        let mut vram = vec![0_u16; 0x4000];
+        let (key, content) = (plane_key(&vram), content_key(&vram));
+        vram[128] = 1 << 8;
+        let other = vram.clone();
+        vram[128] = 0;
+        let mut index = Index {
+            plane: vec![
+                entry("own", format!("{key:016x}")),
+                entry("seen", format!("{:016x}", 0x1234)),
+            ],
+        };
+        // By the plane key only, as before
+        assert_eq!(index.find_plane_with(&vram, &[], &[]), Some(0));
+        assert_eq!(index.find_plane_with(&other, &[], &[]), None);
+        // An alias names the art of `seen` for the content: found for the VRAM of another plane key, after the plane key
+        let aliases = [(content, 0x1234, "test")];
+        assert_eq!(index.find_plane_with(&other, &[], &aliases), Some(1));
+        assert_eq!(index.find_plane_with(&vram, &[], &aliases), Some(0));
+        assert_eq!(index.find_plane_with(&other, &[], &[(content, 0x9999, "absent")]), None);
+        // Art keyed by the content (a picture of the art override, the last of them) comes first, for both
+        index.plane.push(entry("by content", format!("{CONTENT_PREFIX}{content:016x}")));
+        index.plane.push(entry("override", format!("{CONTENT_PREFIX}{content:016x}")));
+        assert_eq!(index.plane[3].content_value(), Some(content));
+        assert_eq!(index.find_plane_with(&vram, &[], &aliases), Some(3));
+        assert_eq!(index.find_plane_with(&other, &[], &aliases), Some(3));
+        // Its key is no plane key, and a key of other digits is no content key
+        assert_eq!(index.find(0), None);
+        assert_eq!(entry("x", format!("{CONTENT_PREFIX}12")).content_value(), None);
+        assert_eq!(index.plane[0].content_value(), None);
+    }
+
+    #[test]
+    fn art_found_by_its_content_is_drawn_in_the_colours_it_was_made_in_only() {
+        // Every map entry the character 1, whose pixels are the colour 5 (left half) and 6 (right half)
+        let mut vram = vec![1_u16; 0x4000];
+        for pixel in 0..64 {
+            vram[64 + pixel] |= if pixel % 8 < 4 { 5 << 8 } else { 6 << 8 };
+        }
+        let content = content_key(&vram);
+        // The art was made in red (5) and blue (6)
+        let mut palette = vec!["000000".to_owned(); 256];
+        palette[5] = "FF0000".to_owned();
+        palette[6] = "0000FF".to_owned();
+        let entry = |id: &str, key: String| Entry {
+            id: id.to_owned(),
+            key,
+            tiles: format!("{id}/t{{x}}_{{y}}.png"),
+            palette: palette.clone(),
+            replace: false,
+        };
+        let colours = entry("x", String::new()).colours().unwrap();
+        let (mut cgram, aliases) = (vec![0_u16; 256], [(content, 0x1234, "test")]);
+        cgram[5] = 0x001F;
+        cgram[6] = 0x7C00;
+        assert_eq!(colours_agree(&vram, &cgram, &colours), 1000);
+        // The game shows the colour 6 in yellow: half the pixels are not the art's
+        let mut yellow = cgram.clone();
+        yellow[6] = 0x03FF;
+        assert_eq!(colours_agree(&vram, &yellow, &colours), 500);
+        // By an alias, and by the content: drawn in the art's colours only
+        let mut index = Index { plane: vec![entry("seen", format!("{:016x}", 0x1234))] };
+        assert_eq!(index.find_plane_with(&vram, &cgram, &aliases), Some(0));
+        assert_eq!(index.find_plane_with(&vram, &yellow, &aliases), None);
+        index.plane.push(entry("by content", format!("{CONTENT_PREFIX}{content:016x}")));
+        assert_eq!(index.find_plane_with(&vram, &cgram, &aliases), Some(1));
+        assert_eq!(index.find_plane_with(&vram, &yellow, &aliases), None);
+        // The art of the plane key is found in any colours, as before
+        index.plane.push(entry("own", format!("{:016x}", plane_key(&vram))));
+        assert_eq!(index.find_plane_with(&vram, &yellow, &aliases), Some(2));
+    }
+
+    #[test]
     fn a_palette_is_256_six_digit_colours() {
         let mut entry = Entry {
             id: "p".to_owned(),
             key: "00000000000000ff".to_owned(),
             tiles: "p/t{x}_{y}.png".to_owned(),
             palette: vec!["102030".to_owned(); 256],
+            replace: false,
         };
         assert_eq!(entry.key_value(), 255);
         assert_eq!(entry.colours().unwrap()[5], [0x10, 0x20, 0x30]);
@@ -366,6 +596,7 @@ mod tests {
                 key: "00000000000000ab".to_owned(),
                 tiles: "plane/t{x}_{y}.png".to_owned(),
                 palette: vec!["000000".to_owned(); 256],
+                replace: false,
             }],
         };
         std::fs::create_dir_all(dir.path().join("art/mode7")).unwrap();

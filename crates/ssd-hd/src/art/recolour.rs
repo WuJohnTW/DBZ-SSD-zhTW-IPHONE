@@ -83,6 +83,24 @@ pub(crate) fn differs(source: &Palette, row: &[[u8; 3]; 16]) -> bool {
         })
 }
 
+/// Whether the art made for `source` cannot be drawn in the colours of `row`: two colours the art
+/// uses are one colour in its palette and two in `row`. A pixel of the art is placed by its colour
+/// alone ([`map_pixel`]), so the pixels of both take the colour of one of them. The game draws
+/// Super Vegeta in some poses with the tiles of Vegeta in his own palette, where the outline (1)
+/// and the hair (14, 15) are three colours (black, yellow, orange); the pack's art of those poses is
+/// Vegeta's, made for his palette, where the three are black, and recoloured it showed him with
+/// black hair. A palette of no colour (art whose palette is read from the pose) says no.
+#[must_use]
+pub(crate) fn merges(source: &Palette, row: &[[u8; 3]; 16]) -> bool {
+    let same = |a: &[u8; 3], b: &[u8; 3]| a.iter().zip(b).all(|(x, y)| x.abs_diff(*y) <= SAME);
+    let used: Vec<usize> = (1..16).filter(|&index| source.mask & (1 << index) != 0).collect();
+    used.iter().enumerate().any(|(n, &a)| {
+        used[n + 1..]
+            .iter()
+            .any(|&b| same(&source.colors[a], &source.colors[b]) && !same(&row[a], &row[b]))
+    })
+}
+
 fn luma(color: [i32; 3]) -> i32 {
     (color[0] * 299 + color[1] * 587 + color[2] * 114) / 1000
 }
@@ -288,5 +306,27 @@ mod tests {
         for c in 0..3 {
             assert!(out.rgba[c].abs_diff([250, 255, 250][c]) < 40, "channel {c}: {:?}", out.rgba);
         }
+    }
+
+    #[test]
+    fn art_whose_one_colour_is_two_colours_of_the_row_cannot_be_recoloured() {
+        // Vegeta's palette: outline (1) and hair (14, 15) black, skin (2). Super Vegeta's row: the
+        // outline black, the hair yellow and orange
+        let black = [0, 0, 0];
+        let vegeta = palette(&[(1, black), (2, [255, 189, 132]), (14, black), (15, black)]);
+        let super_vegeta =
+            row(&[(1, black), (2, [255, 189, 132]), (14, [255, 255, 0]), (15, [255, 115, 33])]);
+        assert!(merges(&vegeta, &super_vegeta), "black hair cannot become yellow");
+        // His own row, a step off, and one darker as a whole (a fade), keep the three one colour
+        assert!(!merges(&vegeta, &row(&[(1, black), (14, [2, 2, 2]), (15, black)])));
+        let faded = row(&[(1, [8, 8, 8]), (2, [120, 90, 60]), (14, [8, 8, 8]), (15, [8, 8, 8])]);
+        assert!(!merges(&vegeta, &faded), "a fade");
+        // The other way, Super Vegeta's art in Vegeta's row: two colours become one, which the
+        // recolouring can do
+        let super_art = palette(&[(1, black), (14, [255, 255, 0]), (15, [255, 115, 33])]);
+        assert!(!merges(&super_art, &row(&[(1, black), (14, black), (15, black)])));
+        // Art of his arm only (no hair in its palette), and art with no palette
+        assert!(!merges(&palette(&[(1, black), (2, [255, 189, 132])]), &super_vegeta));
+        assert!(!merges(&Palette::default(), &super_vegeta));
     }
 }

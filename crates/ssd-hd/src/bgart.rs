@@ -773,9 +773,16 @@ pub(crate) fn record(slots: &[Slot], probe: &Probe<'_>, regs: &ssd_oracle::LineR
         if !slot.shown_by(regs) {
             continue;
         }
-        // Behind a window that hides the layer the pixel is not the layer's
+        // Behind a window that hides the layer the pixel is not the layer's. For the Mode 7 plane the window must hide
+        // the layer at this pixel (the position the game's own layer is windowed at, `screen::bg_in_window`): the
+        // opening flights of Super Saiyan Goku and Super Vegeta turn the main screen's BG1 window on with neither
+        // window set for BG1, which hides nothing; taking the switch alone left the plane's art (the pack's and the
+        // art override's) only on the 1x pixels the game's plane showed (a stair-stepped edge, the art past the
+        // original's outline cut away)
         let in_front = winner != Layer::Backdrop && winner != Layer::Obj;
-        if !in_front && regs.main_bg_window_off[bg] {
+        let hidden = regs.main_bg_window_off[bg]
+            && (!slot.is_plane() || crate::screen::bg_in_window(regs, bg, probe.window_x));
+        if !in_front && hidden {
             continue;
         }
         let Some((x, y)) = slot.locate(regs, probe) else {

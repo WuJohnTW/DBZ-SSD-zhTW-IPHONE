@@ -1,5 +1,6 @@
 package io.github.dbz_ssd_recompiled;
 
+import android.media.AudioManager;
 import android.os.Build;
 import android.os.Bundle;
 import android.view.Display;
@@ -25,6 +26,7 @@ public class GameActivity extends SDLActivity {
     @Override
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
+        setVolumeControlStream(AudioManager.STREAM_MUSIC);
         // The screen stays on while the game is in front, and the picture reaches the edges (cutouts included).
         getWindow().addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
         if (Build.VERSION.SDK_INT >= 28) {

@@ -103,6 +103,38 @@ pub fn animation_factor(wram: &[u8], values: &Values) -> u32 {
     if factor > 1 && attack_animation(wram) { factor } else { 1 }
 }
 
+/// The frames of the game to one frame of the screen in a battle at the Gameplay page's battle speed 1.5x, as a
+/// ratio: 3 frames to 2, with the sound chip at [`BATTLE_TEMPO_APU`] of its clock, so the music and the sound effects
+/// keep their tempo and pitch.
+pub const BATTLE_TEMPO: (u32, u32) = (3, 2);
+/// The sound chip's clock relative to the CPU's at the battle speed 1.5x (`ssd_oracle::Machine::set_apu_clock_ratio`):
+/// the inverse of [`BATTLE_TEMPO`].
+pub const BATTLE_TEMPO_APU: (u32, u32) = tempo_apu(BATTLE_TEMPO);
+/// The battle speed 2x: 2 frames of the game to 1 of the screen, the sound chip at 1/2 of its clock.
+pub const BATTLE_TEMPO_2X: (u32, u32) = (2, 1);
+/// The tempo of each of the page's battle speeds past Off, in the order of its choices (1.5x, 2x).
+pub const BATTLE_TEMPOS: [(u32, u32); 2] = [BATTLE_TEMPO, BATTLE_TEMPO_2X];
+
+/// The sound chip's clock relative to the CPU's at a battle `tempo` (frames of the game, frames of the screen): the
+/// inverse, so the sound chip runs as many of its cycles a second of the screen as at 1x.
+#[must_use]
+pub const fn tempo_apu(tempo: (u32, u32)) -> (u32, u32) {
+    (tempo.1, tempo.0)
+}
+
+/// The tempo the Gameplay page's battle speed runs now ([`BATTLE_TEMPOS`]), if it runs: it is not Off and a battle
+/// is on ([`in_battle`]: from its start and its command selection to its end, the messages included), and the battle
+/// animation speed is not running the attack animation faster ([`animation_factor`] is 1; that speed has the attack
+/// animations, this one the rest). The frames are the game's own, every one whole and every one's sound played; only
+/// the sound chip runs at [`tempo_apu`] of its clock, so its answers reach the CPU at other cycles of a frame (the idle
+/// RNG may draw otherwise than at 1x, as with other timing of the player's presses).
+#[must_use]
+pub fn battle_tempo(wram: &[u8], values: &Values) -> Option<(u32, u32)> {
+    let choice = page::battle_speed(values);
+    let tempo = BATTLE_TEMPOS.get(choice.checked_sub(1)?).copied()?;
+    (in_battle(wram) && animation_factor(wram, values) == 1).then_some(tempo)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -114,6 +146,115 @@ mod tests {
         wram[(d::BATTLE_PHASE - WRAM_BASE) as usize] = phase;
         wram[(d::IN_BATTLE - WRAM_BASE) as usize] = in_battle;
         wram
+    }
+
+    fn battle_speed(on: bool, anim: i64) -> Values {
+        battle_speed_at(i64::from(on), anim)
+    }
+
+    fn battle_speed_at(choice: i64, anim: i64) -> Values {
+        let mut values = Values::new();
+        values.set(page::BATTLE_SPEED, choice);
+        values.set(page::ANIM_SPEED, anim);
+        values
+    }
+
+    #[test]
+    fn the_battle_speed_runs_in_the_whole_battle_and_only_there() {
+        let values = battle_speed(true, 0);
+        // A battle: its start and command selection (mode 2) and the rest (mode 4), messages and animations included.
+        for (message, mode, phase) in
+            [(0, 2, 0), (0x83, 2, 1), (0, 4, 4), (0x81, 4, 2), (0, 0x84, 4)]
+        {
+            let wram = wram_with(message, mode, phase, 0xFF);
+            assert_eq!(
+                battle_tempo(&wram, &values),
+                Some(BATTLE_TEMPO),
+                "in battle: {message:#04x} {mode:#04x} {phase}"
+            );
+        }
+        // The field and the menus: not in battle, or a mode that is not a battle's.
+        for (mode, in_battle) in [(0, 0), (4, 0), (2, 0x7F), (1, 0xFF), (0x11, 0xFF)] {
+            let wram = wram_with(0, mode, 4, in_battle);
+            assert!(
+                battle_tempo(&wram, &values).is_none(),
+                "not a battle: mode {mode:#04x} flag {in_battle:#04x}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_battle_speed_is_off_by_default_and_when_switched_off() {
+        let battle = wram_with(0, 4, 0, 0xFF);
+        assert_eq!(battle_tempo(&battle, &Values::new()), None, "Off by default");
+        assert_eq!(battle_tempo(&battle, &battle_speed(false, 0)), None);
+        assert_eq!(
+            battle_tempo(&battle, &battle_speed(false, 3)),
+            None,
+            "the animation speed alone is not it"
+        );
+    }
+
+    #[test]
+    fn the_animation_speed_keeps_the_attack_animation_and_the_battle_speed_the_rest() {
+        let values = battle_speed(true, 1); // x2
+        let attack = wram_with(0, 4, ATTACK_ANIMATION, 0xFF);
+        assert_eq!(animation_factor(&attack, &values), 2);
+        assert_eq!(
+            battle_tempo(&attack, &values),
+            None,
+            "the attack animation is the animation speed's"
+        );
+        let commands = wram_with(0, 2, 0, 0xFF);
+        assert_eq!(animation_factor(&commands, &values), 1);
+        assert_eq!(
+            battle_tempo(&commands, &values),
+            Some(BATTLE_TEMPO),
+            "the rest of the battle is the battle speed's"
+        );
+        // With the animation speed at Normal the attack animation is the battle speed's too.
+        assert_eq!(battle_tempo(&attack, &battle_speed(true, 0)), Some(BATTLE_TEMPO));
+    }
+
+    #[test]
+    fn the_battle_tempo_is_three_frames_to_two_with_the_sound_chip_at_two_thirds() {
+        assert_eq!(BATTLE_TEMPO, (3, 2));
+        assert_eq!(BATTLE_TEMPO_APU, (2, 3));
+    }
+
+    #[test]
+    fn the_battle_speed_2x_is_two_frames_to_one_with_the_sound_chip_at_half() {
+        assert_eq!(BATTLE_TEMPO_2X, (2, 1));
+        assert_eq!(tempo_apu(BATTLE_TEMPO_2X), (1, 2));
+        // The sound chip's cycles a frame of the screen are 1x's at every speed: frames x clock = 1
+        for (frames, refreshes) in BATTLE_TEMPOS {
+            let (num, den) = tempo_apu((frames, refreshes));
+            assert_eq!(frames * num, refreshes * den, "{frames}/{refreshes}");
+        }
+    }
+
+    #[test]
+    fn each_choice_of_the_battle_speed_runs_its_tempo_in_battle_only() {
+        let battle = wram_with(0, 4, 0, 0xFF);
+        let field = wram_with(0, 0, 4, 0);
+        for (choice, tempo) in
+            [(0, None), (1, Some((3, 2))), (2, Some((2, 1))), (3, None), (-1, None)]
+        {
+            assert_eq!(
+                battle_tempo(&battle, &battle_speed_at(choice, 0)),
+                tempo,
+                "choice {choice}"
+            );
+            assert_eq!(
+                battle_tempo(&field, &battle_speed_at(choice, 0)),
+                None,
+                "the field: {choice}"
+            );
+        }
+        // The animation speed keeps the attack animation at 2x too
+        let attack = wram_with(0, 4, ATTACK_ANIMATION, 0xFF);
+        assert_eq!(battle_tempo(&attack, &battle_speed_at(2, 1)), None);
+        assert_eq!(battle_tempo(&attack, &battle_speed_at(2, 0)), Some(BATTLE_TEMPO_2X));
     }
 
     fn on(wait: i64) -> Values {

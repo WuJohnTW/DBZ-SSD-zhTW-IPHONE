@@ -24,6 +24,7 @@ mod binding;
 pub mod cards;
 mod enhanced;
 pub mod font;
+pub mod lightning;
 pub mod mapart;
 mod menu_art;
 mod mode7;
@@ -41,10 +42,11 @@ pub mod world;
 use ssd_oracle::{CgramWrite, Color, FrameLog, LineEntry, OamWrite, VramWrite};
 use std::sync::Arc;
 
+pub use art::art_loads_on_draw;
 pub use art::{
-    ArtSource, ArtStats, COLOUR_CLASSES, Conditions, Drawn, DrawnPose, Fate, FrameTally, Image,
-    ItemKey, KindPixels, PortraitUse, PoseShape, PoseStat, TallyCount, TallyItem, TallyLayer,
-    colour_class,
+    ArtSource, ArtStats, COLOUR_CLASSES, Conditions, DrawCost, Drawn, DrawnPose, Fate, FrameTally,
+    Image, ItemKey, KindPixels, PortraitUse, PoseShape, PoseStat, TallyCount, TallyItem,
+    TallyLayer, colour_class,
 };
 pub use binding::Binder;
 pub use cards::{CARD_WORDS, CardArt, CardPart, Preview as CardPreview};
@@ -185,6 +187,11 @@ pub struct Renderer {
     /// The text cells of the frame being drawn, noted while `text_on`.
     text: font::TextCapture,
     text_on: bool,
+    /// The lightning of the Super Saiyan transformation, when its pictures were found (see [`Renderer::set_lightning`]).
+    lightning: Option<lightning::Overlay>,
+    /// The frames since the transformation started, while it goes on: the conditions' (see
+    /// [`Conditions::with_ssj_lightning`]).
+    ssj_lightning: Option<u32>,
 }
 
 impl Default for Renderer {
@@ -213,6 +220,22 @@ impl Renderer {
             font: None,
             text: font::TextCapture::default(),
             text_on: false,
+            lightning: None,
+            ssj_lightning: None,
+        }
+    }
+
+    /// Makes the Enhanced pictures ([`Renderer::render_hd`]) draw the pictures of `lightning` over the frame while
+    /// Goku's first Super Saiyan transformation goes on (see [`lightning`]); `None` (the start) draws none. The 1x frame
+    /// of [`Renderer::render`] never has it.
+    pub fn set_lightning(&mut self, lightning: Option<Arc<lightning::Lightning>>) {
+        self.lightning = lightning.map(lightning::Overlay::new);
+    }
+
+    /// Draws the lightning over the Enhanced picture `hd`, while the transformation goes on and there are pictures.
+    pub(crate) fn draw_lightning(&mut self, hd: &mut enhanced::HdFrame) {
+        if let (Some(overlay), Some(frames)) = (self.lightning.as_mut(), self.ssj_lightning) {
+            overlay.draw(hd, frames);
         }
     }
 
@@ -237,9 +260,20 @@ impl Renderer {
         }
     }
 
+    /// Reads the pack's art on a thread of its own (`true`) instead of in the picture that wants it (`false`, the
+    /// start): a picture draws the art read so far and asks for the rest, drawn as the game draws it until the picture
+    /// after it is read. The pictures every art is read for are the same. `SSD_HD_SERIAL` in the environment keeps the
+    /// art read by the pictures. Call it after [`Renderer::set_art`].
+    pub fn set_art_async(&mut self, on: bool) {
+        if let Some(art) = self.art.as_mut() {
+            art.set_async(on);
+        }
+    }
+
     /// The conditions of the frame the next picture with art is drawn from: the pack's pose variants whose condition holds
     /// are drawn ([`Conditions::of_work_ram`] reads them from the work RAM).
     pub fn set_conditions(&mut self, conditions: Conditions) {
+        self.ssj_lightning = conditions.ssj_lightning();
         if let Some(art) = self.art.as_mut() {
             art.conditions = conditions;
         }
@@ -249,6 +283,13 @@ impl Renderer {
     #[must_use]
     pub fn art_stats(&self) -> ArtStats {
         self.art.as_ref().map(|art| art.stats.clone()).unwrap_or_default()
+    }
+
+    /// What the art's stages of the last picture drawn with art cost (see [`DrawCost`]): the whole picture's time is
+    /// the caller's to measure. Zero without art.
+    #[must_use]
+    pub fn art_cost(&self) -> DrawCost {
+        self.art.as_ref().map(|art| art.cost()).unwrap_or_default()
     }
 
     /// Renders the frame `log` describes, at 1x with no art swapped in.

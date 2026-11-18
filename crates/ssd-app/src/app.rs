@@ -18,6 +18,7 @@ use crate::panel::{
     Controls, DebugAction, DivergenceWatch, Effect, FpsCounter, HooksSwitch, KeyRoute, PanelAction,
     PanelState, ReplayAction, Tab, route_key,
 };
+use crate::quit_confirm::{self, QuitConfirm};
 use crate::replay_io::Session;
 use crate::replays::{self, Outcome, REPLAYS_DIR, Verification};
 use crate::screenshot;
@@ -25,7 +26,7 @@ use crate::snapshot;
 use crate::tab_memory;
 use crate::tab_routines::{self, FrameHistory};
 use crate::touch::{self, Touch};
-use crate::ui::{self, Status, View};
+use crate::ui::{self, Live, Status, View};
 use crate::ui_script::{Command, Line, MenuCommand, MenuShow};
 use crate::{audio, paths, saves, video};
 use anyhow::Context;
@@ -248,6 +249,11 @@ struct WindowState {
     /// The game runs at speed 1: a batch is frames the clock owes (a screen slower than the game), not a
     /// fast-forward, so every frame's sound is heard (see [`run_frames`]).
     real_time: bool,
+    /// The Gameplay page's battle speed runs ([`set_battle_tempo`]): the frames of a window frame are not a
+    /// fast-forward's batch but the game's own at 1.5 or 2 times, each run whole (its render log, its pixels) and followed
+    /// as at speed 1, and the last one drawn and shown, so what the window shows of a frame is what speed 1 shows of
+    /// it (see [`run_frames`]).
+    whole_frames: bool,
     /// The Video page's choices as the run shows them (the command line's scale and look included).
     video: VideoSettings,
     /// The choices the PC file held when they were last read: the player's changes are measured from them.
@@ -281,6 +287,12 @@ struct WindowState {
     /// The frames left in which the PPU draws its pixels whatever the run (see [`may_skip_pixels`]): a frame the
     /// Enhanced picture refused was seen lately.
     compose_hold: u32,
+    /// "Quit the game?", while Esc's question is on screen: the game is held until it closes.
+    quit_confirm: Option<QuitConfirm>,
+    /// Goku frame by frame, for the voice of his first Super Saiyan transformation (see [`crate::voice`]).
+    ssj_watch: crate::voice::SsjWatch,
+    /// A frame run started Goku's Super Saiyan transformation: the voice starts with the window frame's sound.
+    voice_due: bool,
 }
 
 /// The time the frame loop spent in its first stages: the HD menu's driver, the machine's frames,
@@ -297,6 +309,185 @@ impl Stages {
     /// Everything the frames cost: what the speed multiplies.
     pub fn frames(&self) -> Duration {
         self.driver + self.emulate + self.history + self.hd
+    }
+}
+
+/// A window frame that takes longer than this, from its start to its present's end, is logged ([`slow_frame_line`]).
+const SLOW_FRAME: Duration = Duration::from_millis(100);
+/// The most slow window frames logged in a second; the others are counted only.
+const SLOW_LINES_A_SECOND: u32 = 2;
+/// How often the slow window frames are summed up in the log (as the sound is, `audio::REPORT_EVERY`).
+const SLOW_REPORT_EVERY: Duration = Duration::from_secs(5);
+
+/// Where the Enhanced picture of a window frame was drawn.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DrawnOn {
+    /// On the window's thread, in the window frame (no Latency Smooth, or a picture that must be shown at once).
+    Window,
+    /// On the thread `hd-draw`: Latency Smooth's picture, which came back in this window frame (the window waited
+    /// for it in the `hd` stage when it was not done).
+    Worker,
+    /// By the Enhanced renderer of `--hd-scale`, when the 16:9 view has no picture.
+    Fallback,
+}
+
+impl std::fmt::Display for DrawnOn {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(match self {
+            DrawnOn::Window => "on the window's thread",
+            DrawnOn::Worker => "in the background",
+            DrawnOn::Fallback => "by the --hd-scale renderer",
+        })
+    }
+}
+
+/// What a window frame cost, for the log of a slow one.
+#[derive(Debug, Clone, Copy, Default)]
+struct FrameCost {
+    /// From the window frame's start to its present's end (the pacer's wait for the next one left out).
+    total: Duration,
+    /// The stages of the frames it ran (zero when none ran).
+    stages: Stages,
+    /// The present: the interface and the swap.
+    present: Duration,
+    /// The frames of the game it asked for and ran.
+    requested: u32,
+    run: u32,
+    /// What the Enhanced pictures that came back in it cost, and where the last was drawn.
+    picture: Option<(ssd_hd::DrawCost, DrawnOn)>,
+}
+
+fn ms(time: Duration) -> f64 {
+    time.as_secs_f64() * 1000.0
+}
+
+/// The log line of a window frame that took longer than [`SLOW_FRAME`]; `None` for one that did not.
+fn slow_frame_line(cost: &FrameCost) -> Option<String> {
+    use std::fmt::Write as _;
+    if cost.total <= SLOW_FRAME {
+        return None;
+    }
+    let stages = &cost.stages;
+    // (the rest: the events, the interface's actions, a screenshot, a window moved or resized)
+    let other = cost.total.saturating_sub(stages.frames() + cost.present);
+    let mut line = format!(
+        "slow window frame: {:.1} ms (emulate {:.1}, driver {:.1}, history {:.1}, hd {:.1}, present {:.1}, other \
+         {:.1} ms; {}/{} frames)",
+        ms(cost.total),
+        ms(stages.emulate),
+        ms(stages.driver),
+        ms(stages.history),
+        ms(stages.hd),
+        ms(cost.present),
+        ms(other),
+        cost.requested,
+        cost.run
+    );
+    match &cost.picture {
+        Some((picture, on)) => {
+            let _ = write!(
+                line,
+                "; picture drawn {on}: {:.1} ms (begin_bg {:.1}, find_poses {:.1}, draw {:.1}, art {:.1} ms; loads \
+                 {:.1} ms: requests {}, received {}: {} bg, {} pictures, {} objects, {} variants, {} planes, {} bytes); \
+                 {} bg slots{}, {} poses, bg art evicted {}",
+                ms(picture.total),
+                ms(picture.begin_bg),
+                ms(picture.find_poses),
+                ms(picture.draw),
+                ms(picture.art_compose),
+                ms(picture.loads),
+                picture.requests,
+                picture.received(),
+                picture.bg_loads,
+                picture.pictures,
+                picture.objects,
+                picture.variants,
+                picture.planes,
+                picture.load_bytes,
+                picture.bg_slots,
+                if picture.plane { " (one the Mode 7 plane)" } else { "" },
+                picture.poses,
+                picture.bg_evicted
+            );
+        }
+        None => line.push_str("; no picture drawn"),
+    }
+    Some(line)
+}
+
+/// The slow window frames of a run: counted for the F1 pill, logged at most [`SLOW_LINES_A_SECOND`] a second, and
+/// summed up every [`SLOW_REPORT_EVERY`].
+#[derive(Debug)]
+struct SlowFrames {
+    /// Since the run started: the slow window frames and the slowest.
+    count: u32,
+    slowest: Duration,
+    /// Since the last summary: when it was, the slow window frames, the slowest, and the background layers the art's
+    /// cache let go to keep within its budget.
+    since: Instant,
+    recent: u32,
+    recent_slowest: Duration,
+    bg_evicted: u32,
+    /// The second the lines logged are counted in, and the lines logged in it.
+    second: Instant,
+    lines: u32,
+}
+
+impl SlowFrames {
+    fn new(now: Instant) -> Self {
+        Self {
+            count: 0,
+            slowest: Duration::ZERO,
+            since: now,
+            recent: 0,
+            recent_slowest: Duration::ZERO,
+            bg_evicted: 0,
+            second: now,
+            lines: 0,
+        }
+    }
+
+    /// Notes a window frame that ended at `now`; returns the line to log for a slow one, unless the second has its
+    /// lines already.
+    fn note(&mut self, cost: &FrameCost, now: Instant) -> Option<String> {
+        if let Some((picture, _)) = &cost.picture {
+            self.bg_evicted += picture.bg_evicted;
+        }
+        let line = slow_frame_line(cost)?;
+        self.count += 1;
+        self.slowest = self.slowest.max(cost.total);
+        self.recent += 1;
+        self.recent_slowest = self.recent_slowest.max(cost.total);
+        if now.duration_since(self.second) >= Duration::from_secs(1) {
+            self.second = now;
+            self.lines = 0;
+        }
+        if self.lines >= SLOW_LINES_A_SECOND {
+            return None;
+        }
+        self.lines += 1;
+        Some(line)
+    }
+
+    /// The summary of the window frames since the last one, once [`SLOW_REPORT_EVERY`] has gone by at `now`.
+    fn report(&mut self, now: Instant) -> Option<String> {
+        let elapsed = now.duration_since(self.since);
+        if elapsed < SLOW_REPORT_EVERY {
+            return None;
+        }
+        let line = format!(
+            "slow window frames: {} over {} ms in {:.1} s, the slowest {:.1} ms; the background art evicted {} layers",
+            self.recent,
+            SLOW_FRAME.as_millis(),
+            elapsed.as_secs_f64(),
+            ms(self.recent_slowest),
+            self.bg_evicted
+        );
+        self.since = now;
+        self.recent = 0;
+        self.recent_slowest = Duration::ZERO;
+        self.bg_evicted = 0;
+        Some(line)
     }
 }
 
@@ -317,6 +508,7 @@ impl WindowState {
             stages: Stages::default(),
             fast_forward: false,
             real_time: false,
+            whole_frames: false,
             video: VideoSettings::default(),
             video_saved: VideoSettings::default(),
             video_apply: false,
@@ -335,6 +527,9 @@ impl WindowState {
             ppu_stale: false,
             held_picture: false,
             compose_hold: 0,
+            quit_confirm: None,
+            ssj_watch: crate::voice::SsjWatch::default(),
+            voice_due: false,
         }
     }
 
@@ -442,6 +637,7 @@ fn hd_frame(
     if let Some(values) = settings.as_ref() {
         hd.follow_language(values);
         state.touch.apply_settings(touch::settings::Settings::from_values(values));
+        state.touch.set_words(crate::lang::interface_text(values));
         let map = Bindings::from_values(values);
         if map != state.bindings {
             state.bindings = map;
@@ -557,6 +753,40 @@ fn frame_layer<'a>(
         (None, None) => return None,
     };
     art.map(|art| ui::Layer { list, art, menu })
+}
+
+/// The HD layer's lists with Esc's question over them while it asks: on the menu on screen, else on the field's
+/// overlay (a new one when there is none). Its words are the HD menus' (translated, styled), English in Classic.
+fn with_quit_confirm(
+    state: &WindowState,
+    scene: Option<ssd_menus::DrawList>,
+    overlay: Option<ssd_menus::DrawList>,
+) -> (Option<ssd_menus::DrawList>, Option<ssd_menus::DrawList>) {
+    let Some(question) = state.quit_confirm.as_ref() else {
+        return (scene, overlay);
+    };
+    let list = question.scene();
+    let list = match state.hd.as_ref() {
+        Some(hd) => hd.dressed(list),
+        None => list,
+    };
+    match scene {
+        Some(mut scene) => {
+            scene.append(list);
+            (Some(scene), overlay)
+        }
+        None => {
+            let mut overlay = overlay.unwrap_or_default();
+            overlay.append(list);
+            (None, Some(overlay))
+        }
+    }
+}
+
+/// Whether the machine runs frames this window frame: not during a verification (`verifying`), not while paused (but
+/// for a step), and not while Esc's question is on screen.
+fn game_runs(state: &WindowState, verifying: bool) -> bool {
+    !verifying && state.quit_confirm.is_none() && (!state.controls.paused || state.step_once)
 }
 
 /// What the windowed loop works with besides the machine and the window.
@@ -859,6 +1089,8 @@ enum Draw {
 /// the picture of a fast-forward's batch is that of its last frame.
 fn note_view(state: &mut WindowState, machine: &Machine, draw: Draw) {
     let Some(hd) = state.hd.as_mut() else { return };
+    // The transformation's lightning, by the watch of its voice: none for a frame the watch did not note (a state loaded)
+    hd.set_ssj_lightning(state.ssj_watch.lightning_at(machine.frame_count()));
     if draw == Draw::Skip {
         hd.skip_frame(machine.wram());
         return;
@@ -944,6 +1176,7 @@ fn header_status(machine: &Machine, history: &FrameHistory, fps: f32) -> Status 
             .map(|figures| figures.total),
         means_missing,
         freezes: machine.freezes().len(),
+        live: None,
     }
 }
 
@@ -1098,7 +1331,9 @@ fn run_frames(
     // few: both run every frame whole. At speed 1 the batch is the frames the clock owes (a phone
     // whose screen fell behind): each one's sound is heard, or the sound would starve.
     let every_sound = state.real_time;
+    // The battle speed's frames are the game's own at 1.5 times, not a fast-forward: every one is run whole
     let fast_forward = frames > 1
+        && !state.whole_frames
         && !state.step_once
         && machine.breakpoints().is_empty()
         && !state.hd.as_ref().is_some_and(hd::Hd::busy);
@@ -1140,6 +1375,10 @@ fn run_frames(
         let ran_at = Instant::now();
         state.stages.driver += driven - started;
         state.stages.emulate += ran_at - driven;
+        // Goku's first Super Saiyan transformation: every frame is looked at (a fast-forward's too), Classic and Enhanced
+        if state.ssj_watch.observe(machine.frame_count(), crate::voice::goku(machine.wram())) {
+            state.voice_due = true;
+        }
         if let Stopped::Breakpoint { key } = stopped {
             breakpoint_stop(state, machine, symbols, key);
             break;
@@ -1152,10 +1391,12 @@ fn run_frames(
         let noted = Instant::now();
         state.stages.history += noted - ran_at;
         // The picture is drawn from the last frame, which starts from the state the one before
-        // ended in: the frames before those two leave nothing for the view to follow
-        if n + 2 >= frames || !fast_forward {
-            note_view(state, machine, Draw::Skip);
-        }
+        // ended in; every frame of the batch is followed all the same, as the translation keeps a
+        // page the message engine names for two frames only (the Item help)
+        // A battle speed's frame not shown is not drawn either: run whole and followed, the frame shown after it is
+        // speed 1's picture of that frame (the translation's pages, the card tooltip), and drawing it as well made a
+        // window frame of two cost two pictures, more than a slow machine draws in a 60 Hz refresh
+        note_view(state, machine, Draw::Skip);
         state.stages.hd += noted.elapsed();
     }
     // Back to the whole of every frame, for the other runs (a state load, a single step)
@@ -1302,10 +1543,20 @@ fn window_frames(
         rounds += 1;
     }
     state.continuous = started && rounds == 1;
-    draw_shown(state, machine);
-    audio.end_frame();
+    if std::mem::take(&mut state.voice_due) {
+        audio.play_voice();
+    }
+    send_then_draw(|| audio.end_frame(), || draw_shown(state, machine));
     state.step_once = false;
     Ok(frames_run)
+}
+
+/// Ends a window frame: the sound of its frames goes to the device (`send`), then its picture is drawn (`draw`).
+/// Drawing may wait for the picture of the window frame before (Latency Smooth); the sound does not wait with it, or
+/// the device's queue runs low while it does.
+fn send_then_draw(send: impl FnOnce(), draw: impl FnOnce()) {
+    send();
+    draw();
 }
 
 /// The Enhanced picture of the frame just run (`--hd-scale`) when the 16:9 view of the frame is
@@ -1318,7 +1569,9 @@ fn fallback_picture(
 ) -> Option<HdFrame> {
     let hd_view = current_hd_view(state.hd_view.as_ref(), machine);
     match enhanced {
-        Some(enhanced) if !verifying && hd_view.is_none() => enhanced.picture(machine),
+        Some(enhanced) if !verifying && hd_view.is_none() => {
+            enhanced.picture(machine, state.ssj_watch.lightning_at(machine.frame_count()))
+        }
         _ => None,
     }
 }
@@ -1758,6 +2011,18 @@ fn open_state(row: usize, state: &mut WindowState, machine: &mut Machine) {
     }
 }
 
+/// The window's pictures read the pack's art on a thread of its own (see [`ssd_hd::Renderer::set_art_async`]): a
+/// picture draws the art read so far, and the threads that draw (the window's, and the one that draws in the
+/// background) never wait for an art file.
+fn read_art_apart(state: &mut WindowState, enhanced: Option<&mut Enhanced>) {
+    if let Some(hd) = state.hd.as_mut() {
+        hd.set_art_async(true);
+    }
+    if let Some(enhanced) = enhanced {
+        enhanced.renderer.set_art_async(true);
+    }
+}
+
 /// Runs the windowed loop: the window, its event loop and the frame loop of [`run_windowed`],
 /// until the player quits.
 /// The Enhanced picture of a run (`--hd-scale`): the renderer that draws it, and whether a frame it
@@ -1766,6 +2031,8 @@ struct Enhanced {
     renderer: ssd_hd::Renderer,
     options: HdOptions,
     refused: bool,
+    /// What the pictures drawn since [`Enhanced::take_cost`] cost.
+    cost: Option<ssd_hd::DrawCost>,
 }
 
 impl Enhanced {
@@ -1773,21 +2040,36 @@ impl Enhanced {
         let mut renderer = ssd_hd::Renderer::new();
         renderer.set_art(hd_art::pack(rom));
         renderer.set_font(hd_art::font(rom));
-        Self { renderer, options, refused: false }
+        renderer.set_lightning(hd_art::lightning());
+        Self { renderer, options, refused: false, cost: None }
+    }
+
+    /// What the pictures drawn since the last call cost, added up; `None` when none was drawn.
+    fn take_cost(&mut self) -> Option<ssd_hd::DrawCost> {
+        self.cost.take()
     }
 
     /// The Enhanced picture of the machine's last frame, or `None` when there is none to draw: the
     /// PPU's render log is switched on when it is off (its frames are logged from then on), and a
-    /// frame the renderer refuses is reported once. The Classic picture is shown instead.
-    fn picture(&mut self, machine: &mut Machine) -> Option<HdFrame> {
+    /// frame the renderer refuses is reported once. The Classic picture is shown instead. `lightning` is the frames since
+    /// Goku's first Super Saiyan transformation started while it goes on ([`crate::voice::SsjWatch::lightning_at`]).
+    fn picture(&mut self, machine: &mut Machine, lightning: Option<u32>) -> Option<HdFrame> {
         if machine.frame_log().is_none() {
             machine.set_line_log(true);
             return None;
         }
-        self.renderer.set_conditions(ssd_hd::Conditions::of_work_ram(machine.wram()));
+        self.renderer.set_conditions(
+            ssd_hd::Conditions::of_work_ram(machine.wram()).with_ssj_lightning(lightning),
+        );
         let log = machine.frame_log()?;
+        let started = Instant::now();
         match self.renderer.render_hd(log, self.options) {
-            Ok(picture) => Some(picture),
+            Ok(picture) => {
+                let drawn =
+                    ssd_hd::DrawCost { total: started.elapsed(), ..self.renderer.art_cost() };
+                self.cost.get_or_insert_default().add(&drawn);
+                Some(picture)
+            }
             Err(reason) => {
                 if !self.refused {
                     log::warn!(
@@ -1827,18 +2109,33 @@ struct Pacer {
     next: Instant,
     /// What a frame cost lately (emulation and the upkeep of its picture), smoothed.
     cost: Duration,
+    /// The Gameplay page's battle speed the window frames run, if they run one ([`battle_tempo_now`]): (frames of the
+    /// game, display refreshes). At speed 1 a frame of the game is then refreshes/frames of a display refresh: 2/3 at
+    /// 1.5x, so 3 frames run to 2 refreshes (1, 1, 2, 1, 2, … a window frame), 1/2 at 2x, so 2 frames run to each
+    /// refresh, each one's sound heard. Set before [`Pacer::frames`] and left for the [`Pacer::wait`] of the same
+    /// window frame.
+    tempo: Option<(u32, u32)>,
 }
 
 impl Pacer {
     fn new(frame_time: Duration) -> Self {
-        Self { frame_time, next: Instant::now(), cost: Duration::from_millis(2) }
+        Self { frame_time, next: Instant::now(), cost: Duration::from_millis(2), tempo: None }
+    }
+
+    /// A frame of the game at speed 1: a display refresh, or refreshes/frames of one at the battle speed (2/3 at 1.5x,
+    /// 1/2 at 2x).
+    fn game_frame_time(&self) -> Duration {
+        match self.tempo {
+            Some((frames, refreshes)) => self.frame_time * refreshes / frames.max(1),
+            None => self.frame_time,
+        }
     }
 
     /// The frames to run in the window frame that starts at `now`, at `speed`.
     fn frames(&self, speed: u32, now: Instant) -> u32 {
         if speed <= 1 {
             let owed = now.saturating_duration_since(self.next).as_secs_f64()
-                / self.frame_time.as_secs_f64();
+                / self.game_frame_time().as_secs_f64();
             return (1 + owed as u32).min(CATCH_UP);
         }
         let period = self.frame_time.as_secs_f64() / f64::from(speed);
@@ -1855,6 +2152,18 @@ impl Pacer {
         }
     }
 
+    /// Moves the start of the next window frame on by the time of the `requested` frames (0: it ran none, one display
+    /// refresh) at `speed`.
+    fn advance(&mut self, speed: u32, requested: u32) {
+        self.next += if requested == 0 {
+            self.frame_time
+        } else if speed <= 1 && self.tempo.is_some() {
+            self.game_frame_time() * requested
+        } else {
+            self.frame_time * requested / speed.max(1)
+        };
+    }
+
     /// Ends a window frame that asked for `requested` frames (0: it ran none) at `speed`: waits for
     /// the next one's time. A verification keeps no pace, and a clock that fell far behind (a window
     /// drag, a breakpoint, a machine too slow) starts over.
@@ -1863,11 +2172,7 @@ impl Pacer {
             self.next = Instant::now();
             return;
         }
-        self.next += if requested == 0 {
-            self.frame_time
-        } else {
-            self.frame_time * requested / speed.max(1)
-        };
+        self.advance(speed, requested);
         let now = Instant::now();
         if self.next > now {
             std::thread::sleep(self.next - now);
@@ -1875,6 +2180,34 @@ impl Pacer {
             self.next = now;
         }
     }
+}
+
+/// Whether the window frame runs the Gameplay page's battle speed: the page has it on in a battle now (`in_battle`,
+/// [`ssd_game::gameplay::battle_tempo`]), the speed is 1 (not the hotkey's fast-forward, nor the animation speed's
+/// attack animation: those run batches whose sound is the first frame's only), and no replay is recorded or played
+/// (the sound chip at another clock changes what the CPU sees of it, so a replay plays only what it was recorded at:
+/// the hardware's ratio).
+fn battle_tempo_now(
+    multiplier: u32,
+    replay_active: bool,
+    battle_tempo: Option<(u32, u32)>,
+) -> Option<(u32, u32)> {
+    battle_tempo.filter(|_| multiplier == 1 && !replay_active)
+}
+
+/// Sets the window frame's battle speed ([`battle_tempo_now`]): the sound chip's clock (the inverse of the tempo with
+/// it, 2/3 at 1.5x and 1/2 at 2x; the hardware's without), the pacer's frame of the game (2/3 or 1/2 of a display
+/// refresh with it) and every frame of a window frame run whole (`WindowState::whole_frames`).
+fn set_battle_tempo(
+    state: &mut WindowState,
+    machine: &mut Machine,
+    pacer: &mut Pacer,
+    tempo: Option<(u32, u32)>,
+) {
+    let (num, den) = tempo.map_or((1, 1), ssd_game::gameplay::tempo_apu);
+    machine.set_apu_clock_ratio(num, den);
+    pacer.tempo = tempo;
+    state.whole_frames = tempo.is_some();
 }
 
 #[allow(clippy::too_many_arguments)]
@@ -1887,6 +2220,7 @@ fn windowed_loop(
     layer: Option<Hd>,
     enhanced: Option<HdOptions>,
     start: Start,
+    debug: bool,
 ) -> anyhow::Result<()> {
     let sdl = sdl3::init()?;
     let video_subsystem = sdl.video()?;
@@ -1896,13 +2230,9 @@ fn windowed_loop(
     if enhanced.is_some() {
         machine.set_line_log(true);
     }
-    let mut state = WindowState::new(Controls::new(
-        mode,
-        HooksSwitch::Allowed,
-        !session.is_active(),
-        !session.is_active(),
-    ));
+    let mut state = window_start_state(mode, session, debug);
     state.hd = layer;
+    read_art_apart(&mut state, enhanced.as_mut());
     state.scaled = enhanced.as_ref().map(|enhanced| enhanced.options);
     (state.video, state.video_saved) = (start.shown, start.saved);
     let settings_file = crate::options::read_settings().unwrap_or_default();
@@ -1934,11 +2264,13 @@ fn windowed_loop(
     refresh_replays(&mut state, &env);
     let mut shown = (state.controls.speed, state.controls.slot);
     let mut video = video::Video::new(&video_subsystem, &window_title(shown.0, shown.1))?;
-    state.touch = Touch::new(
+    state.touch = window_touch(
         touch_on,
         touch::settings::Settings::from_values(&settings_file),
         video.screen_points(),
+        state.controls.debug,
     );
+    state.touch.set_words(crate::lang::interface_text(&settings_file));
     // Set while the touch MENU, not the player, paused the game: only then does Resume unpause.
     let mut touch_paused = false;
     video.set_fullscreen(state.video.fullscreen);
@@ -1954,6 +2286,7 @@ fn windowed_loop(
     audio.set_settings(AudioSettings::from_values(
         &crate::options::read_settings().unwrap_or_default(),
     ));
+    audio.load_voice(&crate::paths::data_dir());
     machine.set_audio_frequency(audio::Audio::frequency());
     let mut events = sdl.event_pump()?;
     // Keyboard keeps working without gamepad support. Opened pads are kept alive here; SDL also
@@ -1976,6 +2309,7 @@ fn windowed_loop(
         language.store(values);
         let values = values.clone();
         hd.follow_language(&values);
+        state.touch.set_words(crate::lang::interface_text(&values));
         if let Err(error) = crate::options::write_settings(&values) {
             log::warn!("the language was not saved: {error:#}");
         }
@@ -1983,6 +2317,7 @@ fn windowed_loop(
     let mut pacer = Pacer::new(Duration::from_secs_f64(1.0 / machine.target_fps()));
     let mut stats_start = pacer.next;
     let mut stats_frames = 0_u32;
+    let mut slow = SlowFrames::new(Instant::now());
     // The Performance Hint session of the window's frames (Android; elsewhere it only keeps its target).
     // (the thread that draws the pictures in the background is one of them: it starts now so the session names it)
     let draw_threads: Vec<i32> =
@@ -1994,6 +2329,8 @@ fn windowed_loop(
     let mut backgrounded = false;
     #[cfg(target_os = "android")]
     let mut setup_hold: Option<Instant> = None;
+    // Paints Esc's question in Classic, which has no HD art (the window needs no picture).
+    let mut plain_art = hd::Art::empty();
     'main: loop {
         // The window frame's work for the Performance Hint session: from here to just before the present.
         let frame_started = Instant::now();
@@ -2064,12 +2401,18 @@ fn windowed_loop(
                             hd.capture(capture);
                         }
                     } else {
+                        // Esc asks before the game ends (see `quit_confirm`); while it asks, the game gets no key.
                         let hotkey = state.bindings.key_hotkey(sc);
-                        match route_key(hotkey, video.text_focus()) {
-                            KeyRoute::Quit => break 'main,
-                            KeyRoute::Action(action) => actions.push(action),
-                            KeyRoute::Game => input.key(&state.bindings, sc, true),
-                            KeyRoute::TextField => {}
+                        let route = route_key(hotkey, video.text_focus());
+                        let press = quit_confirm::key_press(&state.bindings, sc);
+                        match quit_confirm::key(&mut state.quit_confirm, route, press) {
+                            quit_confirm::Step::Quit => break 'main,
+                            quit_confirm::Step::Action(action) => actions.push(action),
+                            quit_confirm::Step::Game => input.key(&state.bindings, sc, true),
+                            quit_confirm::Step::Opened | quit_confirm::Step::Closed => {
+                                input.clear();
+                            }
+                            quit_confirm::Step::Nothing => {}
                         }
                     }
                 }
@@ -2096,6 +2439,13 @@ fn windowed_loop(
                         }
                     } else if let Some(hotkey) = state.bindings.pad_hotkey(button) {
                         actions.extend(PanelAction::from_hotkey(hotkey));
+                    } else if state.quit_confirm.is_some() {
+                        let press = quit_confirm::button_press(&state.bindings, button);
+                        match quit_confirm::key(&mut state.quit_confirm, KeyRoute::Game, press) {
+                            quit_confirm::Step::Quit => break 'main,
+                            quit_confirm::Step::Closed => input.clear(),
+                            _ => {}
+                        }
                     } else {
                         input.gamepad_button(&state.bindings, button, true);
                     }
@@ -2197,8 +2547,12 @@ fn windowed_loop(
         if std::mem::take(&mut state.release_input) {
             input.clear();
         }
-        // The game does not see the keys a text field is typing.
-        let mut pad = if video.text_focus() { Joypad::default() } else { input.joypad() };
+        // The game does not see the keys a text field is typing, nor any while Esc's question is on screen.
+        let mut pad = if video.text_focus() || state.quit_confirm.is_some() {
+            Joypad::default()
+        } else {
+            input.joypad()
+        };
         if state.touch.enabled && state.hd.is_some() {
             // Enhanced: Select + Start held for two seconds opens the touch MENU (the game sees neither while both are held).
             (pad.select, pad.start) = state.touch.chord(Instant::now(), pad.select, pad.start);
@@ -2298,15 +2652,25 @@ fn windowed_loop(
         // of the screen (every frame whole, so the outcome is the original's), on top of the speed of the hotkey.
         let boost = state.hd.as_ref().map_or(1, |hd| hd.driver().animation_factor(machine.wram()));
         let multiplier = speed.multiplier() * boost;
+        // The Gameplay page's battle speed: 3 frames of the game to 2 of the screen at 1.5x, 2 to 1 at 2x, the sound
+        // chip at the inverse of its clock.
+        let tempo = battle_tempo_now(
+            multiplier,
+            session.is_active(),
+            state.hd.as_ref().and_then(|hd| hd.driver().battle_tempo(machine.wram())),
+        );
+        set_battle_tempo(&mut state, machine, &mut pacer, tempo);
         let mut frames_run = 0_u32;
         let mut requested = 0_u32;
-        if env.verify.is_none() && (!state.controls.paused || state.step_once) {
+        let mut stages = Stages::default();
+        if game_runs(&state, env.verify.is_some()) {
             requested = if state.step_once { 1 } else { pacer.frames(multiplier, Instant::now()) };
             state.stages = Stages::default();
             state.real_time = multiplier <= 1;
             frames_run =
                 window_frames(&mut state, machine, session, &env, pad, &mut audio, requested)?;
             pacer.note_cost(frames_run, state.stages.frames());
+            stages = state.stages;
             stats_frames += frames_run;
         } else {
             // Nothing ran: the picture on show is the last frame's, which Latency Smooth may still be drawing
@@ -2342,7 +2706,17 @@ fn windowed_loop(
 
         // While paused this re-presents the last frame (a state load shows up here too). Skipped
         // while minimised, but the loop keeps pacing below so it does not spin the CPU.
-        let status = header_status(machine, &state.history, rate);
+        let (queued_ms, gaps) = audio.health();
+        let live = Live {
+            queued_ms,
+            gaps,
+            tempo: pacer.tempo,
+            requested,
+            run: frames_run,
+            slow: slow.count,
+            slowest_ms: ms(slow.slowest) as f32,
+        };
+        let status = Status { live: Some(live), ..header_status(machine, &state.history, rate) };
         let registers = machine.cpu_registers();
         let controls = state.controls;
         let verify_labels = env.verify.as_ref().map(|run| {
@@ -2365,13 +2739,20 @@ fn windowed_loop(
         // The HD menu on screen, from this frame's state: nothing on the field, nothing in Classic.
         let scene = state.hd.as_ref().and_then(|hd| hd.scene(machine.wram()));
         let overlay = state.hd.as_ref().and_then(|hd| hd.overlay(machine.wram(), machine.sram()));
+        let (scene, overlay) = with_quit_confirm(&state, scene, overlay);
         let history = &state.history;
         let touch_view = state.touch.enabled.then_some(&state.touch);
         let panel = &mut state.panel;
+        let asking = &mut state.quit_confirm;
+        let mut answer = None;
         let mut hd_art = state.hd.as_mut().map(Hd::art);
+        if hd_art.is_none() && asking.is_some() {
+            hd_art = Some(&mut plain_art);
+        }
         let symbols = env.symbols();
         let shown: &Machine = machine;
         perf.report_frame(frame_started.elapsed(), pacer.frame_time);
+        let presenting = Instant::now();
         video.present(&views, &mut ui_input, |ui, games| {
             let view = View {
                 status,
@@ -2386,7 +2767,17 @@ fn windowed_loop(
             };
             let layer = frame_layer(scene.as_ref(), overlay.as_ref(), hd_art.as_deref_mut());
             ui::draw(ui, &view, games, panel, &mut actions, layer);
+            if let Some(question) = asking.as_mut() {
+                answer = ui::quit_confirm_pointer(ui, question);
+            }
         })?;
+        let present = presenting.elapsed();
+        if let Some(outcome) = answer {
+            match quit_confirm::settle(&mut state.quit_confirm, outcome) {
+                quit_confirm::Step::Quit => break 'main,
+                _ => input.clear(),
+            }
+        }
 
         if let Some(kind) = state.shot.take() {
             let result = take_screenshot(
@@ -2415,6 +2806,31 @@ fn windowed_loop(
             log::debug!("{:.2} frames/s", f64::from(stats_frames) / elapsed.as_secs_f64());
             stats_start = Instant::now();
             stats_frames = 0;
+        }
+
+        let picture = match state.hd.as_mut().and_then(Hd::take_draw_cost) {
+            Some((cost, worker)) => {
+                Some((cost, if worker { DrawnOn::Worker } else { DrawnOn::Window }))
+            }
+            None => enhanced
+                .as_mut()
+                .and_then(Enhanced::take_cost)
+                .map(|cost| (cost, DrawnOn::Fallback)),
+        };
+        let cost = FrameCost {
+            total: frame_started.elapsed(),
+            stages,
+            present,
+            requested,
+            run: frames_run,
+            picture,
+        };
+        let now = Instant::now();
+        if let Some(line) = slow.note(&cost, now) {
+            log::warn!("{line}");
+        }
+        if let Some(line) = slow.report(now) {
+            log::info!("{line}");
         }
 
         pacer.wait(multiplier, requested, env.verify.is_some());
@@ -2464,9 +2880,34 @@ fn original_frame(machine: &Machine, stale: bool) -> (u32, u32, Vec<u8>) {
     (frame.size.width, frame.size.height, screenshot::frame_rgba(&frame))
 }
 
+/// The loop state a window run starts with: the controls of `mode` and of `session`, and the debug tools on with
+/// `debug`.
+fn window_start_state(mode: HooksArg, session: &Session, debug: bool) -> WindowState {
+    let mut state = WindowState::new(Controls::new(
+        mode,
+        HooksSwitch::Allowed,
+        !session.is_active(),
+        !session.is_active(),
+    ));
+    state.controls.debug = debug;
+    state
+}
+
+/// The touch controls of a window run; they offer the debug tools' Show FPS only with `debug`.
+fn window_touch(
+    enabled: bool,
+    settings: touch::settings::Settings,
+    screen: egui::Rect,
+    debug: bool,
+) -> Touch {
+    let mut touch = Touch::new(enabled, settings, screen);
+    touch.debug = debug;
+    touch
+}
+
 /// Windowed run: clock-paced at the core's target rate, audio queued to SDL, video via wgpu.
 /// `mode` is the hook mode the machine starts in; `switch` lets the panel change it and run
-/// the replays' checks.
+/// the replays' checks. `debug` turns the debug tools on: the F1 panel, the "F1 debug" pill and the touch Show FPS.
 #[allow(clippy::too_many_arguments)]
 pub fn run_windowed(
     rom: Vec<u8>,
@@ -2477,6 +2918,7 @@ pub fn run_windowed(
     mut session: Session,
     enhanced: Option<HdOptions>,
     start: Start,
+    debug: bool,
 ) -> anyhow::Result<RunStats> {
     enhanced_session(&mut session, ruleset)?;
     let mut layer = hd_layer(&rom, ruleset)?;
@@ -2484,8 +2926,17 @@ pub fn run_windowed(
         hd.set_replaying();
     }
     let mut machine = new_machine(rom.clone(), hooks, &mut session)?;
-    let result =
-        windowed_loop(&mut machine, &rom, &mut session, mode, switch, layer, enhanced, start);
+    let result = windowed_loop(
+        &mut machine,
+        &rom,
+        &mut session,
+        mode,
+        switch,
+        layer,
+        enhanced,
+        start,
+        debug,
+    );
     let result = flush_after(&mut machine, result);
     session.finish(result)?;
     Ok(machine.hook_stats())
@@ -2532,12 +2983,15 @@ fn draw_snapshot(
         !session.is_active(),
         !session.is_active(),
     ));
+    // A UI snapshot pictures the debug panel: the debug tools are on.
+    state.controls.debug = true;
     state.hd = hd_layer(rom, ruleset)?;
     state.touch = Touch::new(
         request.touch,
         touch::settings::Settings::default(),
         egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(width as f32, height as f32)),
     );
+    state.touch.debug = true;
     if let Some(hd) = state.hd.as_mut().filter(|_| session.is_playing()) {
         hd.set_replaying();
     }
@@ -2574,7 +3028,8 @@ fn draw_snapshot(
 
     let hd_view = current_hd_view(state.hd_view.as_ref(), machine);
     let picture = match request.enhanced {
-        Some(options) if hd_view.is_none() => Enhanced::new(options, rom).picture(machine),
+        Some(options) if hd_view.is_none() => Enhanced::new(options, rom)
+            .picture(machine, state.ssj_watch.lightning_at(machine.frame_count())),
         _ => None,
     };
     let shown_picture = hd_view.map(|view| &view.picture.picture).or(picture.as_ref());
@@ -2592,7 +3047,13 @@ fn draw_snapshot(
     let mut actions = Vec::new();
     let scene = state.hd.as_ref().and_then(|hd| hd.scene(machine.wram()));
     let overlay = state.hd.as_ref().and_then(|hd| hd.overlay(machine.wram(), machine.sram()));
+    let (scene, overlay) = with_quit_confirm(&state, scene, overlay);
+    let mut plain_art = hd::Art::empty();
+    let asking = state.quit_confirm.is_some();
     let mut hd_art = state.hd.as_mut().map(Hd::art);
+    if hd_art.is_none() && asking {
+        hd_art = Some(&mut plain_art);
+    }
     let view = View {
         status,
         controls: &controls,
@@ -2663,6 +3124,13 @@ fn run_script_line(
         Command::Mode { routine, mode } => {
             let key = routine_key(routine, env.symbols())?;
             act(PanelAction::SetRoutineMode { key, mode: *mode }, state, machine, session, env);
+        }
+        Command::Quit(press) => {
+            let route = if press.is_some() { KeyRoute::Game } else { KeyRoute::Quit };
+            if quit_confirm::key(&mut state.quit_confirm, route, *press) == quit_confirm::Step::Quit
+            {
+                log::info!("UI script, line {}: Yes would end the run here", line.number);
+            }
         }
         Command::Touch(text) => {
             anyhow::ensure!(state.touch.enabled, "touch lines need --touch-ui");
@@ -2829,6 +3297,56 @@ mod tests {
     use ssd_oracle::{FrameStats, FsSaveStore, MemorySaveStore};
 
     #[test]
+    fn no_frame_runs_while_esc_asks_and_the_game_goes_on_once_it_closes() {
+        let controls = Controls::new(HooksArg::Original, HooksSwitch::Allowed, true, true);
+        let mut state = WindowState::new(controls);
+        assert!(game_runs(&state, false));
+        assert!(!game_runs(&state, true), "a verification paces itself");
+        state.quit_confirm = Some(QuitConfirm::default());
+        assert!(!game_runs(&state, false), "held while it asks");
+        state.step_once = true;
+        assert!(!game_runs(&state, false), "not even a step");
+        state.quit_confirm = None;
+        assert!(game_runs(&state, false), "closed, it goes on");
+        state.step_once = false;
+        state.controls.paused = true;
+        assert!(!game_runs(&state, false), "the pause is the player's own");
+    }
+
+    #[test]
+    fn esc_s_question_is_drawn_over_the_menu_or_the_field_and_only_while_it_asks() {
+        let controls = Controls::new(HooksArg::Original, HooksSwitch::Allowed, true, true);
+        let mut state = WindowState::new(controls);
+        let menu = || {
+            let mut list = ssd_menus::DrawList::new();
+            list.text(
+                1.0,
+                1.0,
+                "Menu",
+                30.0,
+                ssd_menus::layout::palette::BLACK,
+                ssd_menus::Align::Left,
+            );
+            list
+        };
+        assert_eq!(with_quit_confirm(&state, None, None), (None, None), "closed: nothing");
+        assert_eq!(with_quit_confirm(&state, Some(menu()), None), (Some(menu()), None));
+        state.quit_confirm = Some(QuitConfirm::default());
+        // Classic (no HD): a list of its own over the field, in English.
+        let (scene, overlay) = with_quit_confirm(&state, None, None);
+        assert!(scene.is_none());
+        let texts: Vec<String> =
+            overlay.expect("an overlay").texts().map(|(_, _, text)| text.to_owned()).collect();
+        assert_eq!(texts, ["Quit the game?", "No", "Yes"]);
+        // Over a menu: on top of it, the menu kept.
+        let (scene, overlay) = with_quit_confirm(&state, Some(menu()), None);
+        assert!(overlay.is_none());
+        let texts: Vec<String> =
+            scene.expect("the menu").texts().map(|(_, _, text)| text.to_owned()).collect();
+        assert_eq!(texts, ["Menu", "Quit the game?", "No", "Yes"]);
+    }
+
+    #[test]
     fn a_change_of_the_page_reaches_the_picture_and_the_window_but_a_flag_keeps_its_choice() {
         let controls = Controls::new(HooksArg::Original, HooksSwitch::Allowed, true, true);
         let mut state = WindowState::new(controls);
@@ -2921,6 +3439,19 @@ mod tests {
         assert!(format!("{error:#}").contains("disk full"), "{error:#}");
         let error = flush_after(&mut machine, Err::<(), _>(anyhow::anyhow!("boom"))).unwrap_err();
         assert_eq!(error.to_string(), "boom");
+    }
+
+    #[test]
+    fn a_window_run_has_the_debug_tools_it_is_started_with() {
+        let session = Session::default();
+        for debug in [false, true] {
+            let state = window_start_state(HooksArg::Original, &session, debug);
+            assert_eq!(state.controls.debug, debug, "the controls");
+            assert!(state.controls.load_allowed && state.controls.freezes_allowed);
+            let screen = egui::Rect::from_min_size(egui::Pos2::ZERO, egui::vec2(932.0, 430.0));
+            let touch = window_touch(true, touch::settings::Settings::default(), screen, debug);
+            assert_eq!(touch.debug, debug, "the touch controls");
+        }
     }
 
     fn window_state(hooks_switch: HooksSwitch) -> WindowState {
@@ -3152,6 +3683,9 @@ mod tests {
         assert!(state.controls.paused && state.step_once);
 
         act(&mut state, &mut machine, PanelAction::TogglePanel);
+        assert!(!state.panel.open, "no panel without the debug tools");
+        state.controls.debug = true;
+        act(&mut state, &mut machine, PanelAction::TogglePanel);
         assert!(state.panel.open);
 
         act(&mut state, &mut machine, PanelAction::SetHooks(HooksArg::Rust));
@@ -3295,6 +3829,206 @@ mod tests {
         assert_eq!(pacer.frames(8, start + Duration::from_secs(10)), MAX_BATCH);
     }
 
+    /// The game frames a pacer of the game's `frame` runs at speed 1 in `time` on a vsync screen of `refresh` a
+    /// refresh with a machine that keeps up (a window frame starts at the first refresh after the last one's and after
+    /// the pacer's next start), and the most a window frame ran.
+    fn paced(
+        tempo: Option<(u32, u32)>,
+        frame: Duration,
+        refresh: Duration,
+        time: Duration,
+    ) -> (u32, u32) {
+        let mut pacer = Pacer::new(frame);
+        pacer.tempo = tempo;
+        let start = pacer.next;
+        let (mut now, mut total, mut most) = (start, 0, 0);
+        while now < start + time {
+            let requested = pacer.frames(1, now);
+            pacer.advance(1, requested);
+            total += requested;
+            most = most.max(requested);
+            let earliest = (now + refresh).max(pacer.next) - start;
+            let refreshes = earliest.as_nanos().div_ceil(refresh.as_nanos());
+            now = start + refresh * u32::try_from(refreshes).unwrap();
+        }
+        (total, most)
+    }
+
+    #[test]
+    fn the_battle_speed_runs_three_frames_of_the_game_to_two_refreshes() {
+        let frame = Duration::from_secs_f64(1.0 / 60.0988);
+        let ten = Duration::from_secs(10);
+        // 10 s on a screen of the game's refresh (601 refreshes): 901 frames of the game, one or two a window frame.
+        let tempo = Some(ssd_game::gameplay::BATTLE_TEMPO);
+        let (frames, most) = paced(tempo, frame, frame, ten);
+        assert!((900..=902).contains(&frames), "{frames} frames in 10 s");
+        assert_eq!(most, 2, "never more than two frames in a window frame");
+        // Off: a frame a refresh, as ever.
+        assert_eq!(paced(None, frame, frame, ten), (601, 1));
+        // A 120 Hz screen: the same frames of the game, never two in a window frame.
+        let (frames, most) = paced(tempo, frame, frame / 2, ten);
+        assert!((900..=902).contains(&frames) && most == 1, "{frames} frames, {most} at most");
+        assert_eq!(paced(None, frame, frame / 2, ten), (601, 1));
+    }
+
+    #[test]
+    fn the_battle_speed_2x_runs_two_frames_of_the_game_to_each_refresh() {
+        let frame = Duration::from_secs_f64(1.0 / 60.0988);
+        let ten = Duration::from_secs(10);
+        let tempo = Some(ssd_game::gameplay::BATTLE_TEMPO_2X);
+        // 10 s on a screen of the game's refresh (601 refreshes): 1202 frames of the game, two every window frame.
+        let (frames, most) = paced(tempo, frame, frame, ten);
+        assert!((1201..=1203).contains(&frames), "{frames} frames in 10 s");
+        assert_eq!(most, 2, "never more than two frames in a window frame");
+        // A 120 Hz screen: the same frames of the game, one a window frame.
+        let (frames, most) = paced(tempo, frame, frame / 2, ten);
+        assert!((1201..=1203).contains(&frames) && most == 1, "{frames} frames, {most} at most");
+        // The pacer's frame of the game is half a refresh
+        let mut pacer = Pacer::new(frame);
+        pacer.tempo = tempo;
+        assert_eq!(pacer.game_frame_time(), frame / 2);
+        pacer.tempo = Some(ssd_game::gameplay::BATTLE_TEMPO);
+        assert_eq!(pacer.game_frame_time(), frame * 2 / 3);
+    }
+
+    #[test]
+    fn the_battle_speed_gives_a_frame_two_thirds_of_the_sound_and_off_gives_it_back() {
+        struct Count(u64);
+        impl AudioSink for Count {
+            fn push(&mut self, _left: f32, _right: f32) {
+                self.0 += 1;
+            }
+        }
+        let (mut machine, _) = sram_counter_machine();
+        let mut pacer = Pacer::new(Duration::from_millis(16));
+        let mut state = window_state(HooksSwitch::Allowed);
+        let samples = |machine: &mut Machine| {
+            let mut count = Count(0);
+            for _ in 0..300 {
+                machine.run_frame(Joypad::default(), &mut count).unwrap();
+            }
+            count.0
+        };
+        samples(&mut machine); // the resampler's start
+        let before = samples(&mut machine);
+        set_battle_tempo(&mut state, &mut machine, &mut pacer, Some((3, 2)));
+        assert_eq!(machine.apu_clock_ratio(), (2, 3));
+        assert!(pacer.tempo == Some((3, 2)) && state.whole_frames);
+        let tempo = samples(&mut machine);
+        set_battle_tempo(&mut state, &mut machine, &mut pacer, None);
+        assert_eq!(machine.apu_clock_ratio(), (1, 1));
+        assert!(pacer.tempo.is_none() && !state.whole_frames);
+        let after = samples(&mut machine);
+        set_battle_tempo(&mut state, &mut machine, &mut pacer, Some((2, 1)));
+        assert_eq!(machine.apu_clock_ratio(), (1, 2));
+        assert!(pacer.tempo == Some((2, 1)) && state.whole_frames);
+        let double = samples(&mut machine);
+        set_battle_tempo(&mut state, &mut machine, &mut pacer, None);
+        let again = samples(&mut machine);
+        assert!(before > 200 * 300, "the sound of 300 frames: {before}");
+        assert!(
+            tempo * 3 / 2 >= before - 3 && tempo * 3 / 2 <= before + 3,
+            "2/3: {tempo} of {before}"
+        );
+        assert!(after.abs_diff(before) <= 2, "back to all of it: {after} of {before}");
+        assert!(double * 2 >= before - 3 && double * 2 <= before + 3, "1/2: {double} of {before}");
+        assert!(again.abs_diff(before) <= 2, "back to all of it after 2x: {again} of {before}");
+    }
+
+    /// A window frame of `total` ms whose picture came back from the background, with made-up stages.
+    fn slow_cost(total: u64) -> FrameCost {
+        let ms = Duration::from_millis;
+        let picture = ssd_hd::DrawCost {
+            total: ms(290),
+            begin_bg: ms(2),
+            find_poses: ms(3),
+            draw: ms(20),
+            art_compose: ms(5),
+            loads: ms(250),
+            requests: 9,
+            bg_loads: 2,
+            pictures: 1,
+            objects: 3,
+            variants: 1,
+            planes: 0,
+            load_bytes: 123_456,
+            bg_slots: 4,
+            plane: true,
+            poses: 6,
+            bg_evicted: 1,
+        };
+        FrameCost {
+            total: ms(total),
+            stages: Stages { driver: ms(1), emulate: ms(4), history: ms(0), hd: ms(295) },
+            present: ms(8),
+            requested: 2,
+            run: 2,
+            picture: Some((picture, DrawnOn::Worker)),
+        }
+    }
+
+    #[test]
+    fn a_window_frame_over_100_ms_is_logged_with_its_stages_and_one_under_is_not() {
+        assert_eq!(
+            slow_frame_line(&slow_cost(312)).as_deref(),
+            Some(
+                "slow window frame: 312.0 ms (emulate 4.0, driver 1.0, history 0.0, hd 295.0, present 8.0, other \
+                 4.0 ms; 2/2 frames); picture drawn in the background: 290.0 ms (begin_bg 2.0, find_poses 3.0, draw 20.0, art \
+                 5.0 ms; loads 250.0 ms: requests 9, received 7: 2 bg, 1 pictures, 3 objects, 1 variants, 0 planes, \
+                 123456 bytes); 4 bg slots (one the Mode 7 plane), 6 poses, bg art evicted 1"
+            )
+        );
+        assert_eq!(slow_frame_line(&slow_cost(50)), None, "50 ms is not slow");
+        assert_eq!(slow_frame_line(&slow_cost(100)), None, "100 ms is not slow either");
+        let bare = FrameCost { picture: None, ..slow_cost(150) };
+        assert!(slow_frame_line(&bare).unwrap().ends_with("; no picture drawn"));
+    }
+
+    #[test]
+    fn slow_window_frames_are_logged_two_a_second_and_summed_up_every_5_seconds() {
+        let start = Instant::now();
+        let mut slow = SlowFrames::new(start);
+        let at = |ms: u64| start + Duration::from_millis(ms);
+        let logged: Vec<bool> = [100, 200, 300, 400, 1150, 1200]
+            .into_iter()
+            .map(|t| slow.note(&slow_cost(150 + t / 100), at(t)).is_some())
+            .collect();
+        assert_eq!(logged, [true, true, false, false, true, true], "two a second");
+        assert!(slow.note(&slow_cost(40), at(1300)).is_none(), "a quick one is not counted");
+        assert_eq!((slow.count, slow.slowest), (6, Duration::from_millis(162)));
+        assert_eq!(slow.report(at(4000)), None, "not 5 s yet");
+        assert_eq!(
+            slow.report(at(5000)).as_deref(),
+            Some(
+                "slow window frames: 6 over 100 ms in 5.0 s, the slowest 162.0 ms; the background art evicted 7 \
+                 layers"
+            )
+        );
+        assert_eq!(slow.recent, 0, "the next summary starts over");
+        assert_eq!(slow.count, 6, "the pill's count goes on");
+    }
+
+    #[test]
+    fn a_window_frame_sends_its_sound_before_it_draws_its_picture() {
+        let order = std::cell::RefCell::new(Vec::new());
+        send_then_draw(|| order.borrow_mut().push("send"), || order.borrow_mut().push("draw"));
+        assert_eq!(order.into_inner(), ["send", "draw"], "the sound does not wait for the drawing");
+    }
+
+    #[test]
+    fn the_battle_speed_runs_at_speed_1_without_a_replay_only() {
+        for tempo in [(3, 2), (2, 1)] {
+            assert_eq!(battle_tempo_now(1, false, Some(tempo)), Some(tempo));
+            assert_eq!(
+                battle_tempo_now(2, false, Some(tempo)),
+                None,
+                "the hotkey's speed or the animation speed"
+            );
+            assert_eq!(battle_tempo_now(1, true, Some(tempo)), None, "a replay recorded or played");
+        }
+        assert_eq!(battle_tempo_now(1, false, None), None, "off, or not in a battle");
+    }
+
     #[test]
     fn the_pacer_smooths_what_a_frame_costs_and_starts_over_when_far_behind() {
         let mut pacer = Pacer::new(Duration::from_millis(16));
@@ -3315,6 +4049,210 @@ mod tests {
     fn window_title_shows_speed_and_slot() {
         let title = window_title(Speed::default().next(), 3);
         assert_eq!(title, format!("{} — ×2 — slot 3", crate::TITLE));
+    }
+
+    #[test]
+    fn the_frame_goku_first_starts_to_transform_calls_for_the_voice() {
+        let (mut machine, _store) = sram_counter_machine();
+        let mut state = window_state(HooksSwitch::Allowed);
+        let mut session = Session::default();
+        let mut audio = NullAudio;
+        // Goku in the third record of the party (flags $C0, unit id at +$01, level 47 at +$02, character id 0 at +$1C)
+        // (work RAM starts seeded: the nine records are cleared first), in the Frieza fight 03:8683 builds the Super
+        // Saiyan in (group $56 at $0EA3, $01BB 0 below the party size 3 at $0D9A), in phase $1A (battle_phase, $AB)
+        machine.write_wram(0x7E_0B00, &[0; 9 * 0x20]).unwrap();
+        let goku = 0x7E_0B00 + 2 * 0x20;
+        machine.write_wram(0x7E_0EA3, &[0x56]).unwrap();
+        machine.write_wram(0x7E_01BB, &[0]).unwrap();
+        machine.write_wram(0x7E_0D9A, &[3]).unwrap();
+        machine.write_wram(0x7E_00AB, &[0x1A]).unwrap();
+        // Each frame: Goku's unit id, and side A's +$26 ($5F: the script command 05:D943 started the flashing)
+        let mut frame_with =
+            |machine: &mut Machine, state: &mut WindowState, unit: u8, side_a_26: u8| {
+                machine.write_wram(goku, &[0xC0, unit, 47]).unwrap();
+                machine.write_wram(0x7E_1426, &[side_a_26]).unwrap();
+                run_frames(state, machine, &mut session, None, Joypad::default(), &mut audio, 1)
+                    .unwrap();
+                std::mem::take(&mut state.voice_due)
+            };
+        assert!(
+            !frame_with(&mut machine, &mut state, 0x3A, 0x70),
+            "the first frame only notes Goku"
+        );
+        assert!(
+            !frame_with(&mut machine, &mut state, 0x3A, 0x70),
+            "Goku's words before the flashing"
+        );
+        assert!(
+            frame_with(&mut machine, &mut state, 0x3A, 0x5F),
+            "the flashing starts: Goku shouts"
+        );
+        assert!(!frame_with(&mut machine, &mut state, 0x3A, 0x5F));
+        assert!(
+            !frame_with(&mut machine, &mut state, 0x3B, 0x5F),
+            "not again when he is built a Super Saiyan"
+        );
+        assert!(!frame_with(&mut machine, &mut state, 0x00, 0x70));
+        assert!(!frame_with(&mut machine, &mut state, 0x00, 0x5F), "once in a run");
+    }
+
+    #[test]
+    fn the_lightning_follows_the_transformation_and_a_state_loaded_stops_it_before_a_frame_runs() {
+        let (mut machine, _store) = sram_counter_machine();
+        let mut state = window_state(HooksSwitch::Allowed);
+        let mut session = Session::default();
+        let mut audio = NullAudio;
+        // The work RAM of the voice's test above: Goku (record 3, level 47) in the Frieza fight, in phase $1A
+        machine.write_wram(0x7E_0B00, &[0; 9 * 0x20]).unwrap();
+        let goku = 0x7E_0B00 + 2 * 0x20;
+        machine.write_wram(0x7E_0EA3, &[0x56]).unwrap();
+        machine.write_wram(0x7E_01BB, &[0]).unwrap();
+        machine.write_wram(0x7E_0D9A, &[3]).unwrap();
+        machine.write_wram(0x7E_00AB, &[0x1A]).unwrap();
+        let mut frame_with =
+            |machine: &mut Machine, state: &mut WindowState, unit: u8, side_a_26: u8| {
+                machine.write_wram(goku, &[0xC0, unit, 47]).unwrap();
+                machine.write_wram(0x7E_1426, &[side_a_26]).unwrap();
+                run_frames(state, machine, &mut session, None, Joypad::default(), &mut audio, 1)
+                    .unwrap();
+                state.ssj_watch.lightning_at(machine.frame_count())
+            };
+        assert_eq!(frame_with(&mut machine, &mut state, 0x3A, 0x70), None);
+        let before = machine.save_state();
+        assert_eq!(frame_with(&mut machine, &mut state, 0x3A, 0x70), None, "Goku's words");
+        assert_eq!(
+            frame_with(&mut machine, &mut state, 0x3A, 0x5F),
+            Some(0),
+            "the flashing starts"
+        );
+        assert_eq!(frame_with(&mut machine, &mut state, 0x3A, 0x5F), Some(1));
+        assert_eq!(frame_with(&mut machine, &mut state, 0x3A, 0x5F), Some(2));
+        // A state of before the transformation loaded: none at once, before a frame runs
+        machine.load_state(&before).unwrap();
+        assert_eq!(state.ssj_watch.lightning_at(machine.frame_count()), None, "the state loaded");
+        assert_eq!(frame_with(&mut machine, &mut state, 0x3A, 0x70), None);
+        assert_eq!(
+            frame_with(&mut machine, &mut state, 0x3A, 0x5F),
+            Some(0),
+            "the transformation again"
+        );
+        assert_eq!(
+            frame_with(&mut machine, &mut state, 0x3B, 0x5F),
+            None,
+            "built a Super Saiyan: over"
+        );
+    }
+
+    /// The frame the transformation's flashing starts in `secret-ssj-frieza.ssdreplay` (the frame index of the run, the
+    /// frame count before it): the script command `05:D943` sets side A's `+$26` to `$5F` in it, and the next frame's
+    /// picture is the first of the flashing backdrop. Goku's unit id becomes `$3B` (`03:85F0`) at frame 6464, 342
+    /// frames (5.7 s) later; phase `$1A` starts at 5998, with Goku's words ("No... it can't be... Krillin...").
+    const FRIEZA_REPLAY_FLASHING: u64 = 6122;
+    const FRIEZA_REPLAY_BUILT: u64 = 6464;
+
+    #[test]
+    #[ignore = "needs SSD_ROM_PATH and SSD_REPLAY_DIR (the secret battles of the regression inputs)"]
+    fn the_voice_starts_the_frame_the_flashing_of_the_transformation_starts_in_the_replays() {
+        struct Silent;
+        impl ssd_oracle::AudioSink for Silent {
+            fn push(&mut self, _: f32, _: f32) {}
+        }
+        let bytes = std::fs::read(std::env::var("SSD_ROM_PATH").unwrap()).unwrap();
+        let rom = ssd_rom::normalize(&bytes, None).unwrap().bytes;
+        let dir = std::path::PathBuf::from(std::env::var("SSD_REPLAY_DIR").unwrap());
+        let mut paths: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| path.extension().is_some_and(|ext| ext == "ssdreplay"))
+            .collect();
+        paths.sort();
+        let mut frieza = None;
+        for path in &paths {
+            let bytes = std::fs::read(path).unwrap();
+            let (_, bytes) = ssd_oracle::Replay::rebase(&bytes, ssd_oracle::CORE_VERSION).unwrap();
+            let replay = ssd_oracle::Replay::from_bytes(
+                &bytes,
+                ssd_rom::crc32(&rom),
+                ssd_oracle::CORE_VERSION,
+            )
+            .unwrap();
+            let mut machine = replay.power_on(rom.clone()).unwrap();
+            let mut watch = crate::voice::SsjWatch::default();
+            // The frames the watch fires at, and the frames Goku's unit id goes from a form before to $3B
+            let (mut fired, mut built) = (Vec::new(), Vec::new());
+            let mut unit = None;
+            while machine.frame_count() < replay.frames() {
+                let frame = machine.frame_count();
+                ssd_oracle::apply_events(&mut machine, replay.events_at(frame)).unwrap();
+                machine.run_frame_with(&mut |f| replay.input(f), &mut Silent).unwrap();
+                let goku = crate::voice::goku(machine.wram());
+                if watch.observe(machine.frame_count(), goku) {
+                    fired.push(frame);
+                }
+                if unit.is_some_and(|u| [0x00, 0x39, 0x3A].contains(&u)) && goku.unit == Some(0x3B)
+                {
+                    built.push(frame);
+                }
+                unit = goku.unit;
+            }
+            let name = path.file_stem().unwrap().to_string_lossy();
+            eprintln!("{name}: the voice at {fired:?}, Goku built a Super Saiyan at {built:?}");
+            assert_eq!(
+                fired.len(),
+                built.len().min(1),
+                "{name}: the voice once, with a transformation only"
+            );
+            if let (Some(&voice), Some(&made)) = (fired.first(), built.first()) {
+                assert!(voice < made, "{name}: the voice before the end of the transformation");
+            }
+            if name == "secret-ssj-frieza" {
+                frieza = Some((fired, built));
+            }
+        }
+        let (fired, built) = frieza.expect("secret-ssj-frieza.ssdreplay in SSD_REPLAY_DIR");
+        assert_eq!(fired, [FRIEZA_REPLAY_FLASHING], "the voice starts with the flashing");
+        assert_eq!(built, [FRIEZA_REPLAY_BUILT], "Goku's unit id becomes $3B at the end");
+    }
+
+    /// The lightning of `secret-ssj-frieza.ssdreplay`: on from the frame the voice starts at to the last frame before
+    /// Goku's unit id becomes `$3B`, every frame of it, counted from 0, and on no other frame.
+    #[test]
+    #[ignore = "needs SSD_ROM_PATH and SSD_REPLAY_DIR (the secret battles of the regression inputs)"]
+    fn the_lightning_lasts_the_whole_transformation_in_the_frieza_replay() {
+        struct Silent;
+        impl ssd_oracle::AudioSink for Silent {
+            fn push(&mut self, _: f32, _: f32) {}
+        }
+        let bytes = std::fs::read(std::env::var("SSD_ROM_PATH").unwrap()).unwrap();
+        let rom = ssd_rom::normalize(&bytes, None).unwrap().bytes;
+        let path = std::path::PathBuf::from(std::env::var("SSD_REPLAY_DIR").unwrap())
+            .join("secret-ssj-frieza.ssdreplay");
+        let bytes = std::fs::read(path).unwrap();
+        let (_, bytes) = ssd_oracle::Replay::rebase(&bytes, ssd_oracle::CORE_VERSION).unwrap();
+        let replay =
+            ssd_oracle::Replay::from_bytes(&bytes, ssd_rom::crc32(&rom), ssd_oracle::CORE_VERSION)
+                .unwrap();
+        let mut machine = replay.power_on(rom).unwrap();
+        let mut watch = crate::voice::SsjWatch::default();
+        // (the frame index of the run, the lightning's count) of every frame it is on
+        let mut lit = Vec::new();
+        while machine.frame_count() < replay.frames() {
+            let frame = machine.frame_count();
+            ssd_oracle::apply_events(&mut machine, replay.events_at(frame)).unwrap();
+            machine.run_frame_with(&mut |f| replay.input(f), &mut Silent).unwrap();
+            watch.observe(machine.frame_count(), crate::voice::goku(machine.wram()));
+            if let Some(count) = watch.lightning_at(machine.frame_count()) {
+                lit.push((frame, count));
+            }
+        }
+        eprintln!("the lightning: {:?} .. {:?}, {} frames", lit.first(), lit.last(), lit.len());
+        let expected: Vec<(u64, u32)> = (FRIEZA_REPLAY_FLASHING..FRIEZA_REPLAY_BUILT)
+            .map(|frame| (frame, (frame - FRIEZA_REPLAY_FLASHING) as u32))
+            .collect();
+        assert_eq!(
+            lit, expected,
+            "every frame of the transformation, from the voice's to the one before $3B"
+        );
     }
 
     #[test]
@@ -3574,6 +4512,370 @@ mod tests {
         assert_eq!(smooth[0], reference[0]);
         for (n, picture) in smooth.iter().enumerate().skip(1) {
             assert_eq!(*picture, reference[n - 1], "window frame {n} shows the frame before it");
+        }
+        // SAFETY: serialised by ENV_LOCK.
+        unsafe { std::env::remove_var("SSD_DATA_DIR") };
+    }
+
+    /// One run of the reference battle's script on the window's own frame path with the real game (Enhanced mode, the
+    /// sound chip at 1/1, so every run is the same game frame for frame): with `tempo`, in battle, the window frames
+    /// run as the pacer gives them at 1.5 times (1, 2, 1, 2, … frames a window frame).
+    struct BattleRun {
+        /// The pictures on show by the frame they are of.
+        shown: std::collections::BTreeMap<u64, u32>,
+        /// The picture on show after each window frame: the frame the machine is at, the last frame of the window
+        /// frame before, and the picture's CRC.
+        windows: Vec<(u64, u64, u32)>,
+        /// The window frames of two in the battle.
+        pairs: u32,
+        /// Those of them that drew more than one picture (new serials of `ssd_hd::world::next_serial`).
+        pairs_drawn_twice: u32,
+        /// Each window frame in the battle: what it took (ms), the frames it ran, their emulation and the 16:9 view's
+        /// share of it (ms, `Stages`), and the pictures it drew.
+        costs: Vec<(f64, u32, f64, f64, u64)>,
+        wram: Vec<u8>,
+    }
+
+    /// A run of the window's frame path for test (c) of the art read apart: the art files read by the threads that
+    /// draw, the slowest window frame (ms), and the frames run in battle.
+    struct ArtRun {
+        loads_on_draw: u64,
+        slowest: f64,
+        battle_frames: u32,
+        wram: Vec<u8>,
+    }
+
+    /// `frames` frames of the real game on the window's frame path at 4x with the pack's art, the joypad `input` of
+    /// each frame: the art read in the pictures, or (`apart`) as `windowed_loop` sets it (`read_art_apart`), with
+    /// Smooth (`smooth`: the background thread draws) or not (the window's thread draws).
+    fn art_run(
+        rom: &[u8],
+        frames: u64,
+        input: fn(u64) -> Joypad,
+        apart: bool,
+        smooth: bool,
+    ) -> ArtRun {
+        let env = Env { rom, switch: None, verify: None };
+        let mut audio = audio::Audio::muted();
+        let mut session = Session::default();
+        let mut machine = new_machine(rom.to_vec(), None, &mut session).unwrap();
+        let mut state = window_state(HooksSwitch::Allowed);
+        state.hd = hd_layer(rom, Ruleset::enhanced()).unwrap();
+        state.scaled = Some(HdOptions { scale: 4, look: ssd_hd::Look::Crisp });
+        state.real_time = true;
+        state.video.smooth = smooth;
+        if apart {
+            read_art_apart(&mut state, None);
+        }
+        machine.set_line_log(true);
+        let mut previous = Joypad::default();
+        let before = ssd_hd::art_loads_on_draw();
+        let (mut slowest, mut battle_frames) = (0.0_f64, 0);
+        while machine.frame_count() < frames {
+            let pad = input(machine.frame_count());
+            let started = Instant::now();
+            window_step(
+                &mut state,
+                &mut machine,
+                &mut session,
+                &env,
+                &mut audio,
+                1,
+                pad,
+                &mut previous,
+            );
+            slowest = slowest.max(started.elapsed().as_secs_f64() * 1000.0);
+            battle_frames += u32::from(ssd_game::gameplay::in_battle(machine.wram()));
+        }
+        if let Some(hd) = state.hd.as_mut() {
+            hd.finish_drawing();
+        }
+        let loads_on_draw = ssd_hd::art_loads_on_draw() - before;
+        ArtRun { loads_on_draw, slowest, battle_frames, wram: machine.wram().to_vec() }
+    }
+
+    /// The title's Continue with the battery save of the saves folder: Start, Right (Continue), Start, A on the first
+    /// slot, A on Yes; then the saved game runs, A pressed every 64 frames.
+    fn continue_input(frame: u64) -> Joypad {
+        let at = |start: u64| (start..start + 4).contains(&frame);
+        Joypad {
+            start: at(2400) || at(2540),
+            right: at(2480),
+            a: at(2700) || at(2860) || (frame >= 3200 && frame % 64 < 4),
+            ..Joypad::default()
+        }
+    }
+
+    /// The art read apart on the window's frame path with the real game and the shared pack at 4x: through the
+    /// reference battle's script (the title, a new game, the field, the flight and a battle) and a Continue of a battery
+    /// save, the threads that draw read no art file, with Smooth off (the window's thread draws) and on (the background
+    /// thread draws), where the same runs reading the art in the pictures read it there. Each run's slowest window
+    /// frame is printed. Needs `SSD_ROM_PATH`, `SSD_HD_CACHE` (a data folder's `cache` with the pack installed for the
+    /// ROM) and `SSD_BATTERY_SAVE` (a battery save with a game in its first slot).
+    #[test]
+    #[ignore = "needs SSD_ROM_PATH, SSD_HD_CACHE and SSD_BATTERY_SAVE"]
+    fn the_threads_that_draw_read_no_art_in_a_battle_and_a_continue_when_it_is_read_apart() {
+        let _guard = paths::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        let cache = std::env::var_os("SSD_HD_CACHE").expect("SSD_HD_CACHE");
+        #[cfg(unix)]
+        std::os::unix::fs::symlink(&cache, dir.path().join("cache")).unwrap();
+        #[cfg(windows)]
+        std::os::windows::fs::symlink_dir(&cache, dir.path().join("cache")).unwrap();
+        // SAFETY: serialised by ENV_LOCK.
+        unsafe { std::env::set_var("SSD_DATA_DIR", dir.path()) };
+        let rom = std::fs::read(std::env::var("SSD_ROM_PATH").expect("SSD_ROM_PATH")).unwrap();
+        assert!(hd_art::pack(&rom).is_some(), "the pack is installed for the ROM");
+        let report = |name: &str, run: &ArtRun| {
+            eprintln!(
+                "{name}: {} art files read by the threads that draw, slowest window frame {:.1} ms, {} frames in battle",
+                run.loads_on_draw, run.slowest, run.battle_frames
+            );
+        };
+        let battle = ssd_game::scripts::BATTLE_FRAMES;
+        let input = ssd_game::scripts::battle_input;
+        let in_pictures = art_run(&rom, battle, input, false, false);
+        report("battle, read in the pictures", &in_pictures);
+        assert!(in_pictures.loads_on_draw > 0 && in_pictures.battle_frames > 0);
+        for smooth in [false, true] {
+            let apart = art_run(&rom, battle, input, true, smooth);
+            report(&format!("battle, read apart, Smooth {smooth}"), &apart);
+            assert_eq!(apart.loads_on_draw, 0, "Smooth {smooth}");
+            assert_eq!(apart.wram, in_pictures.wram, "the game is the same");
+        }
+        // The Continue of the battery save
+        let save =
+            std::fs::read(std::env::var("SSD_BATTERY_SAVE").expect("SSD_BATTERY_SAVE")).unwrap();
+        std::fs::create_dir_all(paths::saves_dir()).unwrap();
+        let frames = 4_800;
+        let new_game = art_run(&rom, frames, continue_input, false, false).wram;
+        std::fs::write(paths::saves_dir().join("ssd.sav"), save).unwrap();
+        let in_pictures = art_run(&rom, frames, continue_input, false, false);
+        report("continue, read in the pictures", &in_pictures);
+        assert!(in_pictures.wram != new_game, "the saved game is loaded");
+        assert!(in_pictures.loads_on_draw > 0);
+        for smooth in [false, true] {
+            let apart = art_run(&rom, frames, continue_input, true, smooth);
+            report(&format!("continue, read apart, Smooth {smooth}"), &apart);
+            assert_eq!(apart.loads_on_draw, 0, "Smooth {smooth}");
+        }
+        // SAFETY: serialised by ENV_LOCK.
+        unsafe { std::env::remove_var("SSD_DATA_DIR") };
+    }
+
+    fn battle_speed_run(
+        rom: &[u8],
+        tempo: Option<(u32, u32)>,
+        smooth: bool,
+        scale: u32,
+    ) -> BattleRun {
+        let env = Env { rom, switch: None, verify: None };
+        let frames = ssd_game::scripts::BATTLE_FRAMES;
+        let mut audio = audio::Audio::muted();
+        let mut session = Session::default();
+        let mut machine = new_machine(rom.to_vec(), None, &mut session).unwrap();
+        let mut state = window_state(HooksSwitch::Allowed);
+        state.hd = hd_layer(rom, Ruleset::enhanced()).unwrap();
+        state.scaled = Some(HdOptions { scale, look: ssd_hd::Look::Crisp });
+        state.real_time = true;
+        state.video.smooth = smooth;
+        machine.set_line_log(true);
+        let mut previous = Joypad::default();
+        let mut run = BattleRun {
+            shown: std::collections::BTreeMap::new(),
+            windows: Vec::new(),
+            pairs: 0,
+            pairs_drawn_twice: 0,
+            costs: Vec::new(),
+            wram: Vec::new(),
+        };
+        // The window frames of the battle so far: the pacer gives the k-th one floor((k + 1) f / r) - floor(k f / r)
+        // frames at a tempo of f frames to r refreshes (1, 2, 1, 2, … at 1.5 times; 2, 2, … at 2 times)
+        let mut window = 0_u64;
+        let mut last_end = 0;
+        while machine.frame_count() < frames {
+            let at = machine.frame_count();
+            let pad = ssd_game::scripts::battle_input(at);
+            let in_battle = ssd_game::gameplay::in_battle(machine.wram());
+            let paced = tempo.filter(|_| in_battle).map_or(1, |(f, r)| {
+                let (f, r) = (u64::from(f), u64::from(r));
+                let count = (window + 1) * f / r - window * f / r;
+                window += 1;
+                count
+            });
+            // Two frames in this window frame, in battle, when the script holds the same buttons for both (a window
+            // frame's frames get one joypad)
+            let batch =
+                paced == 2 && ssd_game::scripts::battle_input(at + 1) == pad && at + 2 <= frames;
+            state.whole_frames = tempo.is_some() && in_battle;
+            let count = if batch { 2 } else { 1 };
+            let serial = ssd_hd::world::next_serial();
+            state.stages = Stages::default();
+            let started = Instant::now();
+            window_step(
+                &mut state,
+                &mut machine,
+                &mut session,
+                &env,
+                &mut audio,
+                count,
+                pad,
+                &mut previous,
+            );
+            let took = started.elapsed().as_secs_f64() * 1000.0;
+            // (the call above takes a serial of its own)
+            let drawn = ssd_hd::world::next_serial() - serial - 1;
+            if batch {
+                run.pairs += 1;
+                run.pairs_drawn_twice += u32::from(drawn > 1);
+            }
+            if in_battle {
+                let ms = |time: Duration| time.as_secs_f64() * 1000.0;
+                run.costs.push((took, count, ms(state.stages.emulate), ms(state.stages.hd), drawn));
+            }
+            let (frame, view) = state.hd_view.as_ref().expect("a picture is on show");
+            assert_eq!(*frame, machine.frame_count(), "and it is the machine's frame");
+            let crc = ssd_rom::crc32(&view.picture.picture.rgba);
+            run.shown.insert(*frame, crc);
+            run.windows.push((*frame, last_end, crc));
+            last_end = *frame;
+        }
+        run.wram = machine.wram().to_vec();
+        run
+    }
+
+    /// The battle speed's window frames on the window's own frame path with the real game (the reference battle's
+    /// script, in Enhanced mode): run in battle as the pacer gives them at 1.5 times (1, 2, 1, 2, … frames a window
+    /// frame) and at 2 times (2, 2, …), every picture on show is the one speed 1 shows of that frame, so no page of the translation, no card
+    /// tooltip and nothing else the 16:9 view follows from frame to frame stays up, comes late or goes early. A window
+    /// frame of two draws one picture, the shown frame's, as speed 1 draws one a window frame: the frame not shown is
+    /// run whole (its render log, its pixels) and followed, and drawing it as well cost a slow machine the 1.5 times
+    /// (44 to 79 frames a second for 90 on one slow machine). The sound chip stays at 1/1 here, so both runs are the same game
+    /// frame for frame: only the drawing differs.
+    #[test]
+    #[ignore = "needs SSD_ROM_PATH"]
+    fn the_battle_speed_shows_each_frame_as_speed_1_shows_it() {
+        let _guard = paths::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: serialised by ENV_LOCK.
+        unsafe { std::env::set_var("SSD_DATA_DIR", dir.path()) };
+        let rom = std::fs::read(std::env::var("SSD_ROM_PATH").expect("SSD_ROM_PATH")).unwrap();
+        let reference = battle_speed_run(&rom, None, false, 2);
+        let digest =
+            reference.shown.values().fold(0_u64, |sum, crc| sum.rotate_left(5) ^ u64::from(*crc));
+        println!("speed 1: {} pictures, digest {digest:016x}", reference.shown.len());
+        for (name, speed) in [
+            ("1.5x", ssd_game::gameplay::BATTLE_TEMPO),
+            ("2x", ssd_game::gameplay::BATTLE_TEMPO_2X),
+        ] {
+            let tempo = battle_speed_run(&rom, Some(speed), false, 2);
+            assert!(
+                tempo.pairs > 500,
+                "{name}: window frames of two in the battle: {}",
+                tempo.pairs
+            );
+            assert_eq!(tempo.wram, reference.wram, "{name}: the same game");
+            let different: Vec<u64> = tempo
+                .shown
+                .iter()
+                .filter(|&(frame, crc)| reference.shown.get(frame) != Some(crc))
+                .map(|(frame, _)| *frame)
+                .collect();
+            println!(
+                "{} pictures on show at {name}, {} window frames of two ({} drew two pictures); differing from 1x: {different:?}",
+                tempo.shown.len(),
+                tempo.pairs,
+                tempo.pairs_drawn_twice
+            );
+            assert!(
+                different.is_empty(),
+                "{name}: every picture on show is speed 1's of its frame: {different:?}"
+            );
+            assert_eq!(
+                tempo.pairs_drawn_twice, 0,
+                "{name}: a window frame of two draws one picture, as speed 1 draws one"
+            );
+            // Latency Smooth shows its pictures a window frame late: every one on show is speed 1's picture of its
+            // frame (a frame drawn and shown at once) or of the last frame of the window frame before
+            let smooth = battle_speed_run(&rom, Some(speed), true, 2);
+            assert_eq!(smooth.wram, reference.wram);
+            assert_eq!(smooth.pairs_drawn_twice, 0, "{name}: Smooth too");
+            let mut lags = std::collections::BTreeMap::new();
+            for &(frame, before, crc) in &smooth.windows {
+                let lag = [frame, before]
+                    .into_iter()
+                    .position(|of| reference.shown.get(&of) == Some(&crc));
+                assert!(
+                    lag.is_some(),
+                    "{name}: frame {frame} shows a picture speed 1 shows of neither it nor {before}, the window frame before's"
+                );
+                *lags.entry(frame - [frame, before][lag.unwrap_or(0)]).or_insert(0) += 1;
+            }
+            println!(
+                "{name} Smooth: window frames by how many frames late their picture is: {lags:?}"
+            );
+        }
+        // SAFETY: serialised by ENV_LOCK.
+        unsafe { std::env::remove_var("SSD_DATA_DIR") };
+    }
+
+    /// What the battle speed's window frames cost on this machine, against speed 1's, on the reference battle (see
+    /// [`battle_speed_run`]): the milliseconds of a window frame in the battle (p50, p95, max, and how many go over a
+    /// 60 Hz refresh and over two), Latency Low (each picture drawn before the window frame ends) and Smooth. Nothing
+    /// is asserted: a machine's speed is not a property of the code.
+    #[test]
+    #[ignore = "needs SSD_ROM_PATH; prints timings"]
+    fn the_battle_speed_window_frame_cost() {
+        let _guard = paths::ENV_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let dir = tempfile::tempdir().unwrap();
+        // SAFETY: serialised by ENV_LOCK.
+        unsafe { std::env::set_var("SSD_DATA_DIR", dir.path()) };
+        let rom = std::fs::read(std::env::var("SSD_ROM_PATH").expect("SSD_ROM_PATH")).unwrap();
+        for (scale, smooth) in [(2, false), (2, true), (4, false)] {
+            for tempo in [
+                None,
+                Some(ssd_game::gameplay::BATTLE_TEMPO),
+                Some(ssd_game::gameplay::BATTLE_TEMPO_2X),
+            ] {
+                let speed = match tempo {
+                    Some((3, 2)) => "1.5x",
+                    Some(_) => "2x",
+                    None => "1x",
+                };
+                let run = battle_speed_run(&rom, tempo, smooth, scale);
+                let mut all: Vec<f64> = run.costs.iter().map(|c| c.0).collect();
+                all.sort_by(f64::total_cmp);
+                let at = |q: f64| all[((all.len() - 1) as f64 * q).round() as usize];
+                let pairs: Vec<f64> = run.costs.iter().filter(|c| c.1 == 2).map(|c| c.0).collect();
+                let pair_mean = pairs.iter().sum::<f64>() / pairs.len().max(1) as f64;
+                let frames: u32 = run.costs.iter().map(|c| c.1).sum();
+                let emulate: f64 = run.costs.iter().map(|c| c.2).sum();
+                let drawing: f64 = run.costs.iter().map(|c| c.3).sum();
+                let drawn: u64 = run.costs.iter().map(|c| c.4).sum();
+                println!(
+                    "scale {scale} {} {}: {drawn} pictures drawn for {} window frames, {:.2} ms emulation a game frame, \
+                     {:.2} ms of the 16:9 view's upkeep and waits a window frame",
+                    if smooth { "Smooth" } else { "Low" },
+                    speed,
+                    all.len(),
+                    emulate / f64::from(frames.max(1)),
+                    drawing / all.len().max(1) as f64,
+                );
+                println!(
+                    "scale {scale} {} {}: {} window frames ({frames} game frames) p50 {:.2} p95 {:.2} max {:.2} ms, \
+                     over 16.7 ms {}, over 33.3 ms {}, window frames of two {} at {pair_mean:.2} ms, {:.2} ms a game frame",
+                    if smooth { "Smooth" } else { "Low" },
+                    speed,
+                    all.len(),
+                    at(0.5),
+                    at(0.95),
+                    at(1.0),
+                    all.iter().filter(|&&ms| ms > 1000.0 / 60.0).count(),
+                    all.iter().filter(|&&ms| ms > 2000.0 / 60.0).count(),
+                    pairs.len(),
+                    all.iter().sum::<f64>() / f64::from(frames.max(1)),
+                );
+            }
         }
         // SAFETY: serialised by ENV_LOCK.
         unsafe { std::env::remove_var("SSD_DATA_DIR") };

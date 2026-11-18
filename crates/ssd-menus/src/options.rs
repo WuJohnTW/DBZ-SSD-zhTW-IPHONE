@@ -54,9 +54,9 @@ pub fn show_game_page(on: bool) {
 }
 
 /// Offers the translations the player has (their files in the data folder): the app sets them. With one or more,
-/// the Accessibility page shows the Language row and the first launch asks, both offering English and these sorted
-/// by code; with none (the default) the page is as it was and nothing is asked. English and a code given twice are
-/// left out.
+/// the Accessibility page shows the Language row (these in the first launch's order, then English) and the first
+/// launch asks (these alone); with none (the default) the page is as it was and nothing is asked. English and a code
+/// given twice are left out.
 pub fn offer_languages(mut locales: Vec<Locale>) {
     locales.retain(|locale| !locale.language.is_english());
     locales.sort_by_key(|locale| locale.language);
@@ -64,11 +64,15 @@ pub fn offer_languages(mut locales: Vec<Locale>) {
     *LANGUAGES.lock().unwrap_or_else(std::sync::PoisonError::into_inner) = locales;
 }
 
-/// The languages offered: English first, then the translations the player has, sorted by code.
+/// The languages offered, in the Language row's order: the translations the player has in the first launch's order
+/// ([`crate::setup::first_launch_languages`]: Traditional Chinese (Taiwan) first, then by code), then English; English
+/// alone without a translation.
 #[must_use]
 pub fn offered_languages() -> Vec<Locale> {
-    let locales = LANGUAGES.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-    std::iter::once(Locale::english()).chain(locales.iter().cloned()).collect()
+    let locales = LANGUAGES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).clone();
+    let mut offered = crate::setup::first_launch_languages(&locales);
+    offered.push(Locale::english());
+    offered
 }
 
 /// Whether the player has a translation: the Language row shows, and the language can be chosen.
@@ -77,12 +81,16 @@ pub fn language_row_shown() -> bool {
     !LANGUAGES.lock().unwrap_or_else(std::sync::PoisonError::into_inner).is_empty()
 }
 
-/// The choice of the Language row that shows the stored language among `offered`: English (the first) when none is
-/// stored or the stored one is not offered (its files are gone).
+/// The choice of the Language row among `offered` that shows the language of the text: the stored one; English when
+/// the stored one is not offered (its files are gone: the text is English); before a choice, the one the app takes
+/// then ([`crate::setup::language_before_a_choice`]).
 fn language_choice(values: &Values, offered: &[Locale]) -> usize {
-    Language::from_values(values)
-        .and_then(|language| offered.iter().position(|locale| locale.language == language))
-        .unwrap_or(0)
+    let shown = match Language::from_values(values) {
+        Some(language) if offered.iter().any(|locale| locale.language == language) => language,
+        Some(_) => Language::ENGLISH,
+        None => crate::setup::language_before_a_choice(offered),
+    };
+    offered.iter().position(|locale| locale.language == shown).unwrap_or(0)
 }
 
 /// The texts of the Game page's two read-only rows: the current mode, and the HD pack's state.
@@ -253,7 +261,8 @@ pub enum Source {
     /// A small stored number (the index of the choice), under the row's key, in the category's file.
     Stored { default: u8 },
     /// The language of the text: the choices are the languages offered ([`offered_languages`]), the value stored
-    /// is the language's code (`Language::store`), English by default.
+    /// is the language's code (`Language::store`); nothing by default (the first launch asks), when the row shows
+    /// the language the app takes before a choice.
     Language,
     /// The original's text speed (`$01D0`, five speeds): the same setting as the Menu's Text entry.
     TextSpeed,
@@ -397,9 +406,8 @@ impl RowDef {
             Source::TextSpeed => usize::from(TEXT_SPEED_LAST - TEXT_SPEED_DEFAULT),
             Source::Encounters => ENCOUNTERS_NEUTRAL,
             Source::Preset => difficulty::NORMAL,
-            Source::Language | Source::View(_) | Source::Opens(_) | Source::Info | Source::None => {
-                0
-            }
+            Source::Language => language_choice(&Values::new(), &offered_languages()),
+            Source::View(_) | Source::Opens(_) | Source::Info | Source::None => 0,
         }
     }
 
@@ -867,14 +875,31 @@ mod tests {
         );
     }
 
-    #[test]
-    fn the_language_row_offers_english_then_the_translations_sorted_by_code_and_stores_the_code() {
-        let _guard = LANGUAGES_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
-        let code = |code| Language::from_code(code).unwrap();
-        let row = accessibility::ROWS_WITH_LANGUAGE
+    /// The Language row of the Accessibility page.
+    fn language_row() -> &'static RowDef {
+        accessibility::ROWS_WITH_LANGUAGE
             .iter()
             .find(|row| row.key == Language::KEY)
-            .expect("the Language row");
+            .expect("the Language row")
+    }
+
+    /// The codes of the languages offered, in the row's order.
+    fn offered_codes() -> Vec<&'static str> {
+        offered_languages().iter().map(|locale| locale.language.code()).collect()
+    }
+
+    /// The code of the choice the Language row shows for `values`.
+    fn shown_code(values: &Values) -> &'static str {
+        let index = language_row().index(values, &Cheats::neutral(), 0);
+        offered_languages()[index].language.code()
+    }
+
+    #[test]
+    fn the_language_row_offers_the_translations_as_the_first_launch_then_english_and_stores_the_code()
+     {
+        let _guard = LANGUAGES_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let code = |code| Language::from_code(code).unwrap();
+        let row = language_row();
         offer_languages(Vec::new());
         assert!(!language_row_shown());
         assert_eq!(offered_languages(), [Locale::english()], "English alone: nothing to choose");
@@ -886,29 +911,79 @@ mod tests {
             Locale { language: code("zz"), name: "Again".to_owned() },
         ]);
         assert!(language_row_shown());
-        let offered = offered_languages();
-        let codes: Vec<&str> = offered.iter().map(|locale| locale.language.code()).collect();
-        assert_eq!(codes, ["en", "xx", "zh-hk", "zz"], "English, then by code, each once");
-        let names: Vec<&str> = offered.iter().map(|locale| locale.name.as_str()).collect();
-        assert_eq!(names, ["English", "Made up", "繁體中文（香港）", "Zed"]);
+        assert_eq!(
+            offered_codes(),
+            ["xx", "zh-hk", "zz", "en"],
+            "by code (no Taiwan here), each once, English last"
+        );
+        let names: Vec<String> =
+            offered_languages().into_iter().map(|locale| locale.name).collect();
+        assert_eq!(names, ["Made up", "繁體中文（香港）", "Zed", "English"]);
         assert_eq!(row.count(), 4);
         let (mut values, mut cheats) = (Values::new(), Cheats::neutral());
-        assert_eq!(row.index(&values, &cheats, 0), 0, "nothing stored: English");
         assert_eq!(row.set(&mut values, &mut cheats, 1), Effect::Stored);
-        assert_eq!(values.word(Language::KEY), Some("xx"), "the code, not the row's index");
+        assert_eq!(values.word(Language::KEY), Some("zh-hk"), "the code, not the row's index");
         assert_eq!(row.step(&mut values, &mut cheats, 0, 1), Effect::Stored);
-        assert_eq!(Language::from_values(&values), Some(Language::ZH_HK));
-        assert_eq!(row.index(&values, &cheats, 0), 2);
-        values.set(Language::KEY, 1);
-        assert_eq!(
-            row.index(&values, &cheats, 0),
-            2,
-            "an index of the first versions is Hong Kong"
-        );
-        offer_languages(vec![Locale { language: code("xx"), name: "Made up".to_owned() }]);
-        assert_eq!(row.index(&values, &cheats, 0), 0, "Hong Kong is not offered: English shows");
+        assert_eq!(values.word(Language::KEY), Some("zz"), "Right");
+        assert_eq!(row.step(&mut values, &mut cheats, 0, 1), Effect::Stored);
+        assert_eq!(values.word(Language::KEY), Some("en"), "Right again: English, the last");
+        assert_eq!(row.step(&mut values, &mut cheats, 0, 1), Effect::Stored);
+        assert_eq!(values.word(Language::KEY), Some("xx"), "Right at the last wraps to the first");
+        assert_eq!(row.step(&mut values, &mut cheats, 0, -1), Effect::Stored);
+        assert_eq!(values.word(Language::KEY), Some("en"), "Left at the first wraps to English");
         assert_eq!(row.reset(&mut values, &mut cheats), Effect::Stored);
         assert_eq!(Language::from_values(&values), None, "reset: asked again");
+        offer_languages(Vec::new());
+    }
+
+    #[test]
+    fn the_language_row_puts_taiwan_first_and_english_last() {
+        let _guard = LANGUAGES_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let taiwan = Language::from_code("zh-tw").unwrap();
+        offer_languages(vec![Locale::unnamed(Language::ZH_HK), Locale::unnamed(taiwan)]);
+        assert_eq!(offered_codes(), ["zh-tw", "zh-hk", "en"]);
+        offer_languages(vec![Locale::unnamed(Language::ZH_HK)]);
+        assert_eq!(offered_codes(), ["zh-hk", "en"], "without Taiwan");
+        offer_languages(Vec::new());
+        assert_eq!(offered_codes(), ["en"], "no translation: English alone, as upstream");
+    }
+
+    #[test]
+    fn the_language_row_shows_the_stored_language_and_before_a_choice_the_one_in_use() {
+        let _guard = LANGUAGES_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let taiwan = Language::from_code("zh-tw").unwrap();
+        offer_languages(vec![Locale::unnamed(Language::ZH_HK), Locale::unnamed(taiwan)]);
+        for code in ["zh-hk", "en", "zh-tw"] {
+            let mut values = Values::new();
+            Language::from_code(code).unwrap().store(&mut values);
+            assert_eq!(shown_code(&values), code, "{code} stored");
+        }
+        assert_eq!(
+            shown_code(&Values::new()),
+            "zh-tw",
+            "nothing stored: Taiwan, the language in use"
+        );
+        let mut values = Values::new();
+        Language::from_code("xx").unwrap().store(&mut values);
+        assert_eq!(
+            shown_code(&values),
+            "en",
+            "a language whose files are gone: its text is English"
+        );
+        offer_languages(Vec::new());
+        assert_eq!(shown_code(&Values::new()), "en", "no translation: English");
+    }
+
+    #[test]
+    fn an_index_of_the_first_versions_reads_as_the_same_language_whatever_the_order() {
+        let _guard = LANGUAGES_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+        let taiwan = Language::from_code("zh-tw").unwrap();
+        offer_languages(vec![Locale::unnamed(Language::ZH_HK), Locale::unnamed(taiwan)]);
+        let mut values = Values::new();
+        values.set(Language::KEY, 1);
+        assert_eq!(shown_code(&values), "zh-hk", "1: Hong Kong");
+        values.set(Language::KEY, 0);
+        assert_eq!(shown_code(&values), "en", "0: English");
         offer_languages(Vec::new());
     }
 

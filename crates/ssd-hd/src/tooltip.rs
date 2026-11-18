@@ -7,9 +7,15 @@
 //! The window has the colours of the game's own windows (cream, an orange band, a dark red line,
 //! corner caps), the text is the HD font, and the kanji (or the emblem) is the art store's picture.
 //! What each symbol of a card is called and means is in `docs/re/data/cards.md`.
+//!
+//! The tooltip is not drawn while a window of the game's own is open where it would be (the technique list or the
+//! target window that opens once the card is picked: the card and its cursor may stay on the screen under it), nor
+//! at all with a translation that turns it off (`translate::CARD_TOOLTIP_KEY`: the zh-tw pack, whose players read the
+//! cards' kanji as they are).
 
 use crate::cards::{CARD_BASE, CURSOR_CODE, CardArt};
 use crate::font::{Font, MARGIN, TextCell};
+use crate::translate::Overlay;
 
 /// One symbol of the cards: the code of the tile at the top left of its kanji in the UI set, the
 /// reading (the first line, after the picture) and a short meaning (the second line). Only the
@@ -80,9 +86,48 @@ pub(crate) struct Seen {
     age: u32,
 }
 
+/// The tooltip's window: its left, top, width and height in 1x pixels, in a frame `frame_w` pixels wide.
+fn place(seen: &Seen, frame_w: i32) -> (i32, i32, i32, i32) {
+    let tip = &TIPS[seen.tip];
+    let chars = tip.reading.len().max(tip.meaning.len()) as i32;
+    let inner_w = PICTURE + PAD + LINE * chars;
+    let (win_w, win_h) = (inner_w + 2 * (FRAME + PAD), TEXT + 2 * (FRAME + PAD));
+    // Left edge on the card's, kept within the hand's span (and the picture)
+    let hand_right = seen.hand_right.min(frame_w);
+    let win_x = (seen.kanji.0 - 8).min(hand_right - win_w).clamp(0, (frame_w - win_w).max(0));
+    let win_y = seen.cursor_y - ABOVE_CURSOR - win_h;
+    (win_x, win_y, win_w, win_h)
+}
+
+/// Whether a window of the game's own is open where the tooltip's `window` would be: a text cell of the frame that
+/// is not a card's lies in it (a letter, a mark, or the blank inside of a window: the 2-bit tiles of the font the
+/// frame shows, `font::TextCapture`). With the cursor on a card, the picture above the hand is the fight's, with no
+/// text in it.
+fn under_a_window(cells: &[TextCell], (x, y, w, h): (i32, i32, i32, i32)) -> bool {
+    cells.iter().any(|cell| {
+        cell.glyph < CARD_BASE
+            && cell.mask != 0
+            && cell.x < x + w
+            && x < cell.x + 8
+            && cell.y < y + h
+            && y < cell.y + 8
+    })
+}
+
 /// The tooltip for the cards in `cells`, over the picture `rgba` (`width` pixels wide, `scale`
-/// times the 1x frame). Does nothing without card art, a cursor or a card under it.
-pub(crate) fn draw(font: &Font, rgba: &mut [u8], width: usize, scale: usize, cells: &[TextCell]) {
+/// times the 1x frame). Does nothing without card art, a cursor or a card under it, with a window of the game's own
+/// where it would be ([`under_a_window`]), or with `overlay`'s translation turning it off.
+pub(crate) fn draw(
+    font: &Font,
+    rgba: &mut [u8],
+    width: usize,
+    scale: usize,
+    cells: &[TextCell],
+    overlay: Option<&Overlay>,
+) {
+    if overlay.is_some_and(Overlay::card_tooltip_off) {
+        return;
+    }
     let Some(cards) = font.cards() else { return };
     if !(2..=crate::MAX_SCALE as usize).contains(&scale) || cards.tips.is_empty() {
         return;
@@ -130,7 +175,10 @@ pub(crate) fn draw(font: &Font, rgba: &mut [u8], width: usize, scale: usize, cel
         *seen
     };
     if let Some(seen) = shown {
-        paint(font, cards, rgba, width, scale, &seen);
+        let window = place(&seen, (width / scale) as i32);
+        if !under_a_window(cells, window) {
+            paint(font, cards, rgba, width, scale, &seen, window);
+        }
     }
 }
 
@@ -183,16 +231,16 @@ impl Canvas<'_> {
     }
 }
 
-fn paint(font: &Font, cards: &CardArt, rgba: &mut [u8], width: usize, scale: usize, seen: &Seen) {
+fn paint(
+    font: &Font,
+    cards: &CardArt,
+    rgba: &mut [u8],
+    width: usize,
+    scale: usize,
+    seen: &Seen,
+    (win_x, win_y, win_w, win_h): (i32, i32, i32, i32),
+) {
     let tip = &TIPS[seen.tip];
-    let chars = tip.reading.len().max(tip.meaning.len()) as i32;
-    let inner_w = PICTURE + PAD + LINE * chars;
-    let (win_w, win_h) = (inner_w + 2 * (FRAME + PAD), TEXT + 2 * (FRAME + PAD));
-    let frame_w = (width / scale) as i32;
-    // Left edge on the card's, kept within the hand's span (and the picture)
-    let hand_right = seen.hand_right.min(frame_w);
-    let win_x = (seen.kanji.0 - 8).min(hand_right - win_w).clamp(0, (frame_w - win_w).max(0));
-    let win_y = seen.cursor_y - ABOVE_CURSOR - win_h;
     let height = rgba.len() / 4 / width;
     let mut canvas = Canvas { rgba, width, height, scale, tint: seen.white };
     // The frame: a cream edge, the orange band, the dark red line, the cream inside
@@ -299,7 +347,7 @@ mod tests {
         // The cursor at (88, 176), the card's kanji 24 pixels below it
         let both = [cell(88, 176, cursor), cell(88, 200, kanji)];
         let mut rgba = picture();
-        draw(&font, &mut rgba, WIDTH, 2, &both);
+        draw(&font, &mut rgba, WIDTH, 2, &both, None);
         assert!(drawn(&rgba));
         // The window is above the cursor row and its left edge is the card's
         let rows: Vec<usize> =
@@ -308,13 +356,13 @@ mod tests {
         // The cursor blinks off: the card is still there, so the window stays
         let card_only = [cell(88, 200, kanji)];
         let mut rgba = picture();
-        draw(&font, &mut rgba, WIDTH, 2, &card_only);
+        draw(&font, &mut rgba, WIDTH, 2, &card_only, None);
         assert!(drawn(&rgba), "kept while the cursor blinks");
         // ... but not for ever
         let mut gone = false;
         for _ in 0..=KEEP {
             let mut rgba = picture();
-            draw(&font, &mut rgba, WIDTH, 2, &card_only);
+            draw(&font, &mut rgba, WIDTH, 2, &card_only, None);
             gone = !drawn(&rgba);
         }
         assert!(gone, "dropped after {KEEP} frames without the cursor");
@@ -330,7 +378,7 @@ mod tests {
         // reach into that window nor cover the command window to the left of the hand (x < 80)
         let cells = [cell(88, 174, cursor), cell(88, 198, kanji), cell(80, 198, CARD_BASE + 2)];
         let mut rgba = picture();
-        draw(&font, &mut rgba, WIDTH, 2, &cells);
+        draw(&font, &mut rgba, WIDTH, 2, &cells, None);
         assert!(drawn(&rgba));
         let tinted = |x: usize, y: usize| rgba[(y * WIDTH + x) * 4..][..3] == CREAM;
         let message = (112 * 2..WIDTH).any(|x| (167 * 2..224 * 2).any(|y| tinted(x, y)));
@@ -345,19 +393,19 @@ mod tests {
         // A cursor with no card under it (a dialogue's arrow), a card with no cursor
         for cells in [vec![cell(88, 176, cursor)], vec![cell(88, 200, kanji)]] {
             let mut rgba = picture();
-            draw(&font, &mut rgba, WIDTH, 2, &cells);
+            draw(&font, &mut rgba, WIDTH, 2, &cells, None);
             assert!(!drawn(&rgba));
         }
         // The cursor was on a card; the card is played, the window goes at once
         let mut rgba = picture();
-        draw(&font, &mut rgba, WIDTH, 2, &[cell(88, 176, cursor), cell(88, 200, kanji)]);
+        draw(&font, &mut rgba, WIDTH, 2, &[cell(88, 176, cursor), cell(88, 200, kanji)], None);
         assert!(drawn(&rgba));
         let mut rgba = picture();
-        draw(&font, &mut rgba, WIDTH, 2, &[]);
+        draw(&font, &mut rgba, WIDTH, 2, &[], None);
         assert!(!drawn(&rgba));
         // At scale 1 nothing is drawn
         let mut rgba = picture();
-        draw(&font, &mut rgba, WIDTH, 1, &[cell(88, 176, cursor), cell(88, 200, kanji)]);
+        draw(&font, &mut rgba, WIDTH, 1, &[cell(88, 176, cursor), cell(88, 200, kanji)], None);
         assert!(!drawn(&rgba));
     }
 
@@ -371,12 +419,211 @@ mod tests {
         cells.push(cell(80, 198, CARD_BASE + 2)); // the first card's frame
         cells.push(cell(88 + 32 * 4, 174, cursor));
         let mut rgba = picture();
-        draw(&font, &mut rgba, WIDTH, 2, &cells);
+        draw(&font, &mut rgba, WIDTH, 2, &cells, None);
         let columns: Vec<usize> = (0..WIDTH)
             .filter(|&x| (0..224 * 2).any(|y| rgba[(y * WIDTH + x) * 4..][..3] == CREAM))
             .collect();
         assert!(*columns.last().unwrap() < 2 * 240 + 2, "{columns:?}");
         assert!(*columns.last().unwrap() >= 2 * 240 - 4, "{columns:?}");
+    }
+
+    /// A font with card art for the cursor and the seven symbols (glyph `CARD_BASE + 1 + symbol`), each
+    /// tooltip picture a colour of its own.
+    fn every_symbol_font() -> Font {
+        let mut rom = vec![0_u8; crate::font::FONT_OFFSET + 384 * 16];
+        for code in 0..384 {
+            rom[crate::font::FONT_OFFSET + code * 16 + 15] = (code % 250) as u8 + 1;
+        }
+        let mut codes = vec![CURSOR_CODE];
+        codes.extend(TIPS.iter().map(|tip| tip.code));
+        let tips = TIPS
+            .iter()
+            .enumerate()
+            .map(|(symbol, tip)| {
+                let px = crate::cards::TIP_PX * crate::cards::TIP_PX;
+                let pixel = [30 * symbol as u8, 200 - 20 * symbol as u8, 90, 255];
+                (tip.code, pixel.repeat(px))
+            })
+            .collect();
+        let cards = Arc::new(CardArt::flat(&codes, tips));
+        Font::standard(&rom).unwrap().with_cards(&rom, cards).unwrap()
+    }
+
+    /// A picture that is not one colour, so that every blend shows.
+    fn gradient(scale: usize) -> Vec<u8> {
+        let (w, h) = (256 * scale, 224 * scale);
+        (0..w * h)
+            .flat_map(|at| [(at % w) as u8, (at / w) as u8, (at * 7 % 251) as u8, 255])
+            .collect()
+    }
+
+    /// FNV-1a of the whole picture.
+    fn fnv(rgba: &[u8]) -> u64 {
+        rgba.iter()
+            .fold(0xcbf2_9ce4_8422_2325, |h, &b| (h ^ u64::from(b)).wrapping_mul(0x100_0000_01b3))
+    }
+
+    /// The cells of a full hand, the kanji from x 88, the cursor on the card of `slot`, every card of `symbol`.
+    fn hand(symbol: usize, slot: i32) -> Vec<TextCell> {
+        let kanji = CARD_BASE + 1 + symbol as u8;
+        let mut cells: Vec<TextCell> = (0..5).map(|s| cell(88 + 32 * s, 198, kanji)).collect();
+        cells.push(cell(88 + 32 * slot, 174, CARD_BASE));
+        cells
+    }
+
+    /// The whole picture at `scale` with the tooltip `cells` show, drawn with a font of its own.
+    fn shown(cells: &[TextCell], scale: usize, overlay: Option<&Overlay>) -> Vec<u8> {
+        let mut rgba = gradient(scale);
+        draw(&every_symbol_font(), &mut rgba, 256 * scale, scale, cells, overlay);
+        rgba
+    }
+
+    /// The whole picture (FNV-1a of every byte) with the English tooltip of each symbol, the cursor on the card of
+    /// slot 0, 2 or 4 at a scale of 2, 3 or 4, as the tooltip drew it before its layout for translations.
+    const ENGLISH_BEFORE: [(usize, i32, usize, u64); 21] = [
+        (0, 0, 2, 0xb3ba_b099_61cf_b9ba),
+        (0, 2, 3, 0x07f0_89bb_a378_3c9d),
+        (0, 4, 4, 0x38e9_45ac_3d0b_f9d3),
+        (1, 0, 2, 0x1e14_1387_33a2_e003),
+        (1, 2, 3, 0xed3f_d651_893c_e14a),
+        (1, 4, 4, 0x224f_d92c_ef44_b349),
+        (2, 0, 2, 0x2ffd_73d4_5bbf_a3ab),
+        (2, 2, 3, 0xbf92_b2a7_c584_eada),
+        (2, 4, 4, 0x2849_34dc_0d7c_a70d),
+        (3, 0, 2, 0x887c_df37_6d63_57fe),
+        (3, 2, 3, 0xe0d1_5538_2e70_512f),
+        (3, 4, 4, 0xbc41_c477_7408_46b5),
+        (4, 0, 2, 0xe35f_676d_3adc_f163),
+        (4, 2, 3, 0xfda2_706b_f5db_93cd),
+        (4, 4, 4, 0x61dd_2eec_255d_2b09),
+        (5, 0, 2, 0xa42f_5353_1e75_9e82),
+        (5, 2, 3, 0x50b9_ec85_9d69_2904),
+        (5, 4, 4, 0x6698_c6bb_0ab9_e699),
+        (6, 0, 2, 0x82ab_08dd_2407_ee19),
+        (6, 2, 3, 0xd835_0a78_beb4_83a4),
+        (6, 4, 4, 0xce07_481c_b6de_f471),
+    ];
+
+    #[test]
+    fn the_english_tooltip_is_drawn_as_before_to_the_pixel() {
+        for (symbol, slot, scale, before) in ENGLISH_BEFORE {
+            let rgba = shown(&hand(symbol, slot), scale, None);
+            assert_ne!(rgba, gradient(scale), "symbol {symbol}: a tooltip is drawn");
+            assert_eq!(fnv(&rgba), before, "symbol {symbol}, slot {slot}, scale {scale}");
+        }
+    }
+
+    /// The cells of the game's window from (`x0`, `y0`) to (`x1`, `y1`): a line of letters every 16 pixels from its
+    /// top, blanks between, or blanks only.
+    fn window_cells((x0, y0): (i32, i32), (x1, y1): (i32, i32), letters: bool) -> Vec<TextCell> {
+        let mut cells = Vec::new();
+        for y in (y0..y1).step_by(8) {
+            for x in (x0..x1).step_by(8) {
+                let letter = letters && (y - y0) % 16 == 0 && x < x0 + 80;
+                cells.push(cell(x, y, if letter { 0x20 } else { 0 }));
+            }
+        }
+        cells
+    }
+
+    /// Once 必 is picked: the card stays in the first slot with its cursor (the hand's other cards gone), and the game
+    /// opens the technique list (x 112 to 248, y 80 to 200) or, for a plain attack, the target window (x 112 to 248,
+    /// y 136 to 224), both over where the tooltip would be.
+    fn picked(window: &str, letters: bool) -> Vec<TextCell> {
+        let mut cells = hand(5, 0);
+        cells.retain(|c| c.x == 88);
+        let (top, bottom) = if window == "list" { (80, 200) } else { (136, 224) };
+        cells.extend(window_cells((112, top), (248, bottom), letters));
+        cells
+    }
+
+    #[test]
+    fn no_tooltip_while_a_window_of_the_game_is_where_it_would_be() {
+        for window in ["list", "target"] {
+            for letters in [true, false] {
+                let cells = picked(window, letters);
+                assert_eq!(shown(&cells, 2, None), gradient(2), "{window}, letters {letters}");
+                // The same frame without the window: the tooltip is there
+                let card: Vec<TextCell> =
+                    cells.into_iter().filter(|c| c.glyph >= CARD_BASE).collect();
+                assert_ne!(shown(&card, 2, None), gradient(2), "{window}: without it");
+            }
+        }
+        // The game's windows beside the tooltip do not hide it: the command window left of the hand (x < 80), the
+        // favourite card's message from y 167, the status window at the top
+        let mut beside = hand(5, 0);
+        beside.extend([
+            cell(16, 150, 0x20),
+            cell(72, 140, 0),
+            cell(120, 168, 0x20),
+            cell(200, 176, 0),
+            cell(100, 40, 0x20),
+        ]);
+        assert_eq!(shown(&beside, 2, None), shown(&hand(5, 0), 2, None), "windows beside it");
+    }
+
+    /// A translation of `rows` (`key<TAB>text` lines) over a Latin font: the tooltip reads only its switch.
+    fn overlay(rows: &str) -> Overlay {
+        let table =
+            ssd_catalogue::translation::Translation::parse(&format!("key\tzh\n{rows}")).unwrap();
+        let face =
+            crate::translate::ChineseFace::new(crate::font::SHARE_TECH_MONO.to_vec()).unwrap();
+        Overlay::new(Arc::new(table), Arc::new(face))
+    }
+
+    #[test]
+    fn a_translation_that_turns_the_tooltip_off_draws_none_at_any_step_of_the_pick() {
+        let key = crate::translate::CARD_TOOLTIP_KEY;
+        let off = overlay(&format!("{key}\toff\n"));
+        // Picking a card: the cursor on each card of the hand, every symbol
+        for symbol in 0..7 {
+            for slot in 0..5 {
+                let cells = hand(symbol, slot);
+                assert_eq!(
+                    shown(&cells, 3, Some(&off)),
+                    gradient(3),
+                    "symbol {symbol}, slot {slot}"
+                );
+                assert_ne!(
+                    shown(&cells, 3, None),
+                    gradient(3),
+                    "English: symbol {symbol}, slot {slot}"
+                );
+            }
+        }
+        // The technique list open, the target window open
+        for window in ["list", "target"] {
+            assert_eq!(shown(&picked(window, true), 2, Some(&off)), gradient(2), "{window}");
+        }
+        // Nor while the cursor blinks off over a card it was on
+        let font = every_symbol_font();
+        let mut rgba = gradient(2);
+        draw(&font, &mut rgba, 512, 2, &hand(5, 0), Some(&off));
+        let card_only: Vec<TextCell> = hand(5, 0).into_iter().filter(|c| c.y == 198).collect();
+        draw(&font, &mut rgba, 512, 2, &card_only, Some(&off));
+        assert_eq!(rgba, gradient(2), "the cursor blinking");
+    }
+
+    #[test]
+    fn a_translation_without_the_switch_keeps_the_tooltip_as_the_english() {
+        // Another language pack (no switch, or another text) shows the tooltip as without a translation
+        let key = crate::translate::CARD_TOOLTIP_KEY;
+        for rows in [
+            String::new(),
+            "screen:chase_damage\t傷害\n".to_owned(),
+            format!("{key}\ton\n"),
+            format!("{key}\toff now\n"),
+        ] {
+            let other = overlay(&rows);
+            for (symbol, slot, scale, before) in ENGLISH_BEFORE {
+                let rgba = shown(&hand(symbol, slot), scale, Some(&other));
+                assert_eq!(
+                    fnv(&rgba),
+                    before,
+                    "{rows:?}: symbol {symbol}, slot {slot}, scale {scale}"
+                );
+            }
+        }
     }
 
     #[test]

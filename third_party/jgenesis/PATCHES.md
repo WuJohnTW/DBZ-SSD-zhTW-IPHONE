@@ -389,3 +389,19 @@ Save-state rule: any patch changing the bincode layout of `SnesEmulator` bumps `
 - Save-state layout: unchanged. Emulation identical with the switches on; with them off everything
   the CPU can observe is identical (`xtask hd-skip-check` plays whole replays both ways and compares
   the PPU frames of the shown frames, the work RAM, the registers and the master cycles).
+
+### `patch(jgenesis): APU clock ratio for a battle speed with the music at its tempo`
+
+- Files: `backend/snes-core/src/api.rs`.
+- Change: `SnesEmulator::set_apu_clock_ratio(num, den)` (and the `apu_clock_ratio` accessor) hands the
+  APU `num / den` of the main master cycles of every tick (`ApuClockScale`, a `FakeEncode` field
+  carried over by `load_state`, `hard_reset` and `snapshot`; the fraction of a cycle left by the
+  division is carried to the next tick and dropped when the ratio changes, on a state load and on a
+  hard reset). The default, 1/1, takes no division: `Apu::tick` gets the tick's master cycles as
+  upstream does. `apu.rs` is unchanged.
+- Reason: the Enhanced mode's battle speed runs three frames of the game to two of the screen; with
+  the APU at 2/3 its clocks (and the DSP's 32 kHz samples) per second stay the hardware's, so the
+  music and the sound effects keep their tempo and pitch while every frame's sound is played.
+- Save-state layout: unchanged (the field is not encoded; `save_state_version` stays). Emulation
+  identical at 1/1. At another ratio the CPU sees the APU's port answers at other cycles, so a run
+  is not the hardware's: the frontend keeps 1/1 while a replay is recorded or played.

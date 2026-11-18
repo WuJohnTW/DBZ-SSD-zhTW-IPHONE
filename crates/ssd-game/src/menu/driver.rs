@@ -420,6 +420,14 @@ impl Driver {
         gameplay::animation_factor(wram, &self.state.options.game)
     }
 
+    /// The tempo the Gameplay page's battle speed runs now, if it runs (not Off, in a battle, and not in an attack
+    /// animation the animation speed runs faster): see [`gameplay::battle_tempo`]. `wram` is the work RAM after the
+    /// last frame.
+    #[must_use]
+    pub fn battle_tempo(&self, wram: &[u8]) -> Option<(u32, u32)> {
+        gameplay::battle_tempo(wram, &self.state.options.game)
+    }
+
     /// The options of the save slots, as the slot file keeps them.
     #[must_use]
     pub fn option_slots(&self) -> &SlotOptions {
@@ -1125,6 +1133,13 @@ impl State {
             completed.or_else(|| bag.as_ref().map(|&(slot, checksum, _)| (slot, checksum)));
         let saved_cheats = self.store_cheats(written);
         let saved_mods = self.store_mods(written, wram);
+        // A Save to another slot than the bag's: that slot's list is the bag's projection (one entry a stack), so the
+        // slot keeps the bag too, or a Continue of it rebuilds the bag from the list, one unit a stack.
+        let bag = bag.or_else(|| {
+            let (slot, checksum) = completed?;
+            let other = self.keeper.bound_save().is_some_and(|(bound, _)| bound != slot);
+            other.then(|| self.keeper.bag().cloned()).flatten().map(|bag| (slot, checksum, bag))
+        });
         let saved = bag.map(|(slot, checksum, bag)| {
             self.sidecar.store(slot, checksum, &bag);
             SavedBag { slot, checksum, bag }
@@ -2781,6 +2796,33 @@ mod tests {
     }
 
     #[test]
+    fn a_save_to_another_slot_keeps_the_bag_for_that_slot() {
+        let sram = saved_slots(&[0, 1]);
+        let (mut driver, mut menu) = driver_on_cheats(&sram);
+        assert_eq!(driver.state.keeper.bound_save().map(|(slot, _)| slot), Some(0));
+        assert!(driver.bag().is_some(), "the bag is bound");
+        let other = save_into(&mut driver, &mut menu, &sram, 1);
+        // The run's bag at the Save (the fake menu's list is not the projection, so the bag is the save's own).
+        let bag = driver.bag().cloned().expect("the bag is bound");
+        let checksum = checksum_of_slot(&sram, 1);
+        assert_eq!(
+            other.saved.map(|saved| (saved.slot, saved.checksum)),
+            Some((1, checksum)),
+            "the sidecar file is written"
+        );
+        assert_eq!(
+            driver.sidecar().bag_for(1, checksum),
+            Some(&bag),
+            "a Continue of slot 2 finds the bag"
+        );
+        assert_eq!(
+            driver.state.keeper.bound_save().map(|(slot, _)| slot),
+            Some(0),
+            "the run keeps its own save"
+        );
+    }
+
+    #[test]
     fn a_change_of_the_cheats_is_recorded_and_a_replay_gives_them_to_its_run() {
         let mut driver = Driver::new(Labels::default()).with_cheats(CheatSidecar::empty());
         let mut menu = FakeMenu::default();
@@ -3058,6 +3100,51 @@ mod tests {
         driver.key(Key::ResetPage, &wram);
         assert_eq!(driver.animation_factor(&wram), 1);
         assert_eq!(driver.options().game.get("gameplay.auto_run"), None);
+    }
+
+    #[test]
+    fn the_battle_speed_row_is_kept_with_the_slot_and_runs_in_battle_only() {
+        let sram = saved_slots(&[0, 1]);
+        let (mut driver, mut menu) = driver_on_options(&sram);
+        driver.key(Key::Tab, &menu.wram());
+        // The rows: text speed, auto-run, wait, animation speed, battle speed.
+        for _ in 0..4 {
+            driver.key(Key::Down, &menu.wram());
+        }
+        let mut battle = menu.wram();
+        battle[(d::IN_BATTLE - 0x7E_0000) as usize] = 0xFF;
+        battle[(d::GAME_MODE - 0x7E_0000) as usize] = 2;
+        assert_eq!(driver.battle_tempo(&battle), None, "Off until it is chosen");
+        driver.key(Key::Right, &menu.wram()); // Off to 1.5x
+        assert_eq!(driver.options().game.get("gameplay.battle_speed"), Some(1));
+        assert_eq!(driver.battle_tempo(&battle), Some((3, 2)), "1.5x in a battle");
+        driver.key(Key::Right, &menu.wram()); // 1.5x to 2x
+        assert_eq!(driver.options().game.get("gameplay.battle_speed"), Some(2));
+        assert_eq!(driver.battle_tempo(&battle), Some((2, 1)), "2x in a battle");
+        let mut field = battle.clone();
+        field[(d::IN_BATTLE - 0x7E_0000) as usize] = 0;
+        field[(d::GAME_MODE - 0x7E_0000) as usize] = 0;
+        assert_eq!(driver.battle_tempo(&field), None, "the field runs at 1x");
+        // A Save keeps it in the slot file, for that slot only, and a new run on the slot reads it back.
+        let saved = save_into(&mut driver, &mut menu, &sram, 0);
+        assert!(saved.saved_options, "a Save writes the slot file");
+        let text = driver.option_slots().to_text();
+        let slots = SlotOptions::from_text(&text).unwrap();
+        let entry = |slot: u8| {
+            slots
+                .entry_for(slot, checksum_of_slot(&sram, usize::from(slot)))
+                .and_then(|v| v.get("gameplay.battle_speed"))
+        };
+        assert_eq!((entry(0), entry(1)), (Some(2), None));
+        let mut fresh = Driver::new(Labels::default())
+            .with_cheats(CheatSidecar::empty())
+            .with_options(slots, Values::new());
+        fresh.state.curtain = Curtain::Up;
+        fresh.frame(&menu.wram(), Some(&sram), Joypad::default());
+        assert_eq!(fresh.options().game.get("gameplay.battle_speed"), Some(2));
+        fresh.state.curtain = Curtain::Down;
+        assert_eq!(fresh.battle_tempo(&battle), Some((2, 1)));
+        assert_eq!(fresh.battle_tempo(&field), None);
     }
 
     #[test]
@@ -3427,7 +3514,7 @@ mod tests {
         let (mut driver, menu) = driver_on_options(&saved_slots(&[0]));
         driver.state.packs = catalog;
         driver.key(Key::Tab, &menu.wram());
-        for _ in 0..5 {
+        for _ in 0..6 {
             driver.key(Key::Down, &menu.wram());
         }
         driver.key(Key::Confirm, &menu.wram());
@@ -3541,7 +3628,7 @@ mod tests {
         // B goes back to the Options, on the button.
         driver.key(Key::Cancel, &menu.wram());
         assert_eq!(driver.nav().screen(), Screen::Options);
-        assert_eq!(driver.nav().options_row(), 5);
+        assert_eq!(driver.nav().options_row(), 6);
     }
 
     #[test]

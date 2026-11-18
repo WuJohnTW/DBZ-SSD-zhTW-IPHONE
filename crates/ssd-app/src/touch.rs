@@ -97,9 +97,9 @@ pub struct PanelButton {
 #[derive(Debug, Clone)]
 pub struct Panel {
     pub rect: Rect,
-    pub title: &'static str,
+    pub title: String,
     pub buttons: Vec<PanelButton>,
-    pub note: &'static str,
+    pub note: String,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq)]
@@ -148,12 +148,18 @@ pub struct Touch {
     in_battle: bool,
     /// The line of the frame rate and the sound buffer, told by the host; drawn while Show FPS is on.
     pub stats: Option<String>,
+    /// The debug tools are on (`--debug` or `SSD_DEBUG=1`, told by the host): only then do the Options offer Show
+    /// FPS and is the line drawn.
+    pub debug: bool,
     geo: Geometry,
     fingers: Vec<Finger>,
     pressed: [bool; 12],
     out: Vec<Out>,
     /// The GAME page's button tapped once: a second tap does it (the progress since the last save is lost).
     armed: Option<PBtn>,
+    /// The words of the panels and the labels in the player's language (the HD menus' table, `ui-<code>.tsv`, see
+    /// [`Touch::set_words`]); `None`: English, as written here.
+    words: Option<std::sync::Arc<ssd_menus::ui_text::UiText>>,
     /// The button of the window the gamepad's cursor is on; `None` until the pad is used in the window.
     pub focus: Option<PBtn>,
     /// A tap brought the controls back while a gamepad hides them: they stay until the pad is used again.
@@ -239,15 +245,30 @@ impl Touch {
             slot: 1,
             in_battle: false,
             stats: None,
+            debug: false,
             geo,
             fingers: Vec::new(),
             pressed: [false; 12],
             out: Vec::new(),
             armed: None,
+            words: None,
             focus: None,
             shown_by_touch: false,
             chord: chord::Chord::default(),
         }
+    }
+
+    /// The words of the panels and the labels from now on: the HD menus' table of the language
+    /// (`crate::lang::interface_text`), `None` for English.
+    pub fn set_words(&mut self, words: Option<std::sync::Arc<ssd_menus::ui_text::UiText>>) {
+        self.words = words;
+    }
+
+    /// `text` (a label, a title, a note, in English) in the player's language: the table's row for it (a pattern's
+    /// holes looked up too), else `text` as it is.
+    #[must_use]
+    pub fn tr(&self, text: &str) -> String {
+        self.words.as_ref().and_then(|words| words.get(text)).unwrap_or_else(|| text.to_owned())
     }
 
     #[must_use]
@@ -427,9 +448,20 @@ impl Touch {
 
     // --- the panels ----------------------------------------------------------------------------
 
-    /// The window of the MENU, the options or the edit mode, if one is up.
+    /// The window of the MENU, the options or the edit mode, if one is up, in the player's language ([`Touch::tr`]).
     #[must_use]
     pub fn panel(&self) -> Option<Panel> {
+        let mut panel = self.english_panel()?;
+        panel.title = self.tr(&panel.title);
+        panel.note = self.tr(&panel.note);
+        for button in &mut panel.buttons {
+            button.label = self.tr(&button.label);
+        }
+        Some(panel)
+    }
+
+    /// [`Touch::panel`] with its words in English.
+    fn english_panel(&self) -> Option<Panel> {
         let s = self.geo.screen;
         let w = 400.0_f32.min(s.width() - 16.0);
         let col = (w - 36.0) / 2.0;
@@ -440,9 +472,9 @@ impl Touch {
             );
             p.buttons.push(PanelButton { id, rect: r, label, primary });
         };
-        let make = |h: f32, title| {
+        let make = |h: f32, title: &str| {
             let rect = Rect::from_center_size(s.center(), vec2(w, h.min(s.height() - 8.0)));
-            Panel { rect, title, buttons: Vec::new(), note: "" }
+            Panel { rect, title: String::from(title), buttons: Vec::new(), note: String::new() }
         };
         match self.mode {
             Mode::Play => None,
@@ -475,8 +507,9 @@ impl Touch {
                 cell(&mut p, PBtn::Game, "Game: restart, quit".into(), 1.0, 2.0, false);
                 cell(&mut p, PBtn::Slot, format!("State slot: {}", self.slot), 0.0, 3.0, false);
                 cell(&mut p, PBtn::Resume, "Resume".into(), 1.0, 3.0, true);
-                p.note =
-                    "Menu pauses the game. State slot picks the slot of Save and Load (1 to 4).";
+                p.note = String::from(
+                    "Menu pauses the game. State slot picks the slot of Save and Load (1 to 4).",
+                );
                 Some(p)
             }
             Mode::Game => {
@@ -505,12 +538,12 @@ impl Touch {
                     cell(&mut p, PBtn::Quit, quit, 1.0, 0.0, false);
                 }
                 cell(&mut p, PBtn::Back, "Back".into(), 0.0, 3.0, true);
-                p.note = if language {
+                p.note = String::from(if language {
                     "Restart and Quit lose what was played since the last save. Change language starts the game \
                      again and asks for the language."
                 } else {
                     "Restart and Quit lose what was played since the last save."
-                };
+                });
                 Some(p)
             }
             Mode::Options => {
@@ -557,14 +590,17 @@ impl Touch {
                     false,
                 );
                 cell(&mut p, PBtn::OptReset, "Reset layout".into(), 1.0, 2.0, false);
-                cell(
-                    &mut p,
-                    PBtn::OptFps,
-                    format!("Show FPS: {}", if st.show_fps { "On" } else { "Off" }),
-                    0.0,
-                    3.0,
-                    false,
-                );
+                // A debug tool: left out (its place stays empty) without the debug tools.
+                if self.debug {
+                    cell(
+                        &mut p,
+                        PBtn::OptFps,
+                        format!("Show FPS: {}", if st.show_fps { "On" } else { "Off" }),
+                        0.0,
+                        3.0,
+                        false,
+                    );
+                }
                 cell(
                     &mut p,
                     PBtn::OptPicture,
@@ -574,7 +610,9 @@ impl Touch {
                     false,
                 );
                 cell(&mut p, PBtn::Back, "Back".into(), 0.0, 4.0, true);
-                p.note = "Saved on this device only, in ssd.settings. Auto battle switches to the minimal layout in fights.";
+                p.note = String::from(
+                    "Saved on this device only, in ssd.settings. Auto battle switches to the minimal layout in fights.",
+                );
                 Some(p)
             }
             Mode::Edit => {
@@ -600,7 +638,9 @@ impl Touch {
                 row(&mut p, PBtn::OpDown, PBtn::OpUp, 118.0);
                 cell(&mut p, PBtn::EditReset, "Reset to default".into(), 0.0, 4.0, false);
                 cell(&mut p, PBtn::Done, "Done".into(), 1.0, 4.0, true);
-                p.note = "Drag a control, or its square handles to resize it. Saved on this device only.";
+                p.note = String::from(
+                    "Drag a control, or its square handles to resize it. Saved on this device only.",
+                );
                 Some(p)
             }
         }
@@ -1173,6 +1213,158 @@ mod tests {
         t.geometry().item(btn).unwrap().shape.bounds().center()
     }
 
+    /// The Taiwan table the APK brings (`translations/zh-tw/ui-zh-tw.tsv`).
+    fn taiwan() -> std::sync::Arc<ssd_menus::ui_text::UiText> {
+        std::sync::Arc::new(ssd_menus::ui_text::UiText::parse(include_str!(
+            "../../../translations/zh-tw/ui-zh-tw.tsv"
+        )))
+    }
+
+    /// Every panel the touch layer can show, each as (title, labels, note): the MENU on the map and in a battle, the
+    /// GAME page idle and with each button armed, the options with every toggle both ways (and the debug tools' Show
+    /// FPS), the edit mode.
+    fn every_panel(t: &mut Touch) -> Vec<(String, Vec<String>, String)> {
+        let mut out = Vec::new();
+        let mut take = |t: &Touch| {
+            let p = t.panel().expect("a panel is up");
+            out.push((p.title, p.buttons.into_iter().map(|b| b.label).collect(), p.note));
+        };
+        t.debug = true;
+        for battle in [false, true] {
+            t.in_battle = battle;
+            t.mode = Mode::Menu;
+            take(t);
+        }
+        t.mode = Mode::Game;
+        for armed in [None, Some(PBtn::Restart), Some(PBtn::Quit), Some(PBtn::ChangeLanguage)] {
+            t.armed = armed;
+            take(t);
+        }
+        t.armed = None;
+        t.mode = Mode::Options;
+        for on in [false, true] {
+            t.settings.stick = on;
+            t.settings.haptics = on;
+            t.settings.auto_battle = on;
+            t.settings.hide_pad = on;
+            t.settings.show_fps = on;
+            for picture in
+                [settings::Picture::Standard, settings::Picture::Large, settings::Picture::Full]
+            {
+                t.settings.picture = picture;
+                take(t);
+            }
+        }
+        t.mode = Mode::Edit;
+        take(t);
+        out
+    }
+
+    #[test]
+    fn in_chinese_every_panel_has_the_tables_words_and_no_english_left() {
+        let mut t = touch();
+        t.set_words(Some(taiwan()));
+        // Kept as written: the slot's digits, the percent, the file ssd.settings, FPS, and the - and + buttons.
+        let english = |text: &str| {
+            text.replace("ssd.settings", "")
+                .replace("FPS", "")
+                .chars()
+                .any(|c| c.is_ascii_alphabetic())
+        };
+        for (title, labels, note) in every_panel(&mut t) {
+            for text in std::iter::once(&title).chain(&labels).chain(std::iter::once(&note)) {
+                assert!(!english(text), "English left in the touch panel: {text:?}");
+            }
+        }
+        t.mode = Mode::Menu;
+        t.in_battle = false;
+        let menu = t.panel().unwrap();
+        assert_eq!(menu.title, "暫停中");
+        assert_eq!(menu.buttons[0].label, "即時存檔（欄位 1）", "a pattern, the slot carried over");
+        t.mode = Mode::Options;
+        t.settings.stick = false;
+        let options = t.panel().unwrap();
+        assert_eq!(options.title, "觸控選項");
+        assert_eq!(options.buttons[0].label, "版面：十字鍵", "the hole is a word of the table too");
+        for (group, name) in
+            [(Group::Dpad, "已選：十字鍵"), (Group::Menu, "已選：選單鍵"), (Group::L, "已選：L 鍵")]
+        {
+            assert_eq!(t.tr(&format!("Selected: {}", group.name())), name);
+        }
+        // The GAME page's Change language shows only where the player has a translation (a global of the Options).
+        assert_eq!(t.tr("Change language"), "切換語言");
+        assert!(!english(&t.tr(
+            "Restart and Quit lose what was played since the last save. Change language starts the game again and \
+             asks for the language."
+        )));
+        for (english, chinese) in
+            [("MENU", "選單"), ("MIN", "精簡"), ("FULL", "完整"), ("touch zone", "觸控區")]
+        {
+            assert_eq!(t.tr(english), chinese);
+        }
+    }
+
+    #[test]
+    fn in_english_the_panels_say_exactly_what_they_always_said() {
+        let mut t = touch();
+        t.set_words(None);
+        t.settings.opacity = 75;
+        let panels = every_panel(&mut t);
+        let (title, labels, note) = &panels[0];
+        assert_eq!(title, "PAUSED");
+        assert_eq!(
+            labels,
+            &[
+                "Save state (slot 1)",
+                "Load state (slot 1)",
+                "Options",
+                "Edit layout",
+                "Hide controls",
+                "Game: restart, quit",
+                "State slot: 1",
+                "Resume"
+            ]
+        );
+        assert_eq!(
+            note,
+            "Menu pauses the game. State slot picks the slot of Save and Load (1 to 4)."
+        );
+        assert_eq!(panels[1].1[3], "Cheats", "in a battle");
+        let (title, labels, _) = &panels[3];
+        assert_eq!(title, "GAME");
+        assert_eq!(labels[0], "Tap again: restart");
+        let (title, labels, note) = &panels[11];
+        assert_eq!(title, "TOUCH OPTIONS");
+        assert_eq!(
+            labels,
+            &[
+                "Layout: Stick",
+                "Opacity: 75%",
+                "Haptics: On",
+                "Auto battle: On",
+                "Hide w/ pad: On",
+                "Reset layout",
+                "Show FPS: On",
+                "Picture: Full screen",
+                "Back"
+            ]
+        );
+        assert_eq!(
+            note,
+            "Saved on this device only, in ssd.settings. Auto battle switches to the minimal layout in fights."
+        );
+        let (title, labels, note) = panels.last().unwrap();
+        assert_eq!(title, "EDIT LAYOUT");
+        assert_eq!(labels, &["-", "+", "-", "+", "Reset to default", "Done"]);
+        assert_eq!(
+            note,
+            "Drag a control, or its square handles to resize it. Saved on this device only."
+        );
+        for text in ["MENU", "MIN", "FULL", "touch zone", "Selected: D-pad", "Size", "Opacity"] {
+            assert_eq!(t.tr(text), text);
+        }
+    }
+
     #[test]
     fn a_finger_on_a_d_pad_cell_holds_that_direction_and_leaving_releases() {
         let mut t = touch();
@@ -1210,6 +1402,19 @@ mod tests {
         assert!(t.pressed()[4]);
         t.finger_motion(1, centre(&t, Btn::B));
         assert!(t.pressed()[5] && !t.pressed()[4]);
+    }
+
+    #[test]
+    fn the_options_offer_show_fps_only_with_the_debug_tools() {
+        let mut t = touch();
+        assert!(!t.debug, "the debug tools are off by default");
+        t.mode = Mode::Options;
+        let ids: Vec<PBtn> = t.panel().unwrap().buttons.iter().map(|b| b.id).collect();
+        assert!(!ids.contains(&PBtn::OptFps), "no Show FPS: {ids:?}");
+        assert!(ids.contains(&PBtn::OptPicture) && ids.contains(&PBtn::Back), "the rest stays");
+        t.debug = true;
+        let ids: Vec<PBtn> = t.panel().unwrap().buttons.iter().map(|b| b.id).collect();
+        assert!(ids.contains(&PBtn::OptFps), "Show FPS with the debug tools on: {ids:?}");
     }
 
     #[test]

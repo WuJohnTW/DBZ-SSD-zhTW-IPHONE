@@ -906,3 +906,245 @@ fn the_editor_draws_three_digit_levels_and_a_ten_digit_bp_inside_its_windows() {
     }
     assert_no_collision(&list);
 }
+
+/// The zh-tw table of the language pack (`translations/zh-tw/ui-zh-tw.tsv`), as the app reads it.
+fn zh_tw() -> crate::ui_text::UiText {
+    crate::ui_text::UiText::parse(include_str!("../../../../translations/zh-tw/ui-zh-tw.tsv"))
+}
+
+/// The runs of `list` after the zh-tw table, and the runs among them that still hold an English word: a word that is
+/// not a button's name (A, B, X, Y, L R, Start, Select), the N of a count, the P of the zeni (the table keeps it), nor a
+/// name of the fixture's labels (the editor shows the labels it is given; the app gives it the translated ones). An
+/// object's name and help line count only whole (`Obj{id}`, `Help {id}`): a lone "Obj" or "Help" of the screen's own
+/// words is English.
+fn zh_tw_runs(mut list: DrawList, table: &crate::ui_text::UiText) -> (Vec<String>, Vec<String>) {
+    const KEPT: [&str; 10] = ["A", "B", "X", "Y", "L", "R", "N", "P", "Start", "Select"];
+    let names = labels();
+    let named = |word: &str| names.characters.iter().any(|c| c.name == word);
+    // Longest first, so "Help 1" does not take the front of "Help 12".
+    let mut whole: Vec<String> = names
+        .objects
+        .iter()
+        .flat_map(|o| std::iter::once(o.name.clone()).chain(o.help.iter().cloned()))
+        .collect();
+    whole.sort_by_key(|s| std::cmp::Reverse(s.len()));
+    list.map_text(|text| table.get(text));
+    let runs: Vec<String> = list.texts().map(|(_, _, t)| t.to_owned()).collect();
+    let english = runs
+        .iter()
+        .filter(|run| {
+            let rest = whole.iter().fold((*run).clone(), |rest, s| rest.replace(s.as_str(), " "));
+            rest.split(|c: char| !c.is_ascii_alphabetic())
+                .any(|word| !word.is_empty() && !KEPT.contains(&word) && !named(word))
+        })
+        .cloned()
+        .collect();
+    (runs, english)
+}
+
+#[test]
+fn with_the_zh_tw_table_the_editors_screens_keep_no_english_run() {
+    let table = zh_tw();
+    let check = |list: DrawList, what: &str| -> Vec<String> {
+        let (runs, english) = zh_tw_runs(list, &table);
+        assert!(english.is_empty(), "{what}: still English {english:?} in {runs:?}");
+        runs
+    };
+    assert!(check(title_strip(), "title strip").contains(&"編輯存檔".to_owned()));
+    let mut e = editor();
+    assert!(check(scene(&e), "slot picker").contains(&"編輯存檔".to_owned()));
+    e.key(Key::A);
+    assert!(check(scene(&e), "party page").contains(&"存檔欄 01".to_owned()));
+    // Gohan with a level and a BP of his own: the "was", the stops and the delta of the rows.
+    e.key(Key::R);
+    e.key(Key::Right);
+    e.key(Key::Down);
+    e.key(Key::Right);
+    let member = check(scene(&e), "member panel");
+    assert!(member.iter().any(|t| t.contains("比遊戲原值")), "{member:?}");
+    assert!(
+        member.contains(&"-- 編輯 --".to_owned())
+            && member.contains(&"-- 隨等級變動 --".to_owned())
+    );
+    for _ in 0..2 {
+        e.key(Key::R);
+    }
+    assert!(check(scene(&e), "bag page").contains(&"背包".to_owned()));
+    e.key(Key::X);
+    assert!(check(scene(&e), "add object").contains(&"-- 加入卡牌 --".to_owned()));
+    e.key(Key::B);
+    e.key(Key::Start);
+    let sheet = check(scene(&e), "write sheet");
+    assert!(sheet.iter().any(|t| t.starts_with("把變更寫入存檔欄 01")), "{sheet:?}");
+    assert!(sheet.iter().any(|t| t.starts_with("隊伍：Gohan ＬＶ")), "{sheet:?}");
+    // The picker's question on the fixture's story object (26).
+    let mut e = on_bag();
+    e.key(Key::X);
+    for _ in 0..26 {
+        e.key(Key::R);
+    }
+    e.key(Key::A);
+    assert!(matches!(e.stage(), Stage::Ask(..)));
+    let ask = check(scene(&e), "story question");
+    assert!(ask.iter().any(|t| t.starts_with("劇情會檢查這張卡牌。加入")), "{ask:?}");
+    // 0.3.12: a pack's level cap (999) and the wide BP. Gohan past level 48, its cap's notice, a ten-digit BP whose
+    // note is too long for the window (the short "+N  (Y)"), the BP's cap and floor, and the write sheet.
+    let mut e = with_the_pack(999, &ModsSidecar::empty(), &cartridge());
+    e.change_level(979);
+    let wide = check(scene(&e), "member panel past level 48");
+    assert!(
+        wide.contains(&"ＬＶ 999".to_owned()) && wide.contains(&"原為 20  ·  上限 999".to_owned()),
+        "{wide:?}"
+    );
+    e.change_level(1);
+    let cap = check(scene(&e), "level cap notice");
+    assert!(cap.contains(&"Gohan的等級上限是 ＬＶ 999。".to_owned()), "{cap:?}");
+    e.change_bp(1_700_000_000);
+    let long = check(scene(&e), "ten-digit BP");
+    assert!(long.contains(&"原為 8050  ·  +1700000000  （Y）".to_owned()), "{long:?}");
+    e.change_bp(20_000_000_000);
+    let top = check(scene(&e), "BP cap");
+    assert!(
+        top.contains(&"ＢＰ 9999999999".to_owned())
+            && top.contains(&"ＢＰ 上限是 9999999999。".to_owned()),
+        "{top:?}"
+    );
+    e.change_bp(-20_000_000_000);
+    let floor = check(scene(&e), "BP floor");
+    assert!(floor.contains(&"ＢＰ 上限是 0。".to_owned()), "{floor:?}");
+    assert!(
+        floor.iter().any(|t| t.starts_with("原為 8050  ·  -") && t.ends_with("  （Y）")),
+        "{floor:?}"
+    );
+    e.key(Key::Start);
+    let sheet = check(scene(&e), "write sheet past level 48");
+    assert!(sheet.contains(&"隊伍：Gohan ＬＶ 20 > 999（ＢＰ 8050 > 0）".to_owned()), "{sheet:?}");
+}
+
+#[test]
+fn with_the_zh_tw_table_the_latency_row_its_choices_and_its_help_are_chinese() {
+    // The Look row under it is the picture's look (外觀), not the field menu's Look (調查) the table has for the map.
+    use crate::options::Category;
+    let table = zh_tw();
+    let rows = Category::Video.rows();
+    let row = rows.iter().position(|row| row.key == "video.latency").unwrap();
+    for (choice, word) in [(0, "低"), (1, "平滑")] {
+        let mut values: Vec<usize> =
+            rows.iter().map(crate::options::RowDef::default_index).collect();
+        values[row] = choice;
+        let view = crate::view::OptionsView {
+            category: Category::Video,
+            row,
+            values,
+            confirm: None,
+            video: None,
+            controls: None,
+        };
+        let mut list = crate::screens::options_screen(&view);
+        list.map_text(|text| table.get_in(Some("options"), text));
+        let runs: Vec<String> = list.texts().map(|(_, _, t)| t.to_owned()).collect();
+        assert!(runs.contains(&"延遲".to_owned()) && runs.contains(&word.to_owned()), "{runs:?}");
+        assert!(
+            runs.contains(&"外觀".to_owned()) && !runs.iter().any(|t| t.contains("調查")),
+            "{runs:?}"
+        );
+        assert!(
+            runs.concat().contains("「平滑」會在執行下一幀的同時繪製畫面：效能較好，但畫面晚一幀。「低」則每幀立即顯示。"),
+            "{runs:?}"
+        );
+        for english in ["Latency", "Low", "Smooth", "frame", "Look"] {
+            assert!(!runs.iter().any(|t| t.contains(english)), "{english}: {runs:?}");
+        }
+    }
+}
+
+#[test]
+fn with_the_zh_tw_table_the_accessibility_text_group_is_text_not_the_menus_text_speed() {
+    // The group of Text size and Language is the text (文字); the table's lone Text is the menu's text speed (速度).
+    use crate::options::Category;
+    let table = zh_tw();
+    let rows = Category::Accessibility.rows();
+    let row = rows.iter().position(|row| row.group == "Text").unwrap();
+    let view = crate::view::OptionsView {
+        category: Category::Accessibility,
+        row,
+        values: rows.iter().map(crate::options::RowDef::default_index).collect(),
+        confirm: None,
+        video: None,
+        controls: None,
+    };
+    let mut list = crate::screens::options_screen(&view);
+    list.map_text(|text| table.get_in(Some("options"), text));
+    let runs: Vec<String> = list.texts().map(|(_, _, t)| t.to_owned()).collect();
+    assert!(
+        runs.contains(&"-- 文字 --".to_owned()) && runs.contains(&"文字大小".to_owned()),
+        "{runs:?}"
+    );
+    assert!(!runs.iter().any(|t| t.contains("速度")), "{runs:?}");
+}
+
+#[test]
+fn with_the_zh_tw_table_the_language_row_shows_the_name_and_its_help_holds_the_attribution() {
+    // The translator's name is on the Language row's help: on the language's name it ran into the English choice
+    // and past the window (the row is laid out with the name, then the table made it longer).
+    use crate::options::Category;
+    let _guard =
+        crate::options::LANGUAGES_LOCK.lock().unwrap_or_else(std::sync::PoisonError::into_inner);
+    crate::options::offer_languages(vec![crate::language::Locale {
+        language: crate::language::Language::from_code("zh-tw").unwrap(),
+        name: "繁體中文（台灣）".to_owned(),
+    }]);
+    let table = zh_tw();
+    let rows = Category::Accessibility.rows();
+    let row = rows.iter().position(|row| row.key == crate::language::Language::KEY).unwrap();
+    let mut values: Vec<usize> = rows.iter().map(crate::options::RowDef::default_index).collect();
+    values[row] = 1;
+    let view = crate::view::OptionsView {
+        category: Category::Accessibility,
+        row,
+        values,
+        confirm: None,
+        video: None,
+        controls: None,
+    };
+    let mut list = crate::screens::options_screen(&view);
+    crate::options::offer_languages(Vec::new());
+    list.map_text(|text| table.get_in(Some("options"), text));
+    let runs: Vec<String> = list.texts().map(|(_, _, t)| t.to_owned()).collect();
+    assert!(runs.contains(&"繁體中文（台灣）".to_owned()), "{runs:?}");
+    assert!(!runs.iter().any(|t| t.contains("By Ming Liu")), "{runs:?}");
+    assert!(
+        runs.concat().contains("取自資料夾裡的譯文。繁體中文（台灣）翻譯：Ming Liu"),
+        "{runs:?}"
+    );
+    // Each run inside the window's frame, at the widths the CJK face draws (an em for a non-ASCII character).
+    let wide = |text: &str, size: f32| {
+        text.chars()
+            .map(|c| if c.is_ascii() { crate::layout::ADVANCE * size } else { size })
+            .sum::<f32>()
+    };
+    let mut drawn = Vec::new();
+    for op in list.ops() {
+        if let Op::Text { x, y, text, size, align, .. } = op {
+            let width = wide(text, *size);
+            let left = match align {
+                Align::Left => *x,
+                Align::Right => x - width,
+                Align::Centre => x - width / 2.0,
+            };
+            assert!(
+                left >= crate::layout::MARGIN && left + width <= WIDTH - crate::layout::MARGIN,
+                "{text}: {left}..{}",
+                left + width
+            );
+            drawn.push((left, left + width, *y, text.clone()));
+        }
+    }
+    for (n, a) in drawn.iter().enumerate() {
+        for b in &drawn[n + 1..] {
+            if (a.2 - b.2).abs() < 1.0 {
+                assert!(a.1 + 2.0 <= b.0 || b.1 + 2.0 <= a.0, "{a:?} runs into {b:?}");
+            }
+        }
+    }
+}

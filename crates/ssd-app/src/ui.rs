@@ -42,6 +42,44 @@ pub struct Status {
     pub means_missing: bool,
     /// Freezes the machine holds.
     pub freezes: usize,
+    /// The sound and the battle speed of the window frame; `None` where no window frame runs paced (a snapshot).
+    pub live: Option<Live>,
+}
+
+/// What the pill shows of the window frame beside the rate: the sound queued and its gaps, as the touch overlay shows
+/// them, and whether the battle speed is on with the frames the window frame asked for and ran.
+#[derive(Debug, Clone, Copy, Default)]
+pub struct Live {
+    /// The sound queued at the device, in milliseconds (`Audio::health`).
+    pub queued_ms: f32,
+    /// The times the queue ran dry with sound waiting (`Audio::health`).
+    pub gaps: u32,
+    /// The battle speed, if it is on (`Pacer::tempo`: frames of the game, refreshes).
+    pub tempo: Option<(u32, u32)>,
+    /// The frames of the game the window frame asked for.
+    pub requested: u32,
+    /// The frames of the game the window frame ran.
+    pub run: u32,
+    /// The slow window frames of the run (over 100 ms) and the slowest, in milliseconds.
+    pub slow: u32,
+    pub slowest_ms: f32,
+}
+
+/// The pill's text of the window frame: `sound 42 ms · 0 gaps · battle 1.5x · 2/2 frames · slow 0 · max 0 ms` (or
+/// `battle 2x`), with `battle 1x` off.
+fn live_text(live: &Live) -> String {
+    let sound = format!("sound {:.0} ms \u{b7} {} gaps", live.queued_ms, live.gaps);
+    let battle = match live.tempo {
+        Some((frames, refreshes)) => format!(
+            "battle {}x \u{b7} {}/{} frames",
+            f64::from(frames) / f64::from(refreshes.max(1)),
+            live.requested,
+            live.run
+        ),
+        None => "battle 1x".to_owned(),
+    };
+    let slow = format!("slow {} \u{b7} max {:.0} ms", live.slow, live.slowest_ms);
+    format!("{sound} \u{b7} {battle} \u{b7} {slow}")
 }
 
 /// Everything the drawing reads (the game views come apart, see [`draw`]).
@@ -80,7 +118,8 @@ pub type Hd<'a> = Option<Layer<'a>>;
 
 /// Draws the window. `games` are the game views, one frame each: the machine's, or the two of a
 /// verification (A, then B). Actions the user asked for are pushed to `actions`. While an HD menu
-/// is on screen (`hd`), it takes the game's area, and the "F1 debug" pill is left out.
+/// is on screen (`hd`), it takes the game's area, and the "F1 debug" pill is left out; it is also left out without
+/// the debug tools ([`Controls::debug`]).
 pub fn draw(
     ui: &mut Ui,
     view: &View<'_>,
@@ -101,8 +140,8 @@ pub fn draw(
         game_area(ui, games, view.verify_labels.as_ref(), GROUND, hd, None);
     } else {
         game_area(ui, games, view.verify_labels.as_ref(), Color32::BLACK, hd, area);
-        if !on_screen && touch.is_none() {
-            pill(ui.ctx(), view.status.fps, actions);
+        if view.controls.debug && !on_screen && touch.is_none() {
+            pill(ui.ctx(), view.status, actions);
         }
         toast(ui.ctx(), panel, actions);
         let now = ui.ctx().input(|i| i.time);
@@ -142,6 +181,7 @@ fn game_area(
     let overlay = match hd {
         Some(Layer { list, art, menu: true }) => {
             let picture = games.first().map_or(rect, |game| picture_of(ui, rect, game));
+            note_hd_picture(ui, picture);
             hd::paint(ui, picture, list, art);
             ui.allocate_rect(rect, Sense::hover());
             return;
@@ -174,9 +214,43 @@ fn game_area(
     if let Some(Layer { list, art, .. }) = overlay
         && let Some(game) = games.first()
     {
-        hd::paint(ui, picture_of(ui, rect, game), list, art);
+        let picture = picture_of(ui, rect, game);
+        note_hd_picture(ui, picture);
+        hd::paint(ui, picture, list, art);
     }
     ui.allocate_rect(rect, Sense::hover());
+}
+
+/// The egui memory's key of the rect the HD layer was last painted over.
+const HD_PICTURE: &str = "hd-picture";
+
+/// Notes the rect the HD layer is painted over, for the pointer of Esc's question ([`quit_confirm_pointer`]).
+fn note_hd_picture(ui: &Ui, picture: Rect) {
+    ui.ctx().data_mut(|data| data.insert_temp(Id::new(HD_PICTURE), picture));
+}
+
+/// Esc's question under the mouse, once it is drawn: the cursor follows the pointer onto an answer, and a click on
+/// one gives it. The question lies in the HD layer's logical space, fitted to the picture it was painted over.
+pub fn quit_confirm_pointer(
+    ui: &Ui,
+    question: &mut crate::quit_confirm::QuitConfirm,
+) -> Option<crate::quit_confirm::Outcome> {
+    let picture: Rect = ui.ctx().data(|data| data.get_temp(Id::new(HD_PICTURE)))?;
+    let fit = hd::Fit::new(picture);
+    if fit.scale <= 0.0 {
+        return None;
+    }
+    let logical =
+        |at: egui::Pos2| ((at.x - fit.origin.x) / fit.scale, (at.y - fit.origin.y) / fit.scale);
+    let (moved, hover, click) = ui.ctx().input(|input| {
+        let pointer = &input.pointer;
+        let click = if pointer.primary_clicked() { pointer.interact_pos() } else { None };
+        (pointer.delta() != egui::Vec2::ZERO, pointer.hover_pos(), click)
+    });
+    if moved && let Some(at) = hover {
+        question.hover(logical(at));
+    }
+    click.and_then(|at| question.click(logical(at)))
 }
 
 /// One game view fitted in `area`: whole scale in physical pixels, letterboxed.
@@ -210,8 +284,10 @@ fn picture_of(ui: &Ui, area: Rect, game: &GameImage) -> Rect {
 
 // --- panel closed -----------------------------------------------------------------------------
 
-/// The small "F1 debug 60 fps" label top-right; clicking it opens the panel.
-fn pill(ctx: &egui::Context, fps: f32, actions: &mut Vec<PanelAction>) {
+/// The small "F1 debug 60 fps" label top-right, with the window frame's sound and battle speed ([`live_text`]);
+/// clicking it opens the panel.
+fn pill(ctx: &egui::Context, status: Status, actions: &mut Vec<PanelAction>) {
+    let fps = status.fps;
     egui::Area::new(Id::new("pill"))
         .anchor(Align2::RIGHT_TOP, vec2(-12.0, 12.0))
         .order(Order::Foreground)
@@ -229,6 +305,11 @@ fn pill(ctx: &egui::Context, fps: f32, actions: &mut Vec<PanelAction>) {
                     ui.label(
                         RichText::new(format!("{fps:.0} fps")).font(theme::mono(11.0)).color(TEXT),
                     );
+                    if let Some(live) = status.live {
+                        ui.label(
+                            RichText::new(live_text(&live)).font(theme::mono(11.0)).color(TEXT),
+                        );
+                    }
                 });
             });
             let response = ui.interact(inner.response.rect, Id::new("pill-click"), Sense::click());
@@ -714,6 +795,7 @@ mod tests {
                 rust_percent: Some(0.7),
                 means_missing: false,
                 freezes: 1,
+                live: None,
             },
             controls,
             registers: &registers,
@@ -784,7 +866,8 @@ mod tests {
     fn the_closed_window_draws_the_pill_and_a_click_on_it_opens_the_panel() {
         let ctx = ctx();
         let mut panel = PanelState::default();
-        let controls = Controls::new(HooksArg::Original, HooksSwitch::Allowed, true, true);
+        let mut controls = Controls::new(HooksArg::Original, HooksSwitch::Allowed, true, true);
+        controls.debug = true;
         let size = vec2(1170.0, 896.0);
         // The first frames measure the pill; anchored areas settle on the second.
         run_frame(&ctx, size, &mut panel, &controls, vec![]);
@@ -798,6 +881,183 @@ mod tests {
         run_frame(&ctx, size, &mut panel, &controls, vec![egui::Event::PointerMoved(pos)]);
         let actions = run_frame(&ctx, size, &mut panel, &controls, click_at(pos));
         assert_eq!(actions, [PanelAction::TogglePanel]);
+    }
+
+    #[test]
+    fn without_the_debug_tools_the_closed_window_draws_no_pill() {
+        let ctx = ctx();
+        let mut panel = PanelState::default();
+        let controls = Controls::new(HooksArg::Original, HooksSwitch::Allowed, true, true);
+        assert!(!controls.debug, "the debug tools are off by default");
+        let size = vec2(1170.0, 896.0);
+        run_frame(&ctx, size, &mut panel, &controls, vec![]);
+        run_frame(&ctx, size, &mut panel, &controls, vec![]);
+        assert_eq!(ctx.memory(|m| m.area_rect(Id::new("pill"))), None, "no pill");
+        // Where the pill would be, a click asks for nothing.
+        let pos = pos2(size.x - 60.0, 24.0);
+        run_frame(&ctx, size, &mut panel, &controls, vec![egui::Event::PointerMoved(pos)]);
+        let actions = run_frame(&ctx, size, &mut panel, &controls, click_at(pos));
+        assert_eq!(actions, Vec::<PanelAction>::new());
+    }
+
+    /// The texts of the shapes drawn.
+    fn texts(shapes: &[egui::epaint::ClippedShape]) -> Vec<String> {
+        fn walk(shape: &egui::Shape, out: &mut Vec<String>) {
+            match shape {
+                egui::Shape::Text(text) => out.push(text.galley.text().to_owned()),
+                egui::Shape::Vec(shapes) => {
+                    for shape in shapes {
+                        walk(shape, out);
+                    }
+                }
+                _ => {}
+            }
+        }
+        let mut out = Vec::new();
+        for clipped in shapes {
+            walk(&clipped.shape, &mut out);
+        }
+        out
+    }
+
+    #[test]
+    fn the_touch_fps_line_is_drawn_only_with_the_debug_tools() {
+        let ctx = ctx();
+        let controls = Controls::new(HooksArg::Original, HooksSwitch::Allowed, true, true);
+        let (machine, _store) = sram_counter_machine();
+        let history = FrameHistory::default();
+        let registers = machine.cpu_registers();
+        let games = [GameImage {
+            id: egui::TextureId::default(),
+            width: 256,
+            height: 224,
+            pixel_aspect: 1.0,
+        }];
+        let line = "60.0 fps \u{b7} sound 42 ms \u{b7} 0 gaps";
+        let shown = |debug: bool| {
+            // Saved on before: only the debug tools draw it.
+            let settings =
+                crate::touch::settings::Settings { show_fps: true, ..Default::default() };
+            let screen = Rect::from_min_size(pos2(0.0, 0.0), vec2(932.0, 430.0));
+            let mut touch = crate::touch::Touch::new(true, settings, screen);
+            touch.stats = Some(line.to_owned());
+            touch.debug = debug;
+            let view = View {
+                status: Status::default(),
+                controls: &controls,
+                registers: &registers,
+                recording: false,
+                verify_labels: None,
+                machine: &machine,
+                symbols: None,
+                history: &history,
+                touch: Some(&touch),
+            };
+            let raw = egui::RawInput {
+                screen_rect: Some(screen),
+                time: Some(1.0),
+                ..egui::RawInput::default()
+            };
+            let mut panel = PanelState::default();
+            let mut actions = Vec::new();
+            let output =
+                ctx.run_ui(raw, |ui| draw(ui, &view, &games, &mut panel, &mut actions, None));
+            let drawn = texts(&output.shapes);
+            output.drop_without_applying_deltas();
+            drawn
+        };
+        let off = shown(false);
+        assert!(!off.iter().any(|text| text.contains("fps")), "no fps line: {off:?}");
+        let on = shown(true);
+        assert!(on.iter().any(|text| text == line), "the fps line with the debug tools: {on:?}");
+    }
+
+    #[test]
+    fn the_pill_shows_the_sound_gaps_and_the_battle_speed_of_the_window_frame() {
+        let ctx = ctx();
+        let mut controls = Controls::new(HooksArg::Original, HooksSwitch::Allowed, true, true);
+        controls.debug = true;
+        let (machine, _store) = sram_counter_machine();
+        let history = FrameHistory::default();
+        let registers = machine.cpu_registers();
+        let games = [GameImage {
+            id: egui::TextureId::default(),
+            width: 256,
+            height: 224,
+            pixel_aspect: 1.0,
+        }];
+        let shown = |live: Live| {
+            let view = View {
+                status: Status { fps: 60.0, live: Some(live), ..Status::default() },
+                controls: &controls,
+                registers: &registers,
+                recording: false,
+                verify_labels: None,
+                machine: &machine,
+                symbols: None,
+                history: &history,
+                touch: None,
+            };
+            let mut panel = PanelState::default();
+            let mut texts_drawn = Vec::new();
+            // The first frame measures the pill; anchored areas settle on the second.
+            for _ in 0..2 {
+                let raw = egui::RawInput {
+                    screen_rect: Some(Rect::from_min_size(pos2(0.0, 0.0), vec2(1170.0, 896.0))),
+                    time: Some(1.0),
+                    ..egui::RawInput::default()
+                };
+                let mut actions = Vec::new();
+                let output =
+                    ctx.run_ui(raw, |ui| draw(ui, &view, &games, &mut panel, &mut actions, None));
+                texts_drawn = texts(&output.shapes);
+                output.drop_without_applying_deltas();
+            }
+            texts_drawn
+        };
+        let on = shown(Live {
+            queued_ms: 42.4,
+            gaps: 7,
+            tempo: Some((3, 2)),
+            requested: 2,
+            run: 1,
+            slow: 4,
+            slowest_ms: 312.6,
+        });
+        assert!(on.iter().any(|text| text == "60 fps"), "{on:?}");
+        assert!(
+            on.iter().any(|text| text
+                == "sound 42 ms \u{b7} 7 gaps \u{b7} battle 1.5x \u{b7} 2/1 frames \u{b7} slow 4 \u{b7} max 313 ms"),
+            "{on:?}"
+        );
+        let off = shown(Live {
+            queued_ms: 30.0,
+            gaps: 3,
+            tempo: None,
+            requested: 1,
+            run: 1,
+            slow: 0,
+            slowest_ms: 0.0,
+        });
+        assert!(
+            off.iter().any(|text| text
+                == "sound 30 ms \u{b7} 3 gaps \u{b7} battle 1x \u{b7} slow 0 \u{b7} max 0 ms"),
+            "{off:?}"
+        );
+        let double = shown(Live {
+            queued_ms: 120.0,
+            gaps: 0,
+            tempo: Some((2, 1)),
+            requested: 2,
+            run: 2,
+            slow: 0,
+            slowest_ms: 0.0,
+        });
+        assert!(
+            double.iter().any(|text| text
+                == "sound 120 ms \u{b7} 0 gaps \u{b7} battle 2x \u{b7} 2/2 frames \u{b7} slow 0 \u{b7} max 0 ms"),
+            "{double:?}"
+        );
     }
 
     #[test]

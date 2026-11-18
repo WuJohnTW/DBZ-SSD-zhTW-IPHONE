@@ -26,6 +26,7 @@ const SAME_COLOUR: u32 = 24;
 /// first (a pose drawn in other colours than any art was made for: a fade-in whitened or darkened
 /// by the screen's colour math, a flash on some indexes, a body in another fighter's colours). Among
 /// the groups on a par the smallest silhouette that holds every opaque pixel of the pose is the one.
+/// Whether that art can draw the pose is [`draws`].
 pub(crate) fn containing(
     index: &ArtIndex,
     row: &[[u8; 3]; 16],
@@ -83,6 +84,22 @@ pub(crate) fn containing(
         start = end;
     }
     None
+}
+
+/// Whether art made for `palette` that holds `pose` (see [`containing`]) can draw it in the colours
+/// of `row`: not when the pose shows a colour index the palette has no colour for (a rock the
+/// screen's edge cuts, held by the white and blue art of a ki aura, `field-fg-46edb50fbe`, colours
+/// only at 12 and 14, was drawn black), nor when the row has two colours where the palette has one
+/// ([`super::recolour::merges`]: the all-black silhouette `field-fg-9a2f097aa8` held the same rock
+/// and drew a black blob), nor, for a piece the screen's edge cuts ([`Pose::cut`], drawn in its own
+/// colours, not a fade's), when none of its colours is right. Such a holder is some other figure,
+/// and the piece keeps the game's sprite: looking on for another holder found other figures still
+/// (a face's art for the same rock).
+pub(crate) fn draws(palette: &Palette, row: &[[u8; 3]; 16], pose: &Pose) -> bool {
+    let used = pose.arr.iter().filter(|&&c| c != 0).fold(0_u16, |used, &c| used | 1 << (c & 15));
+    palette.mask & used == used
+        && !super::recolour::merges(palette, row)
+        && (!pose.cut || matching(palette, row, used) > 0)
 }
 
 /// How many of the colour indexes in `used` (a bit each) that `palette` has colours for the pose
@@ -222,6 +239,41 @@ mod tests {
         effect.palette = Palette::default();
         let index = ArtIndex::new(Vec::new(), vec![effect]);
         assert_eq!(containing(&index, &row(), &pose(4, 4, &[(0, 0)])), None);
+    }
+
+    #[test]
+    fn art_without_a_colour_of_the_piece_or_of_one_colour_for_two_of_the_row_cannot_draw_it() {
+        // The piece shows colour 1 and colour 2
+        let mut piece = pose(4, 4, &[(0, 0), (1, 1)]);
+        piece.arr[5] = 2;
+        let mut row = row();
+        row[2] = [0, 200, 0];
+        let palette = |colours: &[(usize, [u8; 3])]| {
+            let mut palette = Palette::default();
+            for &(index, colour) in colours {
+                palette.mask |= 1 << index;
+                palette.colors[index] = colour;
+            }
+            palette
+        };
+        // Art with colours for 1 and 2, other colours (a fade): it draws the piece
+        let both = palette(&[(1, [90, 0, 0]), (2, [0, 90, 0])]);
+        assert!(draws(&both, &row, &piece));
+        // Art with no colour 2 (a ki aura's white and blue for a rock): not
+        let aura = palette(&[(1, [255, 255, 255]), (12, [214, 247, 255])]);
+        assert!(!draws(&aura, &row, &piece), "no colour 2");
+        // Art of one colour for 1 and 2 (a black silhouette) while the row has two: not
+        let silhouette = palette(&[(1, [0, 0, 0]), (2, [0, 0, 0])]);
+        assert!(!draws(&silhouette, &row, &piece), "one for two");
+        // The row's own two colours one too (a fade to black): it draws the piece
+        row[1] = [0, 0, 0];
+        row[2] = [0, 0, 0];
+        assert!(draws(&silhouette, &row, &piece));
+        // Cut by the screen's edge, it needs a colour of its own in the art: the faded art has none
+        // of the row's, the silhouette has both
+        piece.cut = true;
+        assert!(!draws(&both, &row, &piece), "a cut piece, no colour right");
+        assert!(draws(&silhouette, &row, &piece));
     }
 
     #[test]

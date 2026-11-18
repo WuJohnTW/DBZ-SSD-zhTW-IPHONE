@@ -269,6 +269,9 @@ pub struct Controls {
     pub can_step: bool,
     /// A verification runs: it has the machines, so the game does not step.
     pub verifying: bool,
+    /// The debug tools are on (`--debug` or `SSD_DEBUG=1`): the panel opens and the "F1 debug" pill is drawn. Off
+    /// by default, so a public build shows neither; the window sets it from the command line.
+    pub debug: bool,
 }
 
 impl Controls {
@@ -290,6 +293,7 @@ impl Controls {
             freezes_allowed,
             can_step: false,
             verifying: false,
+            debug: false,
         }
     }
 
@@ -298,8 +302,9 @@ impl Controls {
     /// mode that cannot be changed or is the current one do nothing.
     pub fn apply(&mut self, action: PanelAction, panel: &mut PanelState) -> Option<Effect> {
         match action {
-            PanelAction::TogglePanel => panel.toggle(),
-            PanelAction::OpenTab(tab) => panel.open_tab(tab),
+            // The panel opens only with the debug tools on: F1, the pill and a toast's "Open" do nothing without.
+            PanelAction::TogglePanel if self.debug => panel.toggle(),
+            PanelAction::OpenTab(tab) if self.debug => panel.open_tab(tab),
             PanelAction::TogglePause => self.paused = !self.paused,
             PanelAction::NextFrame if self.paused && !self.verifying => {
                 return Some(Effect::StepFrame);
@@ -336,7 +341,9 @@ impl Controls {
             // hook mode that cannot be changed or is the current one, a routine or freeze that
             // cannot change: nothing to do. The debugger's and replays' actions change the
             // machine too: the app carries them out.
-            PanelAction::NextFrame
+            PanelAction::TogglePanel
+            | PanelAction::OpenTab(_)
+            | PanelAction::NextFrame
             | PanelAction::SelectSlot(_)
             | PanelAction::LoadState
             | PanelAction::SetHooks(_)
@@ -448,12 +455,33 @@ mod tests {
     #[test]
     fn the_panel_starts_closed_and_f1_toggles_it() {
         let (mut c, mut p) = controls();
+        c.debug = true;
         assert!(!p.open);
         assert_eq!(c.apply(PanelAction::TogglePanel, &mut p), None);
         assert!(p.open);
         c.apply(PanelAction::TogglePanel, &mut p);
         assert!(!p.open);
         assert_eq!(p.tab, Tab::Routines, "the tab is kept");
+    }
+
+    #[test]
+    fn without_the_debug_tools_f1_and_the_toasts_open_nothing() {
+        let (mut c, mut p) = controls();
+        assert!(!c.debug, "the debug tools are off by default");
+        // F1 is still the panel's key; the action it stands for does nothing.
+        let f1 = route_key(crate::hotkeys::fixed_hotkey(sdl3::keyboard::Scancode::F1), false);
+        let KeyRoute::Action(action) = f1 else { panic!("F1 is the panel's key: {f1:?}") };
+        assert_eq!(c.apply(action, &mut p), None);
+        assert!(!p.open, "F1 opens no panel");
+        p.push_toast("Divergence in x".to_owned(), Tab::Replays, 100.0);
+        assert_eq!(c.apply(PanelAction::OpenTab(Tab::Replays), &mut p), None);
+        assert!(!p.open && p.tab == Tab::Routines, "a toast's Open opens no panel");
+        // On, F1 opens and closes it as before.
+        c.debug = true;
+        c.apply(action, &mut p);
+        assert!(p.open, "F1 opens the panel with the debug tools on");
+        c.apply(action, &mut p);
+        assert!(!p.open);
     }
 
     #[test]
@@ -620,6 +648,7 @@ mod tests {
     #[test]
     fn a_toast_lasts_a_while_and_only_shows_with_the_panel_closed() {
         let (mut c, mut p) = controls();
+        c.debug = true;
         p.push_toast("Divergence in x".to_owned(), Tab::Replays, 100.0);
         assert_eq!(p.toast(100.0).map(|t| t.text.as_str()), Some("Divergence in x"));
         assert!(p.toast(100.0 + TOAST_SECONDS - 0.1).is_some());

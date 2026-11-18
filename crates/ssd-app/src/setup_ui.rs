@@ -4,18 +4,28 @@
 use crate::hd::{Art, Fit, paint_fit};
 use crate::theme;
 use ssd_menus::setup::{self, Command, Setup};
+use ssd_menus::ui_text::UiText;
 
-/// Paints `setup` over the whole of `ui`, and returns the command of the button that was tapped or clicked.
-pub fn show(ui: &mut egui::Ui, setup: &Setup, art: &mut Art) -> Option<Command> {
+/// Paints `setup` over the whole of `ui`, its words in the language of `words` (the HD menus' table,
+/// `crate::lang::interface_text`; `None`: English), and returns the command of the button that was tapped or clicked.
+pub fn show(
+    ui: &mut egui::Ui,
+    setup: &Setup,
+    words: Option<&UiText>,
+    art: &mut Art,
+) -> Option<Command> {
     let area = ui.available_rect_before_wrap();
     let fit = Fit::sized(area, setup::WIDTH, setup::HEIGHT);
     ui.painter().rect_filled(area, 0.0, egui::Color32::from_rgb(0x0B, 0x07, 0x06));
     // A label is cut in the font it is drawn with (the game's, with the player's Chinese font after its own), so a
     // Chinese name is measured by its real glyphs, not by the Latin face's.
     let painter = ui.painter();
-    let scene = setup.scene_with(&|text, size, room| {
-        theme::fit_text(painter, text, &theme::game(size * fit.scale), room * fit.scale)
-    });
+    let scene = setup.scene_in(
+        &|text, size, room| {
+            theme::fit_text(painter, text, &theme::game(size * fit.scale), room * fit.scale)
+        },
+        &|text| words.and_then(|words| words.get(text)),
+    );
     paint_fit(ui, area, &fit, &scene, art);
     let mut chosen = None;
     for (index, button) in setup.buttons().iter().enumerate() {
@@ -114,7 +124,11 @@ mod tests {
         for (name, setup) in &pages {
             let pixels = offscreen
                 .draw(&[], |ui, _| {
-                    assert_eq!(show(ui, setup, &mut art), None, "nothing is tapped in a snapshot");
+                    assert_eq!(
+                        show(ui, setup, None, &mut art),
+                        None,
+                        "nothing is tapped in a snapshot"
+                    );
                 })
                 .expect("the page draws");
             assert!(

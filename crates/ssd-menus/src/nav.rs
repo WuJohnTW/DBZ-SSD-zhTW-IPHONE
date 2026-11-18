@@ -1279,7 +1279,7 @@ mod tests {
         assert_eq!(key(&mut nav, Key::Up), Action::None);
         assert_eq!(nav.options_row(), 0);
         assert_eq!(key(&mut nav, Key::Up), Action::None);
-        assert_eq!(nav.options_row(), 5, "Up wraps to the last of the six rows");
+        assert_eq!(nav.options_row(), 6, "Up wraps to the last of the seven rows");
         assert_eq!(key(&mut nav, Key::Down), Action::None);
         assert_eq!(nav.options_row(), 0, "the rows wrap");
         assert_eq!(key(&mut nav, Key::Down), Action::None);
@@ -1906,16 +1906,16 @@ mod tests {
         nav.enter(Screen::Options);
         nav.key(Key::Tab, false, false, 0);
         assert_eq!(nav.options_category(), Category::Gameplay);
-        for _ in 0..5 {
+        for _ in 0..6 {
             nav.key(Key::Down, false, false, 0);
         }
-        assert_eq!(nav.options_row(), 5, "the Data packs button is the last row");
+        assert_eq!(nav.options_row(), 6, "the Data packs button is the last row");
         assert_eq!(nav.key(Key::Confirm, false, false, 0), Action::OptionsOpen(Opens::Packs));
         nav.enter(Screen::Mods);
         assert_eq!(nav.mods_cursor(), 0, "the screen opens on its first line");
         assert_eq!(nav.key_mods(Key::Cancel, &[]), Action::Back);
         nav.resume(Screen::Options);
-        assert_eq!(nav.options_row(), 5, "back on the Options, on the button");
+        assert_eq!(nav.options_row(), 6, "back on the Options, on the button");
     }
 
     #[test]

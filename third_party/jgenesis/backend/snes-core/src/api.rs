@@ -227,6 +227,37 @@ struct Hooks {
     hit: Option<u32>,
 }
 
+/// The APU's clock relative to the main clock, `num / den` (not part of save states). 1/1, the
+/// default, hands the APU the master cycles of each tick unchanged, as upstream does; any other
+/// ratio hands it that share of them, the cycles of the division left over carried to the next
+/// tick, so the APU runs exactly `num / den` of its clocks over a frame.
+#[derive(Debug, Clone, Copy, FakeEncode, FakeDecode)]
+struct ApuClockScale {
+    num: u64,
+    den: u64,
+    /// `num * cycles` left over by the last division by `den` (less than `den`).
+    remainder: u64,
+}
+
+impl Default for ApuClockScale {
+    fn default() -> Self {
+        Self { num: 1, den: 1, remainder: 0 }
+    }
+}
+
+impl ApuClockScale {
+    /// The master cycles the APU runs for a tick of `master_cycles` main master cycles.
+    #[inline]
+    fn apu_master_cycles(&mut self, master_cycles: u64) -> u64 {
+        if self.num == self.den {
+            return master_cycles;
+        }
+        let scaled = master_cycles * self.num + self.remainder;
+        self.remainder = scaled % self.den;
+        scaled / self.den
+    }
+}
+
 #[derive(Encode, Decode, PartialClone)]
 pub struct SnesEmulator {
     main_cpu: Wdc65816,
@@ -255,6 +286,9 @@ pub struct SnesEmulator {
     cpu_counters: CpuCounters,
     #[partial_clone(default)]
     hooks: Hooks,
+    // Host setting, not encoded: carried over by `load_state`
+    #[partial_clone(default)]
+    apu_clock_scale: ApuClockScale,
 }
 
 impl SnesEmulator {
@@ -319,6 +353,7 @@ impl SnesEmulator {
             cpu_write_log: CpuWriteLog::default(),
             cpu_counters: CpuCounters::default(),
             hooks: Hooks::default(),
+            apu_clock_scale: ApuClockScale::default(),
         };
 
         // Reset CPU so that execution starts from the right place
@@ -377,6 +412,7 @@ impl SnesEmulator {
             cpu_write_log: CpuWriteLog { enabled: self.cpu_write_log.enabled, writes: Vec::new() },
             cpu_counters: self.cpu_counters,
             hooks: Hooks { bitmap: self.hooks.bitmap.clone(), hit: None },
+            apu_clock_scale: self.apu_clock_scale,
         }
     }
 
@@ -502,6 +538,30 @@ impl SnesEmulator {
     /// setting survives a state load and a hard reset.
     pub fn set_audio_resampling(&mut self, on: bool) {
         self.audio_resampler.set_enabled(on);
+    }
+
+    /// Runs the APU at `num / den` of its clock relative to the main clock: with 2/3, three frames
+    /// of the CPU and the PPU take the APU's clocks (and sound samples) of two. 1/1 is the
+    /// hardware's ratio and the default, under which every tick is upstream's. Changing the ratio
+    /// drops the fraction of a master cycle the last one had left over. The setting survives a
+    /// state load and a hard reset, and a snapshot keeps it.
+    ///
+    /// # Panics
+    ///
+    /// If `num` or `den` is 0.
+    pub fn set_apu_clock_ratio(&mut self, num: u32, den: u32) {
+        assert!(num > 0 && den > 0, "the APU clock ratio {num}/{den} has a zero");
+        let (num, den) = (u64::from(num), u64::from(den));
+        let scale = &mut self.apu_clock_scale;
+        if scale.num * den != num * scale.den {
+            *scale = ApuClockScale { num, den, remainder: 0 };
+        }
+    }
+
+    /// The APU clock ratio set by [`Self::set_apu_clock_ratio`], as given.
+    #[must_use]
+    pub fn apu_clock_ratio(&self) -> (u64, u64) {
+        (self.apu_clock_scale.num, self.apu_clock_scale.den)
     }
 
     /// The log of the last frame the PPU completed, if the log is on and the frame was logged
@@ -820,9 +880,8 @@ impl SnesEmulator {
             self.ppu.update_controller_hv_latch(h, v, master_cycles_elapsed);
         }
 
-        if let ApuTickEffect::OutputSample(sample_l, sample_r) =
-            self.apu.tick(master_cycles_elapsed)
-        {
+        let apu_master_cycles = self.apu_clock_scale.apu_master_cycles(master_cycles_elapsed);
+        if let ApuTickEffect::OutputSample(sample_l, sample_r) = self.apu.tick(apu_master_cycles) {
             self.audio_resampler.collect_sample(sample_l, sample_r);
             // Samples come out only after a collected one
             self.audio_resampler.output_samples(audio_output).map_err(SnesError::AudioOutput)?;
@@ -953,11 +1012,13 @@ impl EmulatorTrait for SnesEmulator {
         let line_log = self.ppu.line_log_enabled();
         let compose = self.ppu.compose_pixels();
         let resampling = self.audio_resampler.enabled();
+        let apu_clock_scale = ApuClockScale { remainder: 0, ..self.apu_clock_scale };
         *self = Self::create_from_image(rom, self.emulator_config, coprocessor_roms, save_writer)
             .expect("Hard resetting should never fail to load");
         self.ppu.set_line_log(line_log);
         self.ppu.set_compose_pixels(compose);
         self.audio_resampler.set_enabled(resampling);
+        self.apu_clock_scale = apu_clock_scale;
     }
 
     fn load_state(&mut self, mut state: Self::SaveState) {
@@ -974,6 +1035,7 @@ impl EmulatorTrait for SnesEmulator {
         state.dma_unit.carry_over_hdma_copy_units(&self.dma_unit);
         state.cpu_registers.carry_over_nmi_count(&self.cpu_registers);
         state.hooks = Hooks { bitmap: self.hooks.bitmap.take(), hit: None };
+        state.apu_clock_scale = ApuClockScale { remainder: 0, ..self.apu_clock_scale };
         *self = state;
         // A state saved at a hooked opcode fetch arrives there again
         self.detect_hook_hit();
@@ -994,5 +1056,35 @@ impl EmulatorTrait for SnesEmulator {
 
     fn update_audio_output_frequency(&mut self, output_frequency: u64) {
         self.audio_resampler.update_output_frequency(output_frequency);
+    }
+}
+
+#[cfg(test)]
+mod apu_clock_scale_tests {
+    use super::ApuClockScale;
+
+    #[test]
+    fn one_to_one_hands_every_tick_over_unchanged() {
+        let mut scale = ApuClockScale::default();
+        for cycles in [6, 8, 12, 40, 1, 0] {
+            assert_eq!(scale.apu_master_cycles(cycles), cycles);
+        }
+        assert_eq!(scale.remainder, 0);
+    }
+
+    #[test]
+    fn two_thirds_hands_over_two_thirds_of_the_cycles_carrying_the_fraction() {
+        let mut scale = ApuClockScale { num: 2, den: 3, remainder: 0 };
+        let ticks = [6_u64, 8, 8, 12, 40, 6, 8, 7, 1];
+        let mut main = 0;
+        let mut apu = 0;
+        for round in 0..1000 {
+            for &cycles in &ticks {
+                main += cycles;
+                apu += scale.apu_master_cycles(cycles);
+                assert!(scale.remainder < 3);
+            }
+            assert_eq!(apu, main * 2 / 3, "after round {round}");
+        }
     }
 }

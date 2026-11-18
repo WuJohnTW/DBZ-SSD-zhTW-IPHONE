@@ -84,8 +84,10 @@ fn button(p: &Painter, t: &Touch, item: &Item, text: &str) {
     }
 }
 
-fn text_of(t: &Touch, btn: Btn) -> &'static str {
-    match btn {
+/// The label of a button: the SNES buttons' names and the speed as they are, the app's own (MENU, FULL, MIN) in the
+/// player's language ([`Touch::tr`]).
+fn text_of(t: &Touch, btn: Btn) -> String {
+    let name = match btn {
         Btn::A => "A",
         Btn::B => "B",
         Btn::X => "X",
@@ -99,6 +101,10 @@ fn text_of(t: &Touch, btn: Btn) -> &'static str {
         Btn::Full => "FULL",
         Btn::Min => "MIN",
         Btn::Up | Btn::Down | Btn::Left | Btn::Right => "",
+    };
+    match btn {
+        Btn::Menu | Btn::Full | Btn::Min => t.tr(name),
+        _ => name.to_owned(),
     }
 }
 
@@ -129,7 +135,13 @@ fn stick(p: &Painter, t: &Touch, zone: Rect) {
                 Stroke::new(2.0, alpha(CREAM, 0.5 * a)),
                 StrokeKind::Inside,
             );
-            label(p, zone.center_bottom() - vec2(0.0, 14.0), "touch zone", 12.0, alpha(CREAM, a));
+            label(
+                p,
+                zone.center_bottom() - vec2(0.0, 14.0),
+                &t.tr("touch zone"),
+                12.0,
+                alpha(CREAM, a),
+            );
         }
         Some((origin, at)) => {
             p.circle_filled(
@@ -156,7 +168,9 @@ pub fn paint(p: &Painter, t: &Touch) {
     if let Some(band) = geo.band {
         p.rect_filled(band, 0.0, BAND);
     }
-    if t.settings.show_fps
+    // Show FPS is a debug tool: a setting saved on before is not drawn without the debug tools.
+    if t.debug
+        && t.settings.show_fps
         && let Some(stats) = &t.stats
     {
         // At the top in the middle, clear of L and R; drawn even while the controls are hidden.
@@ -206,7 +220,7 @@ fn controls(p: &Painter, t: &Touch) {
         );
     }
     for item in &geo.items {
-        button(p, t, item, text_of(t, item.btn));
+        button(p, t, item, &text_of(t, item.btn));
     }
     if t.mode == Mode::Edit
         && let Some(b) = geo.group_bounds(t.selected)
@@ -235,7 +249,7 @@ fn window(p: &Painter, t: &Touch, panel: &Panel) {
     p.text(
         r.min + vec2(16.0, 24.0),
         Align2::LEFT_CENTER,
-        panel.title,
+        &panel.title,
         theme::game(22.0),
         TEXT_DARK,
     );
@@ -283,14 +297,21 @@ fn window(p: &Painter, t: &Touch, panel: &Panel) {
         p.text(
             r.min + vec2(16.0, 46.0),
             Align2::LEFT_CENTER,
-            format!("Selected: {}", t.selected.name()),
+            t.tr(&format!("Selected: {}", t.selected.name())),
             theme::game(15.0),
             DARK_RED,
         );
         let place = t.settings.place(t.orient(), t.selected);
         let pct = place.scale.unwrap_or(100);
-        bar(p, r.min + vec2(0.0, 62.0), "Size", pct, SCALE_MIN, SCALE_MAX);
-        bar(p, r.min + vec2(0.0, 118.0), "Opacity", t.settings.opacity, OPACITY_MIN, OPACITY_MAX);
+        bar(p, r.min + vec2(0.0, 62.0), &t.tr("Size"), pct, SCALE_MIN, SCALE_MAX);
+        bar(
+            p,
+            r.min + vec2(0.0, 118.0),
+            &t.tr("Opacity"),
+            t.settings.opacity,
+            OPACITY_MIN,
+            OPACITY_MAX,
+        );
     }
     let note_y = match t.mode {
         Mode::Edit => r.min.y + 176.0,
@@ -298,7 +319,7 @@ fn window(p: &Painter, t: &Touch, panel: &Panel) {
         _ => panel.buttons.iter().map(|b| b.rect.max.y).fold(r.min.y + 50.0, f32::max) + 8.0,
     };
     if t.mode != Mode::Edit || note_y < r.max.y {
-        wrapped(p, pos2(r.min.x + 14.0, note_y), panel.note, 12.0, r.width() - 28.0, NOTE);
+        wrapped(p, pos2(r.min.x + 14.0, note_y), &panel.note, 12.0, r.width() - 28.0, NOTE);
     }
     let _ = (Orient::Landscape, MIN_DP);
 }

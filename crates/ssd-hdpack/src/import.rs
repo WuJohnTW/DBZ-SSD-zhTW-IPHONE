@@ -574,6 +574,7 @@ fn import_mode7(mode7: &Path, pack_dir: &Path) -> anyhow::Result<usize> {
             key: key.to_owned(),
             tiles: json_str(plane, "tiles")?.to_owned(),
             palette,
+            replace: false,
         };
         anyhow::ensure!(entry.colours().is_some(), "{id}: the palette is 256 colours `RRGGBB`");
         anyhow::ensure!(

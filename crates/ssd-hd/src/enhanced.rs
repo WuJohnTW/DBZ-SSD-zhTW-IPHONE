@@ -203,7 +203,9 @@ impl Renderer {
                 let shown = self.without_text(&frame, &beneath);
                 picture(shown.as_ref().unwrap_or(&frame), &capture, Some(log), options)
             };
-            self.draw_text(&mut hd, &frame, options, &beneath);
+            // (the transformation's lightning: over the frame, under the HD text)
+            self.draw_lightning(&mut hd);
+            self.draw_text(&mut hd, &frame, options, &beneath, None);
             hd
         });
         self.capture = capture;
@@ -255,19 +257,23 @@ impl Renderer {
         frame: &Frame,
         options: HdOptions,
         beneath: &[Option<Frame>; 4],
+        cells: Option<&[crate::font::TextCell]>,
     ) {
         if let (Some(font), true) = (&self.font, options.scale >= 2) {
             let beneath_pixels: [Option<&[Color]>; 4] =
                 std::array::from_fn(|bg| beneath[bg].as_ref().map(|frame| &frame.pixels[..]));
+            let cells = cells.unwrap_or(self.text.cells());
+            let (width, scale) = (hd.width as usize, options.scale as usize);
             font.draw_with(
                 &mut hd.rgba,
-                hd.width as usize,
-                options.scale as usize,
-                self.text.cells(),
+                width,
+                scale,
+                cells,
                 &frame.pixels,
                 frame.width,
                 beneath_pixels,
             );
+            crate::tooltip::draw(font, &mut hd.rgba, width, scale, cells, None);
         }
     }
 
@@ -310,10 +316,20 @@ impl Renderer {
         if !found.is_empty() {
             let after = self.obj_pixels;
             self.obj_pixels = before;
-            self.hidden_objects = found.iter().fold(0, |all, (pose, _)| all | pose.sprites);
+            let hidden = found.iter().fold(0, |all, (pose, _)| all | pose.sprites);
+            self.hidden_objects = hidden;
             let rows = art::pose_rows(&found, height);
             self.only_rows = rows;
-            under = self.render_log(log, None, false).ok();
+            // (the art records what the layers are under the hidden sprites as this picture is drawn)
+            let saved = art.begin_under();
+            let mut binder = art.binder.take().expect("the art's binder");
+            art.active = true;
+            self.art = Some(art);
+            under = self.render_log(log, Some(&mut binder), false).ok();
+            art = self.art.take().expect("art is on");
+            art.active = false;
+            art.binder = Some(binder);
+            art.end_under(saved, under.is_some(), hidden, rows);
             self.only_rows = None;
             self.hidden_objects = 0;
             if let (Some(under), Some((first_row, past))) = (under.as_mut(), rows) {
@@ -325,6 +341,15 @@ impl Renderer {
             }
             self.obj_pixels = after;
         }
+        // A plane drawn from art with `replace`: the frame again without BG1, the picture under the plane (only then)
+        if art.plane_replaces() {
+            let obj_pixels = self.obj_pixels;
+            let under_plane = self.render_log(&art::without_bg1(log), None, false).ok();
+            self.obj_pixels = obj_pixels;
+            if let Some(frame) = under_plane {
+                art.set_plane_under(picture(&frame, &Capture::default(), None, options));
+            }
+        }
         let capture = std::mem::take(&mut self.capture);
         let beneath = self.title_beneath(log, options);
         let drawn = under.as_ref().unwrap_or(&first);
@@ -332,8 +357,12 @@ impl Renderer {
         let mut hd = picture(shown.as_ref().unwrap_or(drawn), &capture, Some(log), options);
         self.capture = capture;
         art.compose(&mut hd, &first, &found, 0, (0, 0, WIDTH as i32, height as i32));
+        // (the pixels of the text cells a pose variant was drawn on in front of: the text leaves them to the art)
+        let uncovered = art.uncover(self.text.cells());
         self.art = Some(art);
-        self.draw_text(&mut hd, &first, options, &beneath);
+        // (the transformation's lightning: over the frame and the art, under the HD text)
+        self.draw_lightning(&mut hd);
+        self.draw_text(&mut hd, &first, options, &beneath, uncovered.as_deref());
         Ok(hd)
     }
 }

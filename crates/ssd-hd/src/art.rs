@@ -15,21 +15,27 @@
 //! by its palette, the art is drawn recoloured to the palette the game uses ([`recolour`]); an
 //! entry made for the exact palette is always preferred.
 
+mod bg_cache;
 mod bgshadow;
 mod draw;
 mod field;
+mod load;
+#[cfg(test)]
+mod load_tests;
 mod partial;
 mod portrait_check;
 pub(crate) mod poses;
+mod reader;
 mod recolour;
 mod resample;
 #[cfg(test)]
-mod tests;
+pub(crate) mod tests;
 
 pub use portrait_check::PortraitUse;
 pub use tally::{Fate, FrameTally, ItemKey, TallyCount, TallyItem, TallyLayer};
 mod tally;
 
+pub use load::art_loads_on_draw;
 pub use resample::Image;
 
 /// `image`, made for the palette `source`, in the colours of `row` (see [`recolour::recolour`]).
@@ -125,6 +131,14 @@ const OBJECT_CACHE: usize = 256;
 
 /// Pictures of a layer's art whose colours are numbered and kept (see [`ArtState::numbered_colours`]).
 const NUMBERED_PICTURES: usize = 16;
+
+/// The picture of the pose variant an object is drawn from (see [`ArtState::pose_variant`]): with its margin, asked of
+/// the reading thread and not read yet, or none.
+enum VariantArt {
+    Drawn(Arc<Image>, i32),
+    Asked,
+    None,
+}
 
 /// `image` flipped left to right: the art of a pose facing the other way, every row read right to left.
 fn mirror(image: &Image) -> Image {
@@ -329,6 +343,149 @@ pub struct KindPixels {
     pub partial: u64,
 }
 
+/// What a picture cost to draw, by its stages, for the log of a slow window frame: times from `Instant`s and counts
+/// only, so it is kept for every picture. The art's own stages are zero for a picture drawn without art.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct DrawCost {
+    /// The whole picture (`WideRenderer::render_hd`, or the Enhanced renderer's as its caller times it).
+    pub total: std::time::Duration,
+    /// Finding the background layers and the Mode 7 plane the frame shows (`ArtState::begin_bg`).
+    pub begin_bg: std::time::Duration,
+    /// Finding the poses in the frame's sprites.
+    pub find_poses: std::time::Duration,
+    /// The renderer's own passes over the frame (the wide view's compose, every pass of it).
+    pub draw: std::time::Duration,
+    /// Drawing the art over the picture (`ArtState::compose`).
+    pub art_compose: std::time::Duration,
+    /// Reading and scaling the art files the caches lacked on the threads that draw, summed over the threads that read
+    /// them: inside the stages above, not beside them. The art read by its own thread ([`crate::Renderer::set_art_async`])
+    /// is not drawing's time and is not counted.
+    pub loads: std::time::Duration,
+    /// The art files the caches lacked and the picture asked for: read there and then, or asked of the reading thread
+    /// (once a picture for each file).
+    pub requests: u32,
+    /// The art files received into the caches, by kind: background layers, pictures, objects, pose variants, Mode 7
+    /// planes. Read there and then, a file is asked for and received at once; read by its own thread, it is received
+    /// when a picture starts after it is read (see [`DrawCost::received`]).
+    pub bg_loads: u32,
+    pub pictures: u32,
+    pub objects: u32,
+    pub variants: u32,
+    pub planes: u32,
+    /// The bytes of the files received (counted when they are received).
+    pub load_bytes: u64,
+    /// The background layers the frame is bound to, and whether one is the Mode 7 plane.
+    pub bg_slots: u32,
+    pub plane: bool,
+    /// The poses found in the frame's sprites.
+    pub poses: u32,
+    /// The background layers the cache let go to keep within its budget, the one used longest ago first
+    /// (`bg_cache::BgImages::insert`).
+    pub bg_evicted: u32,
+}
+
+impl DrawCost {
+    /// Adds `other`, a picture drawn after this one, to it: times and counts add, the bindings are the last one's.
+    pub fn add(&mut self, other: &DrawCost) {
+        self.total += other.total;
+        self.begin_bg += other.begin_bg;
+        self.find_poses += other.find_poses;
+        self.draw += other.draw;
+        self.art_compose += other.art_compose;
+        self.loads += other.loads;
+        self.requests += other.requests;
+        self.bg_loads += other.bg_loads;
+        self.pictures += other.pictures;
+        self.objects += other.objects;
+        self.variants += other.variants;
+        self.planes += other.planes;
+        self.load_bytes += other.load_bytes;
+        self.bg_slots = other.bg_slots;
+        self.plane = other.plane;
+        self.poses = other.poses;
+        self.bg_evicted += other.bg_evicted;
+    }
+
+    /// The art files received, of every kind.
+    #[must_use]
+    pub fn received(&self) -> u32 {
+        self.bg_loads + self.pictures + self.objects + self.variants + self.planes
+    }
+}
+
+/// The kinds of art file a frame reads (see [`DrawCost`]).
+#[derive(Debug, Clone, Copy)]
+pub(crate) enum LoadKind {
+    Bg,
+    Picture,
+    Object,
+    Variant,
+    Plane,
+}
+
+/// The art files a frame asked for and received, and what reading them on the threads that draw cost: counted where
+/// they are asked for (read there and then, or asked of the reading thread) and where they are received into the
+/// caches, on any thread of the pool.
+#[derive(Debug, Default)]
+pub(crate) struct LoadCounters {
+    requests: std::sync::atomic::AtomicU32,
+    received: [std::sync::atomic::AtomicU32; 5],
+    /// The bytes of the files received: added by the reading of a file the frame reads itself, or when the reading
+    /// thread's file is received.
+    pub(crate) bytes: std::sync::atomic::AtomicU64,
+    nanos: std::sync::atomic::AtomicU64,
+}
+
+impl LoadCounters {
+    /// Counts a file of `kind` read by the frame from now, asked for and received at once (its bytes are counted as
+    /// they are read, see [`LoadCounters::bytes`]); the time is counted when the guard returned goes.
+    fn start(&self, kind: LoadKind) -> LoadTimer<'_> {
+        self.request();
+        self.received[kind as usize].fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        LoadTimer { counters: self, started: std::time::Instant::now() }
+    }
+
+    /// Counts a file asked for.
+    pub(crate) fn request(&self) {
+        self.requests.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    /// Counts a file of `kind` and `bytes` the reading thread read, received into the caches (its time is not the
+    /// frame's).
+    pub(crate) fn receive(&self, kind: LoadKind, bytes: u64) {
+        use std::sync::atomic::Ordering::Relaxed;
+        self.received[kind as usize].fetch_add(1, Relaxed);
+        self.bytes.fetch_add(bytes, Relaxed);
+    }
+
+    /// Puts the counts into `cost`.
+    fn fill_cost(&self, cost: &mut DrawCost) {
+        use std::sync::atomic::Ordering::Relaxed;
+        let count = |kind: LoadKind| self.received[kind as usize].load(Relaxed);
+        cost.requests = self.requests.load(Relaxed);
+        cost.bg_loads = count(LoadKind::Bg);
+        cost.pictures = count(LoadKind::Picture);
+        cost.objects = count(LoadKind::Object);
+        cost.variants = count(LoadKind::Variant);
+        cost.planes = count(LoadKind::Plane);
+        cost.load_bytes = self.bytes.load(Relaxed);
+        cost.loads = std::time::Duration::from_nanos(self.nanos.load(Relaxed));
+    }
+}
+
+/// The time of one file read, counted when it goes (see [`LoadCounters::start`]).
+struct LoadTimer<'a> {
+    counters: &'a LoadCounters,
+    started: std::time::Instant,
+}
+
+impl Drop for LoadTimer<'_> {
+    fn drop(&mut self) {
+        let nanos = u64::try_from(self.started.elapsed().as_nanos()).unwrap_or(u64::MAX);
+        self.counters.nanos.fetch_add(nanos, std::sync::atomic::Ordering::Relaxed);
+    }
+}
+
 /// What the art did in the last frame rendered.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct ArtStats {
@@ -362,6 +519,8 @@ pub struct ArtStats {
     /// where nothing is in front), and the ones drawn from the art of a layer.
     pub bg_pixels: u64,
     pub bg_art: u64,
+    /// The frame was drawn again without BG1 for the picture under the plane (a plane of art with `replace`): 1, else 0.
+    pub plane_under: u64,
     /// The map art of the field frame: the layer of the maps' index its map data names
     /// (`available`, for a frame whose BG2 shows the field's map in whatever main loop state) and
     /// whether the frame draws it (`bound`: the frame is classed as the field and its layer slot was
@@ -371,6 +530,9 @@ pub struct ArtStats {
     /// (the layer's slot was lost: VRAM loaded while it is displayed, or the field's map took its
     /// place).
     pub bg_unbound: Vec<u32>,
+    /// The art files (layers, pictures, objects, pose variants, planes) the frame read itself: none
+    /// when the art is read by its own thread (see [`crate::art_loads_on_draw`]).
+    pub loads_on_draw: u32,
 }
 
 /// See [`ArtStats::field_map`].
@@ -393,36 +555,134 @@ pub(crate) struct PlaneFrame {
 
 /// The work RAM bytes the conditions of a pack's pose variants are read from (`docs/re/data/kaioken-bp.md`, section 4).
 const KAIOKEN_STATE: usize = 0x0C36;
+/// The Kaioken's multiplier in use (`$01EF`, 0 = none; `docs/re/data/kaioken-bp.md`, section 4): written when the move is
+/// set up, before `$0C36` says the Kaioken is on, so the close-up of its first use ("悟空的 N倍界王拳！") has it.
+const KAIOKEN_MULTIPLIER: usize = 0x01EF;
 /// The party records: nine of them from `$0B00`, `$20` bytes each, the unit in the second byte.
 const PARTY_RECORDS: usize = 0x0B00;
 const RECORD_STRIDE: usize = 0x20;
 const PARTY_SLOTS: usize = 9;
 /// The unit of Super Saiyan Goku.
 const SUPER_SAIYAN_GOKU: u8 = 0x3B;
+/// `game_mode` (`$24`, bit 7 aside): what the main loop runs, `$11` the ending (`docs/re/data/scenes.md`).
+const GAME_MODE: usize = 0x0024;
+const ENDING_MODE: u8 = 0x11;
+/// `$73` (a word): the frames of the ending's loop (`00:B07C`), counted by `00:B0E8`. `00:B0EE` draws Goku from the sprites
+/// of the flight with Gohan (`00:BCA7`) while it is under [`ENDING_FLIGHT_END`], and from those of him crouching with
+/// Gohan before Vegeta (`00:BC55`) from then on when Vegeta is in the ending's party ([`ENDING_PARTY`] bit 7); without
+/// Vegeta he flies on, out of the screen.
+const ENDING_FRAMES: usize = 0x0073;
+/// The frame of the ending's loop from which Goku crouches with Gohan before Vegeta (`00:B0F0`, `CPX #$1F40`).
+const ENDING_FLIGHT_END: u16 = 0x1F40;
+/// `$82`: who is in the ending (`00:96C5`, a bit for each member of the party; bit 0 Goku, bit 1 Gohan, bit 7 Vegeta).
+const ENDING_PARTY: usize = 0x0082;
+const ENDING_VEGETA: u8 = 0x80;
 /// The mark of a unit of Goku's art in the index (`battle-goku-NNN`, `gallery-party-goku-u00-NNN`, see [`ArtState::unit_of`]).
-const GOKU_MARK: &str = "goku";
+pub(crate) const GOKU_MARK: &str = "goku";
 /// The mark of a unit of Super Saiyan Goku's art (`battle-goku-ssj-NNN`, `gallery-party-goku-ssj-NNN`).
-const SUPER_SAIYAN_GOKU_MARK: &str = "goku-ssj";
+pub(crate) const SUPER_SAIYAN_GOKU_MARK: &str = "goku-ssj";
+/// The mark of the art of Super Vegeta's battle poses in the index (`battle-super-vegeta-NNN`): its palettes are the
+/// colours the game draws him in (see [`ArtState::recolourable`]).
+pub(crate) const SUPER_VEGETA_MARK: &str = "battle-super-vegeta";
+/// The indexes of Super Vegeta's hair in his palette (yellow and orange; black in Vegeta's, the colour of the outline):
+/// what tells his colours from Vegeta's where a pose's art does not use them.
+pub(crate) const SUPER_VEGETA_HAIR: u16 = 1 << 14 | 1 << 15;
+/// Super Vegeta's palette in GAME OVER (BGR555, index 0 left out): the scene draws him flying over the words with the
+/// tiles of the effect's art `gallery-fx-1118`, in a row of his colours in another order (white 2, grey 3 and 14, skin
+/// 11 to 13) and with another yellow and orange for his hair (4 and 15). The ROM's data at `$12:FE82` (`LoROM`, file
+/// offset `0x97E82`), the same in the frames of four replays that end in it; the row before it (`$12:FE62`) is the same
+/// with black at 4 and 15, Vegeta's hair. See [`game_over_super_vegeta`].
+const GAME_OVER_SUPER_VEGETA: [u16; 16] = [
+    0x0000, 0x0000, 0x7FFF, 0x3DEF, 0x03BF, 0x2ABC, 0x1A38, 0x09B4, 0x71EB, 0x5107, 0x3862, 0x42FF,
+    0x2639, 0x0952, 0x56B5, 0x031F,
+];
+
+/// [`GAME_OVER_SUPER_VEGETA`] as the palette of a pose (every index but 0): the palette of the picture of
+/// `art-override\super-vegeta\` for an effect's pose (patch 0049, `Pack::super_vegeta_override`), drawn only where the
+/// sprite's palette is this one (see [`ArtState::recolourable`]).
+pub(crate) fn game_over_super_vegeta() -> Palette {
+    let mut colors = [[0_u8; 3]; 16];
+    for (colour, &word) in colors.iter_mut().zip(&GAME_OVER_SUPER_VEGETA) {
+        *colour = poses::rgb555(word);
+    }
+    Palette { mask: 0xFFFE, colors }
+}
+/// The indexes of Goku's hair in his palettes: black in the normal Goku's (red with the Kaioken), yellow and gold in the
+/// Super Saiyan's.
+pub(crate) const GOKU_HAIR: u16 = 1 << 14 | 1 << 15;
+/// The key of Goku crouching with Gohan in his arms before Super Vegeta, the ending's scene after the flight
+/// (`battle-goku-017` and `battle-goku-ssj-021`). The game draws him there with black hair, in the normal palette;
+/// this build draws that pose from the Super Saiyan art (with the pack's variant of the hair standing up) while unit
+/// `$3B` is in the party, whatever the colours, because the fight with Super Vegeta comes next. A choice this
+/// branch makes about the story, not what the original game shows (see [`ArtState::unit_for`]).
+const GOKU_HOLDING_GOHAN: u64 = 0x3326_F5A6_5ECC_E1EB;
+/// The key of the pixels of `battle-vegeta-001` (34 x 42, Vegeta standing), which the game also draws, in Super Vegeta's
+/// colours and with OAM palette 0, as Super Vegeta flying through space after the party loses the hidden fight with him.
+/// There the sprites are a field group with the battle pose's key, and a field group finds only the field's art, so his
+/// picture of `art-override\super-vegeta\` (patch 0049) was never found and the game's sprite (with the pads) was drawn.
+/// This field group is drawn from that picture when it can be drawn in the frame's colours (see
+/// [`ArtState::ending_space_vegeta`]).
+const ENDING_SPACE_VEGETA: u64 = 0xAA5F_9D99_2371_E593;
 
 /// The conditions a pack's pose variants name (`[[pose_variant]]`, `ssd_mod::pose::Condition`), as the game's work RAM of a
 /// frame shows them. The Enhanced picture draws a variant only while its condition holds. `super_saiyan_goku` is the party
-/// record of Super Saiyan Goku (see [`ArtState::unit_for`]).
+/// record of Super Saiyan Goku (see [`ArtState::unit_for`]); `ending_flight` the ending's flight with Gohan on screen
+/// (see [`ArtState::ending_goku`]).
 #[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub struct Conditions {
     kaioken: bool,
     super_saiyan_goku: bool,
+    /// The Kaioken is on (`$0C36` bit 7) or its multiplier is in use (`$01EF`), whatever the party: the normal Goku using
+    /// it (see [`ArtState::recolourable`], patch 0050).
+    kaioken_on: bool,
+    /// The ending's flight with Gohan: game mode `$11` and Goku drawn from the flight's sprites, not crouching before
+    /// Vegeta (see [`ENDING_FRAMES`]).
+    ending_flight: bool,
+    /// The frames since Goku's first Super Saiyan transformation started, while it goes on: the lightning of
+    /// [`crate::lightning`] is drawn. The app's to say ([`Conditions::with_ssj_lightning`]); `None` from the work RAM.
+    ssj_lightning: Option<u32>,
 }
 
 impl Conditions {
-    /// The conditions of the work RAM `wram` (the 128 KiB of `$7E` and `$7F`): the Kaioken is on (`$0C36` bit 7) and a party
-    /// record has Super Saiyan Goku's unit (`$3B`). A `wram` too short to hold the bytes says no.
+    /// The conditions of the work RAM `wram` (the 128 KiB of `$7E` and `$7F`): the Kaioken is on (`$0C36` bit 7), a party
+    /// record has Super Saiyan Goku's unit (`$3B`), and the ending's flight is on screen: game mode `$11`, and not the frame
+    /// of its loop ([`ENDING_FRAMES`]) from which Goku crouches before Vegeta with Vegeta in the ending's party. A `wram`
+    /// too short to hold the bytes says no.
     #[must_use]
     pub fn of_work_ram(wram: &[u8]) -> Self {
         let on = wram.get(KAIOKEN_STATE).is_some_and(|byte| byte & 0x80 != 0);
+        let multiplier = wram.get(KAIOKEN_MULTIPLIER).is_some_and(|&byte| byte != 0);
         let goku = (0..PARTY_SLOTS).any(|slot| {
             wram.get(PARTY_RECORDS + RECORD_STRIDE * slot + 1) == Some(&SUPER_SAIYAN_GOKU)
         });
-        Self { kaioken: on && goku, super_saiyan_goku: goku }
+        let ending = wram.get(GAME_MODE).is_some_and(|&mode| mode & 0x7F == ENDING_MODE);
+        let crouching = match (wram.get(ENDING_FRAMES..ENDING_FRAMES + 2), wram.get(ENDING_PARTY)) {
+            (Some(&[low, high]), Some(&party)) => {
+                u16::from_le_bytes([low, high]) >= ENDING_FLIGHT_END && party & ENDING_VEGETA != 0
+            }
+            _ => true,
+        };
+        Self {
+            kaioken: on && goku,
+            super_saiyan_goku: goku,
+            kaioken_on: on || multiplier,
+            ending_flight: ending && !crouching,
+            ssj_lightning: None,
+        }
+    }
+
+    /// These conditions with the frames since Goku's first Super Saiyan transformation started, while it goes on
+    /// (`None`: it does not), which the work RAM alone does not say: the pictures of [`crate::lightning`] are drawn over
+    /// the frame. A picture of other conditions is another picture, so a picture kept is not shown for this one.
+    #[must_use]
+    pub fn with_ssj_lightning(self, frames: Option<u32>) -> Self {
+        Self { ssj_lightning: frames, ..self }
+    }
+
+    /// The frames since the transformation started, while it goes on (see [`Conditions::with_ssj_lightning`]).
+    #[must_use]
+    pub fn ssj_lightning(self) -> Option<u32> {
+        self.ssj_lightning
     }
 
     fn holds(self, condition: ssd_mod::pose::Condition) -> bool {
@@ -449,10 +709,22 @@ pub(crate) struct ArtState {
     /// The pictures of the pack's pose variants at the scale, by the index of the variant and whether it is mirrored (see
     /// [`ArtState::pose_variant`]); `None` for a picture that cannot be read.
     pose_images: FxHashMap<(usize, bool), Option<Arc<Image>>>,
+    /// The pixels of the last frame composed (by their index in it, `in_front_width` wide) a pose variant was drawn on
+    /// where its pose is in front of what the frame shows: empty when no variant was drawn (see [`ArtState::uncover`]).
+    in_front: Vec<bool>,
+    in_front_width: usize,
     /// The conditions the pose variants are drawn under: those of the frame (see [`Conditions::of_work_ram`]).
     pub(crate) conditions: Conditions,
-    /// The art of the background layers, by the index of the entry.
-    bg_images: FxHashMap<u32, Option<Arc<BgImage>>>,
+    /// The art of the background layers, by the index of the entry, kept within a budget (see
+    /// [`bg_cache::BG_BUDGET`]).
+    bg_images: bg_cache::BgImages,
+    /// How the art is read: by the frames, or by a thread of its own (see [`ArtState::set_async`]).
+    loading: load::Loading,
+    /// What the frame being drawn cost so far, and the art it asked for and received (see [`ArtState::cost`]).
+    cost: DrawCost,
+    loads: LoadCounters,
+    /// The background layers' LRU evictions counted when the frame being drawn started (see [`DrawCost::bg_evicted`]).
+    bg_evicted_before: u64,
     /// The field maps' art: the source of the layer shown, and the tiles of art read at the
     /// picture's scale, by layer and tile.
     field_sources: FxHashMap<u32, Option<Arc<Image>>>,
@@ -462,12 +734,19 @@ pub(crate) struct ArtState {
     /// The plane the frame shows (see [`ArtState::begin_bg`]): the matrix of each line, by
     /// scanline, and the VRAM words the plane is made of.
     plane: Option<PlaneFrame>,
+    /// The picture of the frame drawn again without BG1, when the plane is drawn from art with `replace`
+    /// ([`ArtState::plane_replaces`], [`ArtState::set_plane_under`]): what is under the plane.
+    plane_under: Option<crate::HdFrame>,
     /// The CGRAM at the start of the frame, the colours the pictures are drawn in.
     cgram: Vec<u16>,
     /// For the keys of partial poses seen: the object that holds it and where (see [`partial`]).
     partials: FxHashMap<u64, Option<(u32, i32, i32)>>,
     /// The number of poses of each unit of the index (see [`ArtState::unit_for`]).
     unit_sizes: std::sync::OnceLock<FxHashMap<String, u32>>,
+    /// The coloured palettes of Super Vegeta's art (see [`ArtState::recolourable`]).
+    super_vegeta: std::sync::OnceLock<Vec<Palette>>,
+    /// The coloured palettes of Super Saiyan Goku's art (see [`ArtState::recolourable`]).
+    super_saiyan_goku: std::sync::OnceLock<Vec<Palette>>,
     /// For the keys of poses seen that the index has no key for: the object of their shape.
     shapes: FxHashMap<u64, Option<u32>>,
     pub(crate) binder: Option<Binder<'static>>,
@@ -534,15 +813,24 @@ impl ArtState {
             variants: FxHashMap::default(),
             variant_bytes: 0,
             pose_images: FxHashMap::default(),
+            in_front: Vec::new(),
+            in_front_width: 0,
             conditions: Conditions::default(),
-            bg_images: FxHashMap::default(),
+            bg_images: bg_cache::BgImages::default(),
+            loading: load::Loading::default(),
+            cost: DrawCost::default(),
+            loads: LoadCounters::default(),
+            bg_evicted_before: 0,
             field_sources: FxHashMap::default(),
             field_tiles: field::FieldTiles::default(),
             plane_arts: FxHashMap::default(),
             plane: None,
+            plane_under: None,
             cgram: Vec::new(),
             partials: FxHashMap::default(),
             unit_sizes: std::sync::OnceLock::new(),
+            super_vegeta: std::sync::OnceLock::new(),
+            super_saiyan_goku: std::sync::OnceLock::new(),
             shapes: FxHashMap::default(),
             measure: false,
             numbered: Vec::new(),
@@ -599,6 +887,9 @@ impl ArtState {
             self.plane_arts.clear();
         }
         self.field_frame = None;
+        self.cost = DrawCost::default();
+        self.loads = LoadCounters::default();
+        self.bg_evicted_before = self.bg_images.evicted;
         // (a record is a hundred bytes: a frame's are megabytes, written by every worker)
         if self.pixels.len() == width * height {
             let band = crate::pool::band(height) * width;
@@ -610,9 +901,27 @@ impl ArtState {
         self.width = width;
         self.height = height;
         self.stats = ArtStats::default();
+        self.plane_under = None;
         self.pose_sprites.clear();
         self.dumps.clear();
         self.tally = FrameTally::default();
+        self.begin_loading();
+    }
+
+    /// Whether the frame's plane is drawn from art with `replace` ([`crate::mode7art::Entry::replace`]): the frame is
+    /// then drawn again without BG1 ([`without_bg1`]) for the picture under the plane ([`ArtState::set_plane_under`]).
+    pub(crate) fn plane_replaces(&self) -> bool {
+        self.plane.is_some()
+            && self.lookup.bg_slots.iter().find(|slot| slot.is_plane()).is_some_and(|slot| {
+                self.pack.mode7.plane.get(slot.entry as usize).is_some_and(|entry| entry.replace)
+            })
+    }
+
+    /// The picture (the size of the frame's picture) of the frame drawn without BG1, for the plane of art with
+    /// `replace` ([`ArtState::plane_replaces`]); counted in [`ArtStats::plane_under`].
+    pub(crate) fn set_plane_under(&mut self, picture: crate::HdFrame) {
+        self.plane_under = Some(picture);
+        self.stats.plane_under += 1;
     }
 
     /// The background layers of the frame being drawn.
@@ -623,6 +932,7 @@ impl ArtState {
     /// Finds the background layers of the pack that the frame `log` shows (by the content of
     /// their tiles), before its pixels are captured.
     pub(crate) fn begin_bg(&mut self, log: &FrameLog) {
+        let started = std::time::Instant::now();
         let mut slots = if self.lookup.bg_classes.is_empty() {
             Vec::new()
         } else {
@@ -636,7 +946,19 @@ impl ArtState {
             slots.insert(0, Slot::plane(at));
             self.plane = Some(plane);
         }
+        self.cost.bg_slots = u32::try_from(slots.len()).unwrap_or(u32::MAX);
+        self.cost.plane = self.plane.is_some();
         self.lookup.bg_slots = slots;
+        self.cost.begin_bg += started.elapsed();
+    }
+
+    /// What the frame drawn since [`ArtState::begin`] cost so far: its stages, the files it read, its bindings.
+    pub(crate) fn cost(&self) -> DrawCost {
+        let mut cost = self.cost;
+        self.loads.fill_cost(&mut cost);
+        cost.bg_evicted =
+            u32::try_from(self.bg_images.evicted - self.bg_evicted_before).unwrap_or(u32::MAX);
+        cost
     }
 
     /// The Mode 7 plane of the pack that the frame shows, if any: found by the content of VRAM, and
@@ -652,7 +974,7 @@ impl ArtState {
         if !log.entries.iter().any(|entry| shows(&entry.regs)) {
             return None;
         }
-        let at = self.pack.mode7.find(crate::mode7art::plane_key(&log.vram))?;
+        let at = self.pack.mode7.find_plane(&log.vram, &log.cgram_start)?;
         let mut lines = vec![None; usize::from(log.height) + 2];
         for entry in &log.entries {
             if shows(&entry.regs)
@@ -671,91 +993,41 @@ impl ArtState {
         if let Some(loaded) = self.plane_arts.get(&at) {
             return loaded.clone();
         }
+        if self.loads_async() {
+            self.want(load::ArtKey::Plane(at), 0);
+            return None;
+        }
         let loaded = self.load_plane_art(at);
+        self.loaded_on_draw(1);
         self.plane_arts.insert(at, loaded.clone());
         loaded
     }
 
     fn load_plane_art(&self, at: u32) -> Option<Arc<crate::mode7art::PlaneArt>> {
-        use crate::mode7art::{Entry, PLANE, PlaneArt, SCALE, TILE};
-        let entry = &self.pack.mode7.plane[at as usize];
-        let palette = entry.colours()?;
-        let (side, across) = (PLANE * SCALE, Entry::tiles_across());
-        let tile_side = TILE * SCALE;
-        let tiles: Vec<Option<Vec<u8>>> = (0..across * across)
-            .into_par_iter()
-            .map(|n| {
-                let bytes = std::fs::read(
-                    self.pack.dir.join("art/mode7").join(entry.tile_file(n % across, n / across)),
-                )
-                .ok()?;
-                let (w, h, rgba) = crate::png::read_rgba(&bytes).ok()?;
-                (w as usize == tile_side && h as usize == tile_side).then_some(rgba)
-            })
-            .collect();
-        let mut rgba = vec![0_u8; side * side * 4];
-        for (n, tile) in tiles.into_iter().enumerate() {
-            let tile = tile?;
-            let (ox, oy) = ((n % across) * tile_side, (n / across) * tile_side);
-            for y in 0..tile_side {
-                let from = y * tile_side * 4;
-                let to = ((oy + y) * side + ox) * 4;
-                rgba[to..to + tile_side * 4].copy_from_slice(&tile[from..from + tile_side * 4]);
-            }
-        }
-        Some(Arc::new(PlaneArt::new(side, &rgba, palette)))
+        let _timer = self.loads.start(LoadKind::Plane);
+        load::plane(&self.pack, at, true, &self.loads.bytes)
     }
 
     /// The art of background entry `at` at the picture's scale, with its source.
     fn bg_image(&mut self, at: u32) -> Option<Arc<BgImage>> {
-        if let Some(loaded) = self.bg_images.get(&at) {
+        if let Some(loaded) = self.bg_images.get(at) {
             return loaded.clone();
         }
-        let loaded = self.load_bg(at);
-        if self.bg_images.len() >= 4 {
-            self.bg_images.clear();
+        if self.loads_async() {
+            self.want(load::ArtKey::Bg(at), 0);
+            return None;
         }
-        self.bg_images.insert(at, loaded.clone());
+        let loaded = self.load_bg(at);
+        self.loaded_on_draw(1);
+        self.bg_images.reads += 1;
+        self.bg_images.insert(at, loaded.clone(), bg_cache::BG_BUDGET);
         loaded
     }
 
     fn load_bg(&self, at: u32) -> Option<Arc<BgImage>> {
-        let entry = &self.pack.bg.layer[at as usize];
         let large = self.lookup.bg_slots.iter().any(|slot| slot.entry == at && slot.large);
-        let (width, height) = entry.art_size(large);
-        let read = |relative: &str| -> Option<(usize, usize, Vec<u8>)> {
-            let bytes = std::fs::read(self.pack.dir.join(relative)).ok()?;
-            let (w, h, rgba) = crate::png::read_rgba(&bytes).ok()?;
-            Some((w as usize, h as usize, rgba))
-        };
-        let (aw, ah, art) = read(&entry.art)?;
-        // The files are what the index says: the layer's rows at the art's scale, and at 1x
-        if (aw, ah) != (width * bgart::SCALE, height * bgart::SCALE) {
-            return None;
-        }
-        let source = if entry.source.is_empty() {
-            None
-        } else {
-            let (sw, sh, source) = read(&entry.source)?;
-            if (sw, sh) != (width, height) {
-                return None;
-            }
-            Some(Arc::new(Image::new(sw, sh, source)))
-        };
-        let art =
-            resample::resize(&Image::new(aw, ah, art), width * self.scale, height * self.scale);
-        let base = bgart::parse_palette(&entry.palette).map(Arc::new);
-        Some(Arc::new(BgImage { art: BgArt::Whole(art), base, source }))
-    }
-
-    fn load(&self, relative: &str, width: usize, height: usize) -> Option<Arc<Image>> {
-        let bytes = std::fs::read(self.pack.dir.join(relative)).ok()?;
-        let (w, h, rgba) = crate::png::read_rgba(&bytes).ok()?;
-        let image = Image::new(w as usize, h as usize, rgba);
-        if image.width == 0 || image.height == 0 {
-            return None;
-        }
-        Some(Arc::new(resample::resize(&image, width, height)))
+        let _timer = self.loads.start(LoadKind::Bg);
+        load::bg(&self.pack, at, large, self.scale, &self.loads.bytes)
     }
 
     /// The art of picture `at` of the index: 32 art pixels to a character, at the picture's scale.
@@ -763,7 +1035,12 @@ impl ArtState {
         if let Some(loaded) = self.pictures.get(&at) {
             return loaded.clone();
         }
+        if self.loads_async() {
+            self.want(load::ArtKey::Picture(at), 0);
+            return None;
+        }
         let image = self.load_picture(at);
+        self.loaded_on_draw(1);
         self.pictures.insert(at, image.clone());
         image
     }
@@ -778,7 +1055,12 @@ impl ArtState {
             self.recent.push_back(at);
             return loaded;
         }
+        if self.loads_async() {
+            self.want(load::ArtKey::Object(at), 0);
+            return None;
+        }
         let image = self.load_object(at);
+        self.loaded_on_draw(1);
         self.remember_object(at, image.clone());
         image
     }
@@ -834,6 +1116,34 @@ impl ArtState {
     /// record of the frame to split by rows.
     pub(crate) fn capture_parts(&mut self) -> (&Lookup, &mut [ArtPixel]) {
         (&self.lookup, &mut self.pixels)
+    }
+
+    /// Sets the record of the frame aside before the frame is drawn again without the sprites the poses hide (the
+    /// picture under them): that drawing captures its own record ([`ArtState::end_under`] takes what the poses'
+    /// pixels show under them from it). The counts of the frame are kept as they are.
+    pub(crate) fn begin_under(&mut self) -> UnderCapture {
+        let blank = vec![ArtPixel::NONE; self.pixels.len()];
+        UnderCapture {
+            first: std::mem::replace(&mut self.pixels, blank),
+            stats: self.stats.clone(),
+        }
+    }
+
+    /// Puts the record of the frame back after the picture under the poses was drawn (see [`ArtState::begin_under`]):
+    /// when it was (`drawn`), each pixel the hidden sprites (`hidden`) won in rows `rows` takes what the backgrounds
+    /// are there in that picture ([`merge_under`]).
+    pub(crate) fn end_under(
+        &mut self,
+        saved: UnderCapture,
+        drawn: bool,
+        hidden: u128,
+        rows: Option<(usize, usize)>,
+    ) {
+        let under = std::mem::replace(&mut self.pixels, saved.first);
+        self.stats = saved.stats;
+        if drawn {
+            merge_under(&mut self.pixels, &under, self.width, hidden, rows);
+        }
     }
 
     /// The background slots of the last picture, one row per slot: the index entry, its BG, the
@@ -895,6 +1205,14 @@ impl ArtState {
     /// [`ArtState::find_poses`] for the sprites of `view`: the window alone, or a wide view of the
     /// field with its margins and the objects the original drops.
     pub(crate) fn find_poses_in(&mut self, log: &FrameLog, view: &poses::View) -> Vec<(Pose, u32)> {
+        let started = std::time::Instant::now();
+        let found = self.find_poses_of(log, view);
+        self.cost.poses = u32::try_from(found.len()).unwrap_or(u32::MAX);
+        self.cost.find_poses += started.elapsed();
+        found
+    }
+
+    fn find_poses_of(&mut self, log: &FrameLog, view: &poses::View) -> Vec<(Pose, u32)> {
         self.cgram.clear();
         self.cgram.extend_from_slice(&log.cgram_start);
         if self.pack.art.objects().is_empty() || self.backgrounds_only {
@@ -1057,13 +1375,17 @@ impl ArtState {
             if pose.shadow || !free(pose, taken) {
                 continue;
             }
-            let unit = self.unit_for(pose);
-            let (best, mirrored) = self.exact_art(pose, &rows[n], unit.as_ref());
-            if let Some(at) = best {
+            let unit = self.unit_for(pose, &rows[n]);
+            let (best, mirrored, refused) = self.exact_art(pose, &rows[n], unit.as_ref());
+            if let Some(at) = best.map(|at| self.ending_goku(at)) {
                 taken |= pose.sprites & !pose.excluded;
                 let placed_at = if mirrored { at | MIRROR } else { at };
                 placed[n] = Some((self.placed(pose, at, &rows[n], false), placed_at));
                 sources[n] = if mirrored { ArtSource::Mirror } else { ArtSource::Exact };
+            } else if refused {
+                // The pose keeps the game's sprite: its sprites are not another pose's (the field's group of
+                // the same sprites, Super Vegeta's dash as `field-frieza-force-000`), nor drawn by a shape
+                taken |= pose.sprites & !pose.excluded;
             }
         }
         for (n, pose) in found.iter().enumerate() {
@@ -1094,7 +1416,18 @@ impl ArtState {
                 }
                 None => continue,
             };
+            // (the art of the same shape or holding the pose is drawn in the frame's colours too, else the
+            // pose keeps the game's sprite; art holding a piece must have the piece's colours, see
+            // `partial::draws`)
+            let at = self.held_override(at, shaped, pose, &found_pose, &rows[n]).unwrap_or(at);
+            let palette = &self.pack.art.objects()[at as usize].palette;
+            let held_wrong = !shaped && !partial::draws(palette, &rows[n], pose);
+            if held_wrong || !self.recolourable(&found_pose, at, &rows[n]) {
+                taken |= pose.sprites;
+                continue;
+            }
             taken |= pose.sprites;
+            let at = self.ending_goku(at);
             placed[n] = Some((self.placed(&found_pose, at, &rows[n], shaped), at));
             sources[n] = if shaped { ArtSource::Shaped } else { ArtSource::Held };
         }
@@ -1106,8 +1439,14 @@ impl ArtState {
         let mut matches: Vec<(Pose, u32)> = Vec::new();
         for (n, slot) in placed.into_iter().enumerate() {
             if let Some((pose, at)) = slot {
-                if at != SHADOW && self.object(at).is_none() {
-                    continue;
+                if at != SHADOW {
+                    // (a pose whose art or pose variant is still being read is drawn as the game draws it)
+                    // (both asked for in the same frame)
+                    let drawn = self.object(at).is_some();
+                    let asked = self.loads_async() && self.variant_asked(at);
+                    if !drawn || asked {
+                        continue;
+                    }
                 }
                 stats[n].matched = true;
                 stats[n].recoloured = pose.recolour.is_some();
@@ -1229,7 +1568,22 @@ impl ArtState {
         x_offset: i32,
         clip: (i32, i32, i32, i32),
     ) {
+        let started = std::time::Instant::now();
+        self.compose_art(hd, frame, found, x_offset, clip);
+        self.cost.art_compose += started.elapsed();
+    }
+
+    fn compose_art(
+        &mut self,
+        hd: &mut crate::HdFrame,
+        frame: &crate::Frame,
+        found: &[(Pose, u32)],
+        x_offset: i32,
+        clip: (i32, i32, i32, i32),
+    ) {
         let scale = self.scale;
+        self.in_front.clear();
+        self.in_front_width = frame.width;
         let hidden = found.iter().fold(0_u128, |all, (pose, _)| all | pose.sprites);
         self.repair_portraits();
         let ground_shadows = bgshadow::find(frame, &mut self.pixels);
@@ -1281,17 +1635,26 @@ impl ArtState {
         let mut placed: Vec<Placed<'_>> = Vec::new();
         // The poses a pose variant replaces: drawn by the variant, after the others
         let mut replaced: Vec<(&Pose, Arc<Image>, i32)> = Vec::new();
+        // The sprites of the poses drawn from a picture of a folder of `art-override\` that adds poses
+        // (`super-vegeta\`, `goku\`, `ending-goku\`: `Object::override_only`): such a picture need not cover the
+        // sprites' pixels (Super Vegeta's has no shoulder pads), and where it does not, the art of a pose behind them
+        // is drawn; the poses are then drawn from back to front (see `draw_objects`)
+        let mut open = 0_u128;
         for (pose, at) in found.iter().filter(|(_, at)| *at != SHADOW) {
             if let Some((image, margin)) = self.pose_variant(*at) {
                 replaced.push((pose, image, margin));
                 continue;
             }
-            let luma = self.pack.art.objects()[real(*at)].luma;
+            let object = &self.pack.art.objects()[real(*at)];
+            let (luma, override_only) = (object.luma, object.override_only());
             if let Some(image) = self.object(*at) {
                 let image = match &pose.recolour {
                     Some(variant) => self.object_variant(pose, *at, image, variant),
                     None => image,
                 };
+                if override_only {
+                    open |= pose.sprites & !pose.excluded;
+                }
                 placed.push((pose, image, luma));
             }
         }
@@ -1305,12 +1668,27 @@ impl ArtState {
             x_offset,
             clip,
             measure,
+            open,
         );
+        if !replaced.is_empty() {
+            self.in_front.resize(frame.width * frame.height, false);
+        }
         for (pose, image, margin) in &replaced {
             let x_offset = if pose.bg { 0 } else { x_offset };
             let origin = (pose.org.0 + x_offset - margin, pose.org.1 + ROW_OF_CAPTURE - margin);
             let sprites = pose.sprites & !pose.excluded;
-            draw_variant(&mut hd.rgba, scale, frame, &self.pixels, sprites, image, origin, clip);
+            draw_variant(
+                &mut hd.rgba,
+                scale,
+                frame,
+                &self.pixels,
+                sprites,
+                pose.priority,
+                image,
+                origin,
+                clip,
+                &mut self.in_front,
+            );
         }
         if measure {
             self.stats.drawn = placed
@@ -1352,6 +1730,7 @@ impl ArtState {
         if let Some(j) = slots.iter().position(Slot::is_plane)
             && let Some(plane) = self.plane.take()
         {
+            let size = hd.rgba.len();
             if let Some(art) = self.plane_art(slots[j].entry) {
                 draw::draw_plane(
                     &mut hd.rgba,
@@ -1365,6 +1744,11 @@ impl ArtState {
                         x_offset,
                         slot: j,
                         hidden,
+                        under: self
+                            .plane_under
+                            .as_ref()
+                            .map(|under| &under.rgba[..])
+                            .filter(|under| under.len() == size),
                     },
                 );
             }
@@ -1509,9 +1893,20 @@ impl ArtState {
             .map(|(_, at)| *at)
             .filter(|at| *at != SHADOW && !self.objects.contains_key(at))
             .collect();
+        if self.loads_async() {
+            // (asked for in the frame's order, before the frame asks for them one at a time)
+            for &at in &new_pictures {
+                self.want(load::ArtKey::Picture(at), 0);
+            }
+            for &at in &new_objects {
+                self.want(load::ArtKey::Object(at), 0);
+            }
+            return;
+        }
         if new_pictures.len() + new_objects.len() < 2 {
             return;
         }
+        self.loaded_on_draw(new_pictures.len() + new_objects.len());
         let (loaded_pictures, loaded_objects): (Vec<_>, Vec<_>) = rayon::join(
             || new_pictures.par_iter().map(|&at| (at, self.load_picture(at))).collect(),
             || {
@@ -1533,57 +1928,65 @@ impl ArtState {
     }
 
     fn load_picture(&self, at: u32) -> Option<Arc<Image>> {
-        let side = 32 * self.scale;
-        self.load(&self.pack.art.pictures()[at as usize].art, side, side)
+        let _timer = self.loads.start(LoadKind::Picture);
+        load::picture(&self.pack, at, self.scale, &self.loads.bytes)
     }
 
     fn load_object(&self, at: u32) -> Option<Arc<Image>> {
-        let object = &self.pack.art.objects()[real(at)];
-        let (w, h) =
-            (usize::from(object.width) * self.scale, usize::from(object.height) * self.scale);
-        let image = self.load(&object.art, w, h)?;
-        if at & MIRROR == 0 {
-            return Some(image);
-        }
-        Some(Arc::new(mirror(&image)))
+        let _timer = self.loads.start(LoadKind::Object);
+        load::object(&self.pack, at, self.scale, &self.loads.bytes)
     }
 
-    /// The picture of a pose variant of `object` at the scale, mirrored when the pose faces the other way (as the object's own
-    /// picture is). The file must be the object's picture grown by the margin, four art pixels to a game pixel: a file that is
-    /// missing or of another size is not drawn, and the log says why.
+    /// `cells` (the text cells of the frame last composed) without the pixels a pose variant was drawn on in front of them,
+    /// when there are any: the HD text fills a cell's pixels with its ground and draws its glyph there after the art, so a
+    /// variant's margin over a cell the game shows past the sprites (the white of a BG3 aura or blast behind the fighter,
+    /// cells of the blank glyph) was painted over, the hair cut along the cells' edges. A cell in front of the pose (a
+    /// window over it) keeps its pixels. `None` when no pixel of `cells` is taken out.
+    /// Per pixel of the last picture, whether it is drawn from one of the pack's pictures (a portrait, a face).
+    pub(crate) fn picture_pixels(&self) -> Vec<bool> {
+        self.pixels.iter().map(|pixel| pixel.picture != NO_PICTURE).collect()
+    }
+
+    pub(crate) fn uncover(
+        &self,
+        cells: &[crate::font::TextCell],
+    ) -> Option<Vec<crate::font::TextCell>> {
+        if self.in_front.is_empty() {
+            return None;
+        }
+        let width = self.in_front_width as i32;
+        let height = (self.in_front.len() / self.in_front_width.max(1)) as i32;
+        let covered = |x: i32, y: i32| {
+            (0..width).contains(&x)
+                && (0..height).contains(&y)
+                && self.in_front[(y * width + x) as usize]
+        };
+        let mut changed = false;
+        let uncovered = cells
+            .iter()
+            .map(|cell| {
+                let mut cell = *cell;
+                for bit in 0..64_i32 {
+                    if cell.mask >> bit & 1 != 0 && covered(cell.x + bit % 8, cell.y + bit / 8) {
+                        cell.mask &= !(1 << bit);
+                        changed = true;
+                    }
+                }
+                cell
+            })
+            .collect();
+        changed.then_some(uncovered)
+    }
+
+    /// The picture of a pose variant of `object` at the scale (see [`load::pose_variant`]).
     fn load_variant(
         &self,
         variant: &PoseVariant,
         object: &crate::art_index::Object,
         mirrored: bool,
     ) -> Option<Arc<Image>> {
-        let margin = variant.margin as usize;
-        let (w, h) =
-            (usize::from(object.width) + 2 * margin, usize::from(object.height) + 2 * margin);
-        let refused = |reason: String| {
-            log::warn!("the pose variant {} of {} is not drawn: {reason}", variant.file, object.id);
-        };
-        let bytes = match std::fs::read(self.pack.dir.join(&variant.file)) {
-            Ok(bytes) => bytes,
-            Err(error) => {
-                refused(error.to_string());
-                return None;
-            }
-        };
-        let (pw, ph, rgba) = match crate::png::read_rgba(&bytes) {
-            Ok(picture) => picture,
-            Err(error) => {
-                refused(error);
-                return None;
-            }
-        };
-        if (pw as usize, ph as usize) != (w * 4, h * 4) {
-            refused(format!("it is {pw} x {ph} pixels, not {} x {}", w * 4, h * 4));
-            return None;
-        }
-        let picture = Image::new(pw as usize, ph as usize, rgba);
-        let image = resample::resize(&picture, w * self.scale, h * self.scale);
-        Some(Arc::new(if mirrored { mirror(&image) } else { image }))
+        let _timer = self.loads.start(LoadKind::Variant);
+        load::pose_variant(&self.pack, variant, object, mirrored, self.scale, &self.loads.bytes)
     }
 
     /// The picture of the pose variant the pack gives the object `at` while the conditions of the frame hold, and its margin
@@ -1593,6 +1996,20 @@ impl ArtState {
     /// drawn (see [`ArtState::load_variant`]). `None` when no variant holds for the object, or no picture is drawn: the object
     /// is then drawn as it is.
     fn pose_variant(&mut self, at: u32) -> Option<(Arc<Image>, i32)> {
+        match self.pose_variant_art(at) {
+            VariantArt::Drawn(image, margin) => Some((image, margin)),
+            VariantArt::Asked | VariantArt::None => None,
+        }
+    }
+
+    /// Whether the picture of the pose variant the object `at` is drawn from is asked of the reading thread and not read
+    /// yet (see [`ArtState::set_async`]): the pose is then drawn as the game draws it, as a pose whose art is not read.
+    fn variant_asked(&mut self, at: u32) -> bool {
+        matches!(self.pose_variant_art(at), VariantArt::Asked)
+    }
+
+    /// [`ArtState::pose_variant`], and whether the picture is asked of the reading thread.
+    fn pose_variant_art(&mut self, at: u32) -> VariantArt {
         let pack = Arc::clone(&self.pack);
         let object = &pack.art.objects()[real(at)];
         let mirrored = at & MIRROR != 0;
@@ -1615,17 +2032,22 @@ impl ArtState {
             let margin = variant.margin as i32;
             let loaded = match self.pose_images.get(&(first + index, mirrored)) {
                 Some(loaded) => loaded.clone(),
+                None if self.loads_async() => {
+                    self.want(load::ArtKey::Variant(first + index, mirrored), at);
+                    return VariantArt::Asked;
+                }
                 None => {
                     let loaded = self.load_variant(variant, object, mirrored);
+                    self.loaded_on_draw(1);
                     self.pose_images.insert((first + index, mirrored), loaded.clone());
                     loaded
                 }
             };
             if let Some(image) = loaded {
-                return Some((image, margin));
+                return VariantArt::Drawn(image, margin);
             }
         }
-        None
+        VariantArt::None
     }
 
     /// Keeps `image` as the art of object `at`, the least recently used one making room.
@@ -1694,6 +2116,114 @@ impl ArtState {
         }
     }
 
+    /// Whether object `at` can draw `pose` in the colours of `row`: not when the recolouring would
+    /// give one colour where the row has two ([`recolour::merges`]) and `row` is Super Vegeta's
+    /// palette, or Super Saiyan Goku's on a pose the pack has no Super Saiyan art for (the palette of
+    /// some art of theirs, [`SUPER_VEGETA_MARK`], [`SUPER_SAIYAN_GOKU_MARK`], with every colour the
+    /// object uses). The game draws Super Vegeta in some poses (his energy wave, his Exploding Wave,
+    /// a kick that throws him) with Vegeta's tiles in his own palette, the hair (14, 15) yellow and
+    /// orange, and a piece of Super Saiyan Goku's head at the screen's edge in the hidden fight with
+    /// tiles the pack has only normal art for (`noartfix-f884cde40d`); that art is of the normal
+    /// forms, where the hair is the black of the outline (1), and recoloured it showed them with
+    /// black hair. Such a
+    /// pose keeps the game's sprite, its own pixels and colours, as a pose with no art does. Where
+    /// the pack has Super Saiyan art for the pose, [`Self::unit_for`] chooses between the sets.
+    /// A picture of `art-override\super-vegeta\` (patch 0049,
+    /// [`crate::art_index::Object::super_vegeta_only`]) is drawn only when `row` is Super Vegeta's palette: the colours of
+    /// some art of his with every colour the pose uses and his hair, so that Vegeta's colours (black hair) never take
+    /// it, even in a pose whose art shows no hair. His picture of an effect's pose (palette [`game_over_super_vegeta`]) is
+    /// drawn only when `row` is that palette, every colour.
+    /// A picture of `art-override\goku\` (patch 0051, [`crate::art_index::Object::normal_goku_only`]) is drawn only when
+    /// the hair of `row` ([`GOKU_HAIR`]) is not Super Saiyan Goku's and no two of its colours become two in `row`
+    /// ([`recolour::merges`]): the picture's hair is the black of its outline, so it is drawn in the normal Goku's black
+    /// hair, and in the Kaioken's colours where the outline is as red as the hair, but where the hair is red and the outline
+    /// is not the pose keeps the game's sprite as before (patch 0050).
+    fn recolourable(&self, pose: &Pose, at: u32, row: &[[u8; 3]; 16]) -> bool {
+        let object = &self.pack.art.objects()[at as usize];
+        if object.normal_goku_only() {
+            return !self.super_saiyan_hair(row) && !recolour::merges(&object.palette, row);
+        }
+        if self.normal_goku_in_super_saiyan_art(pose, at, row) {
+            return false;
+        }
+        if object.super_vegeta_only() {
+            // (his picture of the effect's pose of GAME OVER: in that scene's palette of his only)
+            if object.palette == game_over_super_vegeta() {
+                return object.palette.distance(row) == 0;
+            }
+            let wanted = object.palette.mask | SUPER_VEGETA_HAIR;
+            return self
+                .super_vegeta()
+                .iter()
+                .any(|palette| palette.mask & wanted == wanted && palette.distance(row) == 0);
+        }
+        if object.luma || !recolour::merges(&object.palette, row) {
+            return true;
+        }
+        let mask = object.palette.mask;
+        let of_row = |palettes: &[Palette]| {
+            palettes.iter().any(|palette| palette.mask & mask == mask && palette.distance(row) == 0)
+        };
+        let goku = || {
+            of_row(self.super_saiyan_goku())
+                && !self
+                    .candidates(pose)
+                    .iter()
+                    .any(|&(at, _)| self.unit_of(at).contains(SUPER_SAIYAN_GOKU_MARK))
+        };
+        !(of_row(self.super_vegeta()) || goku())
+    }
+
+    /// The coloured palettes of Super Vegeta's art in the index.
+    fn super_vegeta(&self) -> &[Palette] {
+        self.super_vegeta.get_or_init(|| self.palettes_of(SUPER_VEGETA_MARK))
+    }
+
+    /// Whether `at` is Super Saiyan Goku's art drawn for the normal Goku using the Kaioken (patch 0050): the Kaioken is on
+    /// (`$0C36` bit 7, or its multiplier `$01EF` in use, as in the close-up of its first use), the hair of `row`
+    /// ([`GOKU_HAIR`]) is not the Super Saiyan's (black in his own palette, red in the Kaioken's), and the pack has no art
+    /// of the normal Goku for the pose (or its mirror image). The pack has only Super Saiyan art for some poses the game
+    /// draws for both (the whole body powering up, `battle-goku-ssj-020`, is the Kaioken's close-up as well as the Super
+    /// Saiyan's): recoloured, its hair and the aura stay gold, and Goku using the Kaioken (and the Kaioken with the
+    /// Kamehameha) was drawn as the Super Saiyan. Such a pose keeps the game's sprite, as a pose with no art does.
+    /// Without the Kaioken nothing changes (Goku turning Super Saiyan before Frieza is drawn from that art in the frames
+    /// whose palette still has his black hair, as before), nor in the Super Saiyan's hair. Where the pack has art of both
+    /// for the pose, [`Self::unit_for`] chooses between the sets.
+    fn normal_goku_in_super_saiyan_art(&self, pose: &Pose, at: u32, row: &[[u8; 3]; 16]) -> bool {
+        if !self.conditions.kaioken_on || !self.unit_of(at).contains(SUPER_SAIYAN_GOKU_MARK) {
+            return false;
+        }
+        let normal =
+            |unit: &str| unit.contains(GOKU_MARK) && !unit.contains(SUPER_SAIYAN_GOKU_MARK);
+        !self.super_saiyan_hair(row)
+            && !self.candidates(pose).iter().any(|&(at, _)| normal(&self.unit_of(at)))
+    }
+
+    /// Whether the hair of `row` ([`GOKU_HAIR`]) is the colours of some art of Super Saiyan Goku.
+    fn super_saiyan_hair(&self, row: &[[u8; 3]; 16]) -> bool {
+        self.super_saiyan_goku().iter().any(|palette| {
+            palette.mask & GOKU_HAIR == GOKU_HAIR
+                && Palette { mask: GOKU_HAIR, ..*palette }.distance(row) == 0
+        })
+    }
+
+    /// The coloured palettes of Super Saiyan Goku's art in the index.
+    fn super_saiyan_goku(&self) -> &[Palette] {
+        self.super_saiyan_goku.get_or_init(|| self.palettes_of(SUPER_SAIYAN_GOKU_MARK))
+    }
+
+    /// The coloured palettes of the art whose id has `mark`.
+    fn palettes_of(&self, mark: &str) -> Vec<Palette> {
+        let objects = self.pack.art.objects();
+        objects
+            .iter()
+            .filter(|object| {
+                object.id.contains(mark) && object.palette.mask != 0 && !object.override_only()
+            })
+            .map(|object| object.palette)
+            .collect()
+    }
+
     /// The object of the index with the silhouette of `pose` (the same box and the same opaque
     /// pixels), when the pose is one a palette variant could be: big enough, of several
     /// colours, and not a plain block. The answer is kept by the pose's key.
@@ -1733,33 +2263,121 @@ impl ArtState {
     }
 
     /// The art made for exactly the pixels of `pose`, or for them mirrored left to right (drawn
-    /// mirrored: the second answer), among the objects of the pose's kind: the art of `unit` when
-    /// one is given, in the palette closest to `row`; the art of the pose's own facing before the
-    /// art of the other one.
+    /// mirrored: the second answer), among the objects of the pose's kind that can be drawn in the
+    /// colours of `row` ([`Self::recolourable`]): the art of `unit` when one is given, in the
+    /// palette closest to `row`; the art of the pose's own facing before the art of the other one.
+    /// The third answer: there is art of `unit` (or of any unit) for the pose, none of which can be
+    /// drawn in those colours.
     fn exact_art(
         &self,
         pose: &Pose,
         row: &[[u8; 3]; 16],
         unit: Option<&String>,
-    ) -> (Option<u32>, bool) {
-        let best = self
+    ) -> (Option<u32>, bool, bool) {
+        if let Some(at) = self.ending_space_vegeta(pose, row) {
+            return (Some(at), false, false);
+        }
+        let of_unit: Vec<(u32, bool)> = self
             .candidates(pose)
             .into_iter()
             .filter(|&(at, _)| unit.is_none_or(|unit| self.unit_of(at) == *unit))
-            .min_by_key(|&(at, mirrored)| {
-                let palette = &self.pack.art.objects()[at as usize].palette;
-                (u8::from(mirrored), palette.distance(row), u8::from(palette.mask == 0))
-            });
+            .collect();
+        let best =
+            of_unit.iter().copied().filter(|&(at, _)| self.recolourable(pose, at, row)).min_by_key(
+                |&(at, mirrored)| {
+                    let palette = &self.pack.art.objects()[at as usize].palette;
+                    (u8::from(mirrored), palette.distance(row), u8::from(palette.mask == 0))
+                },
+            );
         match best {
-            Some((at, mirrored)) => (Some(at), mirrored),
-            None => (None, false),
+            Some((at, mirrored)) => (Some(at), mirrored, false),
+            None => (None, false, !of_unit.is_empty()),
         }
+    }
+
+    /// The picture of `art-override\ending-goku\` drawn in place of object `at` (Goku's art for the pose, see
+    /// [`crate::art_index::Object::ending_goku_only`]) while the ending's flight with Gohan is on screen
+    /// ([`Conditions::of_work_ram`]): his torn clothes there, the art as before everywhere else. `at` itself in any other
+    /// frame, for art that has no such picture, and without the folder.
+    fn ending_goku(&self, at: u32) -> u32 {
+        if !self.conditions.ending_flight {
+            return at;
+        }
+        let objects = self.pack.art.objects();
+        let object = &objects[at as usize];
+        self.pack
+            .art
+            .objects_with(object.key)
+            .iter()
+            .copied()
+            .find(|&other| {
+                let other = &objects[other as usize];
+                other.ending_goku_only()
+                    && other.field() == object.field()
+                    && other.id.strip_suffix(crate::art_index::ENDING_GOKU_ONLY)
+                        == Some(object.id.as_str())
+            })
+            .unwrap_or(at)
+    }
+
+    /// The picture of `art-override\super-vegeta\` for the field group of [`ENDING_SPACE_VEGETA`] (Super Vegeta in
+    /// space), when `row` is Super Vegeta's palette ([`Self::recolourable`]). `None` for any other pose, in other colours
+    /// (Vegeta's), or without the picture: the pose is then found as before.
+    fn ending_space_vegeta(&self, pose: &Pose, row: &[[u8; 3]; 16]) -> Option<u32> {
+        if !pose.field || pose.key != ENDING_SPACE_VEGETA {
+            return None;
+        }
+        let objects = self.pack.art.objects();
+        self.pack.art.objects_with(pose.key).iter().copied().find(|&at| {
+            objects[at as usize].super_vegeta_only() && self.recolourable(pose, at, row)
+        })
+    }
+
+    /// The picture of `art-override\super-vegeta\` (patch 0049) to draw `piece` from in place of object `at`, the art of the
+    /// same shape (`shaped`) or the art of the whole pose `held` that holds it, when `at` cannot draw it in the colours of
+    /// `row` and the picture of `at`'s key can: Super Vegeta vanishing in his teleport (`battle-vegeta-804`) is drawn in
+    /// stripes the index has no key for, held by Vegeta's art of the pose (black hair where he has two colours), and the
+    /// stripes kept the game's sprite because his picture is found by its key only. `None` where `at` can draw the piece
+    /// (nothing that was drawn from art changes) or no such picture can. `at` an effect's art (palette mask 0, recoloured
+    /// from the sprite's own colours, so it draws in any): the picture is drawn wherever it can be, Vegeta flying over
+    /// GAME OVER (`gallery-fx-1118`, with the pads) in his palette of that scene ([`game_over_super_vegeta`]), the art
+    /// as before in any other.
+    fn held_override(
+        &self,
+        at: u32,
+        shaped: bool,
+        piece: &Pose,
+        held: &Pose,
+        row: &[[u8; 3]; 16],
+    ) -> Option<u32> {
+        let objects = self.pack.art.objects();
+        let drawable = |at: u32| {
+            (shaped || partial::draws(&objects[at as usize].palette, row, piece))
+                && self.recolourable(held, at, row)
+        };
+        let effect = {
+            let object = &objects[at as usize];
+            !object.luma && object.palette.mask == 0
+        };
+        if drawable(at) && !effect {
+            return None;
+        }
+        self.pack
+            .art
+            .objects_with(objects[at as usize].key)
+            .iter()
+            .copied()
+            .find(|&other| objects[other as usize].super_vegeta_only() && drawable(other))
     }
 
     /// The objects of the pose's kind made for its pixels, and for them mirrored (`true`).
     fn candidates(&self, pose: &Pose) -> Vec<(u32, bool)> {
         let index = &self.pack.art;
-        let of_kind = |&&at: &&u32| index.objects()[at as usize].field() == pose.field;
+        // (the poses of `art-override\ending-goku\` are drawn only in place of their art, see `Self::ending_goku`)
+        let of_kind = |&&at: &&u32| {
+            let object = &index.objects()[at as usize];
+            object.field() == pose.field && !object.ending_goku_only()
+        };
         let mut found: Vec<(u32, bool)> =
             index.objects_with(pose.key).iter().filter(of_kind).map(|&at| (at, false)).collect();
         if let Some(mirror) = pose.mirror_key().filter(|&mirror| mirror != pose.key) {
@@ -1783,13 +2401,37 @@ impl ArtState {
     /// Saibamen of the game) and each was drawn on its own, so they differ in the details: the
     /// fighters of a formation are drawn from the unit with the most poses in the index, in the
     /// colours of their own palettes, whatever their colours, and so are the frames of an
-    /// animation. While Super Saiyan Goku is in the party, a pose that both his normal and his Super
-    /// Saiyan art have is drawn from the Super Saiyan art: the normal art has the same pixels, in the
-    /// normal palette, where his hair is black; without him, from the normal art, however many poses
-    /// the Super Saiyan set has. `None` when one unit (or none) has art for the pose.
-    fn unit_for(&self, pose: &Pose) -> Option<String> {
-        let mut units: Vec<String> =
-            self.candidates(pose).into_iter().map(|(at, _)| self.unit_of(at)).collect();
+    /// animation. While Super Saiyan Goku is in the party, a pose that both his normal and his
+    /// Super Saiyan art have is drawn from the Super Saiyan art, unless the colours of `row` are
+    /// nearer the normal art's (see [`Self::goku_colours`]): the normal art has the same
+    /// pixels, in the normal palette, where his hair is black, and the scenes of the ending draw
+    /// him so (black hair, the normal palette) with his Super Saiyan unit still in the party, but
+    /// for the pose of [`GOKU_HOLDING_GOHAN`], drawn from the Super Saiyan art whatever its colours
+    /// (a choice of this branch);
+    /// without him, from the Super Saiyan art when the colours of `row` are nearer its art's (Goku
+    /// turning Super Saiyan before Frieza: the close-up `battle-goku-068` in the Super Saiyan palette
+    /// before `$3B` is in a party record), else from the normal art, however many poses the Super
+    /// Saiyan set has: the palette decides, the party record breaks a tie. Otherwise a
+    /// unit with art for the pose made for exactly the colours of `row` is drawn from: two units of
+    /// the same pixels can be two characters, not two colours of one (Vegeta and Super Vegeta), and
+    /// the art of the one with more poses, recoloured, cannot give the other's colours back where
+    /// its palette has one colour for several (Vegeta's black hair, eyes and outline). When several
+    /// units have art for the exact colours, the one of them with the most poses; when none has,
+    /// the unit with the most poses. `None` when one unit (or none) has art for the pose.
+    ///
+    /// A picture of `art-override\super-vegeta\` (patch 0049) or `art-override\goku\` (patch 0051) for the pose that can be
+    /// drawn in the colours of `row` (Super Vegeta's; the normal Goku's black hair, see [`Self::recolourable`]) is the
+    /// unit drawn from; one that cannot is left out, so the choice is as it was without it.
+    fn unit_for(&self, pose: &Pose, row: &[[u8; 3]; 16]) -> Option<String> {
+        let mut candidates = self.candidates(pose);
+        let objects = self.pack.art.objects();
+        if let Some(&(at, _)) = candidates.iter().find(|&&(at, _)| {
+            objects[at as usize].override_only() && self.recolourable(pose, at, row)
+        }) {
+            return Some(self.unit_of(at));
+        }
+        candidates.retain(|&(at, _)| !objects[at as usize].override_only());
+        let mut units: Vec<String> = candidates.iter().map(|&(at, _)| self.unit_of(at)).collect();
         units.sort();
         units.dedup();
         if units.len() < 2 {
@@ -1799,16 +2441,84 @@ impl ArtState {
         let normal = |unit: &String| unit.contains(GOKU_MARK) && !super_saiyan(unit);
         if units.iter().any(super_saiyan) && units.iter().any(normal) {
             // Any set of Goku's art (the battle poses, the close-ups of the special attacks) that has a Super Saiyan set for
-            // these pixels is drawn from it while he is in the party, and from the normal set otherwise.
-            if self.conditions.super_saiyan_goku {
+            // these pixels is drawn from it while he is in the party and the frame does not colour him as the normal Goku,
+            // and from the normal set otherwise.
+            // Goku holding Gohan before Super Vegeta is the Super Saiyan whatever the colours: a choice of this branch
+            // (see `GOKU_HOLDING_GOHAN`)
+            let holding_gohan = candidates
+                .iter()
+                .any(|&(at, _)| self.pack.art.objects()[at as usize].key == GOKU_HOLDING_GOHAN);
+            let colours = self.goku_colours(&candidates, row);
+            let drawn_super_saiyan = if self.conditions.super_saiyan_goku {
+                holding_gohan || colours != Some(std::cmp::Ordering::Less)
+            } else {
+                // Without `$3B` only colours strictly nearer the Super Saiyan art's make him one
+                colours == Some(std::cmp::Ordering::Greater)
+            };
+            if drawn_super_saiyan {
                 return units.into_iter().find(super_saiyan);
             }
             units.retain(|unit| !super_saiyan(unit));
+        }
+        // A palette of no colour is 0 from every row: it is not art made for these colours
+        let objects = self.pack.art.objects();
+        let exact: Vec<String> = candidates
+            .iter()
+            .filter(|&&(at, _)| {
+                let palette = &objects[at as usize].palette;
+                palette.mask != 0 && palette.distance(row) == 0
+            })
+            .map(|&(at, _)| self.unit_of(at))
+            .collect();
+        if units.iter().any(|unit| exact.contains(unit)) {
+            units.retain(|unit| exact.contains(unit));
         }
         let sizes = self.unit_sizes();
         units.into_iter().max_by_key(|unit| {
             (sizes.get(unit).copied().unwrap_or(0), std::cmp::Reverse(unit.clone()))
         })
+    }
+
+    /// How `row` colours a pose that both Goku's normal and his Super Saiyan art have: `Less` when the colours of the
+    /// normal art's palette are strictly nearer `row` than those of the Super Saiyan art's (the normal Goku),
+    /// `Greater` when the Super Saiyan art's are strictly nearer, `Equal` when they are as near. Only the
+    /// indices every coloured palette of the two sets uses are compared, so a colour one set has and the other does
+    /// not (the Super Saiyan's index 11, absent from `gallery-party-goku-u00-056`) weighs on neither side, and the
+    /// colours the sets share (skin, outline) weigh the same on both: what decides is where they differ, the hair (14
+    /// and 15, black for the normal Goku, yellow for the Super Saiyan) and the gi. The game draws Super Saiyan Goku in
+    /// the normal palette in the scenes of the ending (the flight with Gohan, Goku holding him before Super Vegeta),
+    /// with unit `$3B` still in a party record; in a fight it draws him in the Super Saiyan palette, and as he turns
+    /// Super Saiyan before Frieza, before `$3B` is in a party record. `None` when either set has no coloured palette
+    /// for the pose: the party record decides then, as it does when the two are as near.
+    fn goku_colours(
+        &self,
+        candidates: &[(u32, bool)],
+        row: &[[u8; 3]; 16],
+    ) -> Option<std::cmp::Ordering> {
+        let objects = self.pack.art.objects();
+        let coloured: Vec<(bool, Palette)> = candidates
+            .iter()
+            .filter_map(|&(at, _)| {
+                let unit = self.unit_of(at);
+                let palette = objects[at as usize].palette;
+                (unit.contains(GOKU_MARK) && palette.mask != 0)
+                    .then(|| (unit.contains(SUPER_SAIYAN_GOKU_MARK), palette))
+            })
+            .collect();
+        let shared = coloured.iter().fold(u16::MAX, |mask, (_, palette)| mask & palette.mask);
+        let nearest = |super_saiyan: bool| {
+            coloured
+                .iter()
+                .filter(|&&(of, _)| of == super_saiyan)
+                .map(|(_, palette)| {
+                    Palette { mask: palette.mask & shared, ..*palette }.distance(row)
+                })
+                .min()
+        };
+        match (nearest(false), nearest(true)) {
+            (Some(normal), Some(super_saiyan)) => Some(normal.cmp(&super_saiyan)),
+            _ => None,
+        }
     }
 
     /// The number of poses of each unit of the index.
@@ -2135,6 +2845,44 @@ fn count_pixel(counts: &mut KindPixels, mask: &[u128; 5], bit: u128, pixel: &Art
     } else {
         counts.partial += 1;
     }
+}
+
+/// The record of a frame set aside while the picture under its poses is drawn (see [`ArtState::begin_under`]).
+pub(crate) struct UnderCapture {
+    first: Vec<ArtPixel>,
+    stats: ArtStats,
+}
+
+/// Gives each pixel of `pixels` (the frame's record) that one of the `hidden` sprites won, in rows `rows`, the
+/// backgrounds' record of the same pixel in `under` (the record of the frame drawn without those sprites): the art of
+/// the backgrounds is drawn where the pose's art leaves the pixel clear only as the layers are there with the sprite
+/// gone. The record of the sprite itself can only guess at them: it takes every layer the line shows, under a window
+/// that hides one too, and none in front of them that has no art (an explosion's ground), where the picture under the
+/// poses shows what is really there. The rest of the pixel (its object, priority, colour math) stays the sprite's.
+pub(crate) fn merge_under(
+    pixels: &mut [ArtPixel],
+    under: &[ArtPixel],
+    width: usize,
+    hidden: u128,
+    rows: Option<(usize, usize)>,
+) {
+    let Some((first, past)) = rows else { return };
+    let end = (past * width).min(pixels.len()).min(under.len());
+    let start = (first * width).min(end);
+    for (pixel, below) in pixels[start..end].iter_mut().zip(&under[start..end]) {
+        if pixel.oam != crate::NO_OBJECT && hidden >> (pixel.oam & 127) & 1 != 0 {
+            pixel.bg = below.bg;
+        }
+    }
+}
+
+/// `log` with BG1 off on every line: the frame under a Mode 7 plane (see [`ArtState::plane_replaces`]).
+pub(crate) fn without_bg1(log: &FrameLog) -> FrameLog {
+    let mut under = log.clone();
+    for entry in &mut under.entries {
+        entry.regs.main_bg[0] = false;
+    }
+    under
 }
 
 /// The frame rows the picture under the matched poses is needed for: their boxes and the margin

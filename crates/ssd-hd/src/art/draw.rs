@@ -344,6 +344,9 @@ pub(crate) struct PlaneDraw<'a> {
     pub slot: usize,
     /// The objects (a bit for each OAM entry) that an HD pose hides.
     pub hidden: u128,
+    /// The picture under the plane (the frame drawn without BG1, the size of the picture), for art with `replace`:
+    /// where the plane is not transparent its pixel is the picture under it, and the art is drawn over that.
+    pub under: Option<&'a [u8]>,
 }
 
 /// Draws the Mode 7 plane's art: each picture pixel of a 1x pixel the plane showed is the art at the
@@ -396,6 +399,16 @@ pub(crate) fn draw_plane(
                         if !in_plane {
                             continue;
                         }
+                        let target = (sy * frame_width * scale + x * scale + sx) * 4;
+                        // (art with `replace`: the game's pixel of the plane gives way to what is under the plane, at
+                        // every finer place of it: the look's pixel is the 1x pixel spread, so a finer place where
+                        // the plane is transparent can still hold the colour of the plane's pixel; where the plane is
+                        // transparent at 1x the picture under it is the look's own)
+                        if let Some(under) = draw.under {
+                            let at = line * row_bytes * scale + target;
+                            block[target..target + 4].copy_from_slice(&under[at..at + 4]);
+                            any = true;
+                        }
                         let [r, g, b, alpha] = draw.art.sample(map_x, map_y, step);
                         if alpha == 0 {
                             continue;
@@ -410,7 +423,6 @@ pub(crate) fn draw_plane(
                                 adapt(color, draw.art.palette[usize::from(index)], expand(word));
                         }
                         let color = shade(pix.plan, pixel.brightness, color);
-                        let target = (sy * frame_width * scale + x * scale + sx) * 4;
                         blend(&mut block[target..target + 4], color, alpha);
                         any = true;
                     }
@@ -597,6 +609,16 @@ impl Drawn {
 /// `x_offset` the x of the window in it (the wide view's margin). `clip` is the part of the frame
 /// that may be drawn on: `(left, top, right, bottom)`. Returns what each pose drew; with
 /// `measure` the colour sums too (they cost a little in the loop over the pixels drawn).
+///
+/// `open` are the sprites of the poses whose art need not cover their sprites' pixels: the poses
+/// added by a folder of `art-override\` (`super-vegeta\`, `goku\`, `ending-goku\`, see
+/// `Object::override_only`), whose pictures were not made from the game's sprite (Super Vegeta's
+/// without the shoulder pads it has). Before any pose is drawn, each pose's art is drawn where its
+/// own pixels are behind one of those sprites ([`cells_behind`]), so where the art in front is
+/// transparent the pose behind it shows (an energy wave behind Super Vegeta), and where the art in
+/// front is partly transparent the two are mixed. Elsewhere, and with no such sprite, a pose draws
+/// only the pixels its own sprites show. With such a sprite the poses are drawn from back to front;
+/// with none, in their order in `poses`.
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn draw_objects(
     rgba: &mut [u8],
@@ -607,79 +629,168 @@ pub(crate) fn draw_objects(
     x_offset: i32,
     clip: (i32, i32, i32, i32),
     measure: bool,
+    open: u128,
 ) -> Vec<Drawn> {
-    let width = frame.width * scale;
-    let mut shown = Vec::with_capacity(poses.len());
-    for &(pose, ref image, ref luma) in poses {
-        let (grid, visible) = cells(pose, frame, pixels, x_offset, clip);
-        let x_offset = if pose.bg { 0 } else { x_offset };
-        let (x0, y0) = (pose.org.0 + x_offset, pose.org.1 + ROW_OF_CAPTURE);
-        let (w, h) = (pose.w, pose.h);
-        let rows = image.height.min(h * scale);
-        let columns = image.width.min(w * scale);
-        // Each row of the art is its own pixels of the picture: rows are independent
-        let first = (y0 * scale as i32).max(0) as usize;
-        let start = first * width * 4;
-        if start >= rgba.len() {
-            shown.push(Drawn { visible, ..Drawn::default() });
-            continue;
+    // The order the poses are drawn in. With no sprite of `open`: the order they were found in, as
+    // before. With one: from back to front by their frontmost sprite (`Pose::first`, the highest
+    // first; the found order among equals). A pose's art grows past its sprites' pixels only over
+    // the poses behind it (`cells`): so the art of a pose of `open` that goes past the game's
+    // silhouette is not drawn over by a pose behind it, and the art of a pose in front of it (a
+    // hit's spark on him, his own energy wave, a fighter in front of him) grows over his. The art
+    // drawn behind the sprites of `open` (`cells_behind`) takes the same order: where the art of
+    // two poses behind one overlaps, the front one's shows
+    let mut order: Vec<usize> = (0..poses.len()).collect();
+    if open != 0 {
+        order.sort_by_key(|&n| std::cmp::Reverse(poses[n].0.first));
+        for &n in &order {
+            let (pose, ref image, luma) = poses[n];
+            let grid = cells_behind(pose, frame, pixels, x_offset, clip, open, luma);
+            if grid.iter().any(|cell| matches!(cell, Cell::Draw { .. })) {
+                paint_art(rgba, scale, frame.width, pose, image, luma, &grid, x_offset, false);
+            }
         }
-        let area = &mut rgba[start..];
-        let skipped = (first as i32 - y0 * scale as i32).max(0) as usize;
-        let sums = area
-            .par_chunks_mut(width * 4)
-            .take(rows.saturating_sub(skipped))
-            .enumerate()
-            .with_min_len(crate::pool::band(rows))
-            .map(|(n, row)| {
-                let mut sums = Drawn::default();
-                let py = n + skipped;
-                for px in 0..columns {
-                    let target_x = x0 * scale as i32 + px as i32;
-                    if target_x < 0 || target_x as usize >= width {
-                        continue;
-                    }
-                    let Cell::Draw { color, plan, brightness } =
-                        grid[(py / scale) * w + px / scale]
-                    else {
-                        continue;
-                    };
-                    let at = py * image.width + px;
-                    let source = &image.rgba[at * 4..at * 4 + 4];
-                    if source[3] == 0 {
-                        continue;
-                    }
-                    let shown = if *luma {
-                        luma_colour(color, image, at)
-                    } else {
-                        shade(plan, brightness, [source[0], source[1], source[2]])
-                    };
-                    if measure {
-                        let weight = u64::from(source[3]);
-                        sums.weight += weight;
-                        for channel in 0..3 {
-                            sums.shown[channel] += weight * u64::from(shown[channel]);
-                            sums.original[channel] += weight * u64::from(color[channel]);
-                        }
-                        sums.classes_shown[colour_class(shown)] += weight;
-                        sums.classes_original[colour_class(color)] += weight;
-                    }
-                    let target = target_x as usize * 4;
-                    blend(&mut row[target..target + 4], shown, source[3]);
-                }
-                sums
-            })
-            .reduce(Drawn::default, Drawn::add);
-        shown.push(Drawn { visible, ..sums });
+    }
+    let mut shown = vec![Drawn::default(); poses.len()];
+    for &n in &order {
+        let (pose, ref image, luma) = poses[n];
+        let (grid, visible) = cells(pose, frame, pixels, x_offset, clip);
+        let sums = paint_art(rgba, scale, frame.width, pose, image, luma, &grid, x_offset, measure);
+        shown[n] = Drawn { visible, ..sums };
     }
     shown
+}
+
+/// Draws the art `image` of `pose` over `rgba` at the cells of `grid` that are [`Cell::Draw`] (see
+/// [`draw_objects`]). Returns the colour sums (with `measure`).
+#[allow(clippy::too_many_arguments)]
+fn paint_art(
+    rgba: &mut [u8],
+    scale: usize,
+    frame_width: usize,
+    pose: &Pose,
+    image: &Image,
+    luma: bool,
+    grid: &[Cell],
+    x_offset: i32,
+    measure: bool,
+) -> Drawn {
+    let width = frame_width * scale;
+    let x_offset = if pose.bg { 0 } else { x_offset };
+    let (x0, y0) = (pose.org.0 + x_offset, pose.org.1 + ROW_OF_CAPTURE);
+    let (w, h) = (pose.w, pose.h);
+    let rows = image.height.min(h * scale);
+    let columns = image.width.min(w * scale);
+    // Each row of the art is its own pixels of the picture: rows are independent
+    let first = (y0 * scale as i32).max(0) as usize;
+    let start = first * width * 4;
+    if start >= rgba.len() {
+        return Drawn::default();
+    }
+    let area = &mut rgba[start..];
+    let skipped = (first as i32 - y0 * scale as i32).max(0) as usize;
+    area.par_chunks_mut(width * 4)
+        .take(rows.saturating_sub(skipped))
+        .enumerate()
+        .with_min_len(crate::pool::band(rows))
+        .map(|(n, row)| {
+            let mut sums = Drawn::default();
+            let py = n + skipped;
+            for px in 0..columns {
+                let target_x = x0 * scale as i32 + px as i32;
+                if target_x < 0 || target_x as usize >= width {
+                    continue;
+                }
+                let Cell::Draw { color, plan, brightness } = grid[(py / scale) * w + px / scale]
+                else {
+                    continue;
+                };
+                let at = py * image.width + px;
+                let source = &image.rgba[at * 4..at * 4 + 4];
+                if source[3] == 0 {
+                    continue;
+                }
+                let shown = if luma {
+                    luma_colour(color, image, at)
+                } else {
+                    shade(plan, brightness, [source[0], source[1], source[2]])
+                };
+                if measure {
+                    let weight = u64::from(source[3]);
+                    sums.weight += weight;
+                    for channel in 0..3 {
+                        sums.shown[channel] += weight * u64::from(shown[channel]);
+                        sums.original[channel] += weight * u64::from(color[channel]);
+                    }
+                    sums.classes_shown[colour_class(shown)] += weight;
+                    sums.classes_original[colour_class(color)] += weight;
+                }
+                let target = target_x as usize * 4;
+                blend(&mut row[target..target + 4], shown, source[3]);
+            }
+            sums
+        })
+        .reduce(Drawn::default, Drawn::add)
+}
+
+/// The pixels of `pose`'s silhouette that a sprite of `open` (not the pose's own) shows in front of
+/// it: [`Cell::Draw`] there, with the shading of the pixel; [`Cell::Skip`] elsewhere. The original's
+/// colour of the pose there (what luma art is lit by) is its own for an effect's pose; a luma pose
+/// of a fighter is left out there (the frame has only the colour of the sprite in front).
+fn cells_behind(
+    pose: &Pose,
+    frame: &Frame,
+    pixels: &[ArtPixel],
+    x_offset: i32,
+    clip: (i32, i32, i32, i32),
+    open: u128,
+    luma: bool,
+) -> Vec<Cell> {
+    let (w, h) = (pose.w as i32, pose.h as i32);
+    let mut out = vec![Cell::Skip; (w * h).max(0) as usize];
+    if pose.bg {
+        return out;
+    }
+    let own = pose.sprites & !pose.excluded;
+    let (x0, y0) = (pose.org.0 + x_offset, pose.org.1 + ROW_OF_CAPTURE);
+    for y in 0..h {
+        for x in 0..w {
+            let at = (y * w + x) as usize;
+            if pose.arr[at] == 0 {
+                continue;
+            }
+            let (fx, fy) = (x0 + x, y0 + y);
+            let in_frame =
+                (0..frame.width as i32).contains(&fx) && (0..frame.height as i32).contains(&fy);
+            let in_clip = fx >= clip.0 && fx < clip.2 && fy >= clip.1 && fy < clip.3;
+            if !in_frame || !in_clip {
+                continue;
+            }
+            let index = fy as usize * frame.width + fx as usize;
+            let pixel = &pixels[index];
+            if pixel.oam == NO_OBJECT || own >> pixel.oam & 1 != 0 || open >> pixel.oam & 1 == 0 {
+                continue;
+            }
+            let color = match pose.rgba.get(at * 4..at * 4 + 3) {
+                Some(rgb) => [rgb[0], rgb[1], rgb[2]],
+                None if luma => continue,
+                None => {
+                    let c = frame.pixels[index];
+                    [c.r, c.g, c.b]
+                }
+            };
+            out[at] = Cell::Draw { color, plan: pixel.plan, brightness: pixel.brightness };
+        }
+    }
+    out
 }
 
 /// Draws the picture of a pose variant over `rgba`: `image` is the variant's picture at the picture's `scale`, its top left at
 /// `origin` (frame coordinates, the margin included). Its opaque pixels are drawn in their own colours, dimmed only by the
 /// screen's brightness: they are not the palette's (`recolour`) nor the colour math's. A pixel that shows a sprite of another
 /// object is left as it is (that object is in front); the others, the pose's own sprites included, are drawn over the
-/// picture, so the variant's margin shows past the sprites it grows from.
+/// picture, so the variant's margin shows past the sprites it grows from. The frame pixels it drew where a sprite of the
+/// pose's `priority` bits would be in front of what the frame shows are marked in `in_front` (by the pixel's index in the
+/// frame): the HD text does not paint a text cell's ground over them (see [`super::ArtState::uncover`]).
 #[allow(clippy::too_many_arguments)]
 pub(crate) fn draw_variant(
     rgba: &mut [u8],
@@ -687,9 +798,11 @@ pub(crate) fn draw_variant(
     frame: &Frame,
     pixels: &[ArtPixel],
     sprites: u128,
+    priority: u8,
     image: &Image,
     origin: (i32, i32),
     clip: (i32, i32, i32, i32),
+    in_front: &mut [bool],
 ) {
     let width = frame.width * scale;
     let rows = rgba.len() / (width * 4);
@@ -705,13 +818,16 @@ pub(crate) fn draw_variant(
             if source[3] == 0 || x < 0 || x as usize >= width {
                 continue;
             }
-            let Some((pixel, _)) =
+            let Some((pixel, index)) =
                 at_frame(frame, pixels, clip, x / scale as i32, y / scale as i32)
             else {
                 continue;
             };
             if pixel.oam != NO_OBJECT && sprites >> pixel.oam & 1 == 0 {
                 continue;
+            }
+            if pixel.beaten_by(priority) {
+                in_front[index] = true;
             }
             let colour = shade(plain, pixel.brightness, [source[0], source[1], source[2]]);
             let at = (y as usize * width + x as usize) * 4;

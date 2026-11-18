@@ -1,9 +1,9 @@
 #!/usr/bin/env bash
-# Makes the pictures of the README's comparison gallery (docs/media/cmp-*.png) from your own ROM.
+# Makes the pictures of the comparison gallery of docs/ENGINE.en.md (docs/media/cmp-*.png) from your own ROM.
 #
 #   tools/gallery/make.sh [--exe target/release/ssd-recompiled.exe] [--replays .work/replays] [--out docs/media]
 #
-# Needs the game with its ROM cached (README, "Getting started"), the HD pack installed (the Remastered
+# Needs the game with its ROM cached (docs/ENGINE.en.md, "Getting started"), the HD pack installed (the Remastered
 # pictures use it), and the reference replays (`cargo run --release -p xtask -- make-replays`, and
 # tools/saves/secrets.sh for the `secret-*` ones). tools/gallery/frames.txt says what each picture is.
 # The game draws offscreen (--ui-snapshot): no window is opened. The PNGs the game writes are stored
@@ -32,9 +32,10 @@ while IFS='|' read -r name replay classic remastered script; do
     script="$(echo "$script" | xargs)"
     remastered="${remastered:-$classic}"
     echo "== $name ($replay, frames $classic / $remastered${script:+, $script})"
-    "$exe" --replay "$replays/$replay.ssdreplay" --headless-frames "$classic" \
+    # --lang en: the pictures are English whatever translations the data folder holds
+    "$exe" --replay "$replays/$replay.ssdreplay" --headless-frames "$classic" --lang en \
         --ui-size 1170x956 --ui-snapshot "$out/cmp-$name-classic.png"
-    args=(--replay "$replays/$replay.ssdreplay" --headless-frames "$remastered"
+    args=(--replay "$replays/$replay.ssdreplay" --headless-frames "$remastered" --lang en
           --mode enhanced --hd-scale 4 --ui-size 1488x956 --ui-snapshot "$out/cmp-$name-remastered.png")
     if [ -n "$script" ]; then args+=(--ui-script "$root/tools/gallery/$script"); fi
     "$exe" "${args[@]}"

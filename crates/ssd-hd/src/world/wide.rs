@@ -36,7 +36,7 @@ use crate::bgart::Probe;
 use crate::enhanced::picture;
 use crate::font::{Font, TextCapture};
 use crate::pack::Pack;
-use crate::translate::{Overlay, Target, Translator};
+use crate::translate::{Beneath, Overlay, Target, Translator};
 use crate::{Binder, Frame, HdFrame, HdOptions, Memories, Pixel, Renderer, Unsupported, WIDTH};
 use rayon::prelude::*;
 use ssd_catalogue::engine::OnScreen;
@@ -263,6 +263,14 @@ pub struct WideRenderer {
     mapped: bool,
     /// The translation drawn over the original's message windows, when the run has one.
     translator: Option<Translator>,
+    /// The time the renderer's own passes took in the picture being drawn ([`WideRenderer::compose`]).
+    compose_time: std::time::Duration,
+    /// What the last Enhanced picture drawn cost ([`WideRenderer::draw_cost`]).
+    cost: crate::DrawCost,
+    /// The lightning of the Super Saiyan transformation (see [`WideRenderer::set_lightning`]), and the frames since the
+    /// transformation started while it goes on (the conditions', [`Conditions::with_ssj_lightning`]).
+    lightning: Option<crate::lightning::Overlay>,
+    ssj_lightning: Option<u32>,
 }
 
 /// A part of an object the original drops, as a wide frame draws it.
@@ -339,6 +347,9 @@ pub struct WideHd {
     pub logical: Rect,
     pub hud: Rect,
     pub stats: WideStats,
+    /// The picture lacks art the reading thread is still reading (see [`WideRun::set_art_async`]): the picture of the
+    /// frame once the art is read is another. Always `false` when the frames read their art.
+    pub art_pending: bool,
 }
 
 /// The serial of the next picture made: a counter of the process, so two pictures with one serial are one picture.
@@ -386,7 +397,17 @@ impl WideRenderer {
             extras: Vec::new(),
             mapped: false,
             translator: None,
+            compose_time: std::time::Duration::ZERO,
+            cost: crate::DrawCost::default(),
+            lightning: None,
+            ssj_lightning: None,
         }
+    }
+
+    /// What the last Enhanced picture drawn ([`WideRenderer::render_hd`]) cost, by its stages.
+    #[must_use]
+    pub fn draw_cost(&self) -> crate::DrawCost {
+        self.cost
     }
 
     /// Makes [`WideRenderer::render_hd`] draw the game's UI text from `font` at a scale of 2 or
@@ -448,9 +469,16 @@ impl WideRenderer {
 
     /// The conditions of the frame the next picture with art is drawn from (see [`crate::Renderer::set_conditions`]).
     pub fn set_conditions(&mut self, conditions: Conditions) {
+        self.ssj_lightning = conditions.ssj_lightning();
         if let Some(art) = self.art.as_mut() {
             art.conditions = conditions;
         }
+    }
+
+    /// Makes [`WideRenderer::render_hd`] draw the pictures of `lightning` over the PPU's picture while Goku's first
+    /// Super Saiyan transformation goes on (see [`crate::lightning`]); `None` (the start) draws none.
+    pub fn set_lightning(&mut self, lightning: Option<Arc<crate::lightning::Lightning>>) {
+        self.lightning = lightning.map(crate::lightning::Overlay::new);
     }
 
     /// Makes [`WideRenderer::render_hd`] draw the art of the backgrounds alone (the layers, not the
@@ -459,6 +487,20 @@ impl WideRenderer {
         if let Some(art) = self.art.as_mut() {
             art.backgrounds_only = on;
         }
+    }
+
+    /// Reads the pack's art on a thread of its own (see [`crate::Renderer::set_art_async`]). Call it
+    /// after [`WideRenderer::set_art`].
+    pub fn set_art_async(&mut self, on: bool) {
+        if let Some(art) = self.art.as_mut() {
+            art.set_async(on);
+        }
+    }
+
+    /// Whether the last picture lacks art it asked the reading thread for: the picture drawn once it
+    /// is read is another.
+    pub(crate) fn art_pending(&self) -> bool {
+        self.art.as_ref().is_some_and(|art| art.art_pending())
     }
 
     /// What the art did in the last picture drawn with it.
@@ -523,6 +565,8 @@ impl WideRenderer {
         options: WideOptions,
         hd: HdOptions,
     ) -> Result<WideHd, WideError> {
+        let started = std::time::Instant::now();
+        self.compose_time = std::time::Duration::ZERO;
         assert!((1..=crate::MAX_SCALE).contains(&hd.scale), "the scale is 1 to 8");
         check_width(options.width)?;
         check_frame(log)?;
@@ -564,7 +608,38 @@ impl WideRenderer {
         let before: Vec<_> = self.chunks.iter().map(|chunk| chunk.obj_pixels).collect();
         let tallying = art.as_ref().is_some_and(|art| art.tallying());
         self.text_on = self.font.is_some() && (hd.scale >= 2 || tallying);
-        let first = self.compose(rom, field, log, options, scene, art.as_deref_mut(), 0, None);
+        // The layers the translation takes the place of (the intro's, `Translator::quiet_layers`): their letters are
+        // read from the frame as the game draws it (for the translation: `lettered`), then the frame is drawn again
+        // without those layers, and the art (which draws its pictures only where the frame shows no text over them),
+        // the picture and the HD text are of that frame: a cell of another layer the letters hid part of (the
+        // stripes behind the intro, as blank cells with the pack) would take its ground with the letters' shapes cut
+        // out of it
+        let quiet = self
+            .translator
+            .as_ref()
+            .map(Translator::quiet_layers)
+            .filter(|layers| self.text_on && !tallying && layers.contains(&true))
+            .map(|layers| {
+                let mut quiet = log.clone();
+                for entry in &mut quiet.entries {
+                    for (shown, off) in entry.regs.main_bg.iter_mut().zip(layers) {
+                        *shown &= !off;
+                    }
+                }
+                quiet
+            });
+        let mut lettered = None;
+        let first = match &quiet {
+            Some(quiet) => {
+                let _ = self.compose(rom, field, log, options, scene, None, 0, None);
+                lettered = Some(self.text.cells().to_vec());
+                for (chunk, saved) in self.chunks.iter_mut().zip(&before) {
+                    chunk.obj_pixels = *saved;
+                }
+                self.compose(rom, field, quiet, options, scene, art.as_deref_mut(), 0, None)
+            }
+            None => self.compose(rom, field, log, options, scene, art.as_deref_mut(), 0, None),
+        };
         self.text_on = false;
         let wide = match first {
             Ok(wide) => wide,
@@ -605,7 +680,19 @@ impl WideRenderer {
             }
             let hidden = found.iter().fold(0, |all, (pose, _)| all | pose.sprites);
             let rows = crate::art::pose_rows(&found, wide.frame.height);
-            under = self.compose(rom, field, log, options, scene, None, hidden, rows).ok();
+            // (the art records what the layers are under the hidden sprites as this picture is drawn)
+            let saved = art.as_mut().map(|art| {
+                art.active = true;
+                art.begin_under()
+            });
+            let drawn = quiet.as_ref().unwrap_or(log);
+            under = self
+                .compose(rom, field, drawn, options, scene, art.as_deref_mut(), hidden, rows)
+                .ok();
+            if let (Some(art), Some(saved)) = (art.as_mut(), saved) {
+                art.active = false;
+                art.end_under(saved, under.is_some(), hidden, rows);
+            }
             if let (Some(under), Some((first_row, past))) = (under.as_mut(), rows) {
                 // The lines the poses do not reach are the first frame's
                 let width = wide.frame.width;
@@ -618,14 +705,28 @@ impl WideRenderer {
                 chunk.obj_pixels = *saved;
             }
         }
+        // A plane drawn from art with `replace`: the frame again without BG1, the picture under the plane (only then)
+        let under_plane = if !tallying && art.as_ref().is_some_and(|art| art.plane_replaces()) {
+            let saved: Vec<_> = self.chunks.iter().map(|chunk| chunk.obj_pixels).collect();
+            let drawn = crate::art::without_bg1(quiet.as_ref().unwrap_or(log));
+            let frame = self.compose(rom, field, &drawn, options, scene, None, 0, None).ok();
+            for (chunk, saved) in self.chunks.iter_mut().zip(&saved) {
+                chunk.obj_pixels = *saved;
+            }
+            frame
+        } else {
+            None
+        };
         // The picture under the title's text, for each BG layer that holds clear glyphs: the frame
         // drawn again with only that layer off, where the ink of the title hid the picture
         let beneath = if self.font.is_some() && hd.scale >= 2 && !tallying {
-            crate::font::beneath_logs(log, self.text.cells()).map(|blank| {
-                blank.and_then(|blank| {
-                    self.compose(rom, field, &blank, options, scene, None, 0, None).ok()
-                })
-            })
+            crate::font::beneath_logs(quiet.as_ref().unwrap_or(log), self.text.cells()).map(
+                |blank| {
+                    blank.and_then(|blank| {
+                        self.compose(rom, field, &blank, options, scene, None, 0, None).ok()
+                    })
+                },
+            )
         } else {
             [None, None, None, None]
         };
@@ -634,7 +735,7 @@ impl WideRenderer {
         let base = under.as_ref().map_or(&wide.frame, |under| &under.frame);
         // The filter must not see the letters the font redraws: a pixel beside one would keep
         // sub-pixels of its colour as specks around the HD glyph
-        let cleaned = (self.font.is_some() && hd.scale >= 2 && !tallying).then(|| Frame {
+        let mut cleaned = (self.font.is_some() && hd.scale >= 2 && !tallying).then(|| Frame {
             pixels: crate::font::without_letters(
                 &base.pixels,
                 base.width,
@@ -644,6 +745,21 @@ impl WideRenderer {
             sources: Vec::new(),
             ..*base
         });
+        // (the intro's lines the translation draws: their English goes, the marks the font does not know too)
+        if let (Some(cleaned), Some(translator)) = (cleaned.as_mut(), self.translator.as_ref()) {
+            let width = cleaned.width;
+            translator.clean_intro(
+                &mut cleaned.pixels,
+                width,
+                self.text.cells(),
+                beneath_pixels,
+                wide.logical.x,
+            );
+        }
+        if let (Some(art), Some(under_plane)) = (art.as_mut(), under_plane.as_ref()) {
+            let under = picture(&under_plane.frame, &crate::enhanced::Capture::default(), None, hd);
+            art.set_plane_under(under);
+        }
         let mut picture = picture(
             cleaned.as_ref().unwrap_or(base),
             &crate::enhanced::Capture::default(),
@@ -666,30 +782,134 @@ impl WideRenderer {
             };
             art.compose(&mut picture, &wide.frame, &found, logical.x, clip);
         }
+        // (the transformation's lightning: over the frame and the art, in the PPU's picture, under the HD text)
+        if let (Some(overlay), Some(frames), false) =
+            (self.lightning.as_mut(), self.ssj_lightning, tallying)
+        {
+            overlay.draw(&mut picture, frames);
+        }
+        // (the pixels of the text cells a pose variant was drawn on in front of: the text leaves them to the art)
+        let uncovered =
+            art.as_ref().filter(|_| !tallying).and_then(|art| art.uncover(self.text.cells()));
+        let uncovered_lettered = match (art.as_ref().filter(|_| !tallying), lettered.as_deref()) {
+            (Some(art), Some(lettered)) => art.uncover(lettered),
+            _ => None,
+        };
         self.art = art;
-        if let (Some(font), true) = (&self.font, hd.scale >= 2 && !tallying) {
+        let font = self.font.clone();
+        if let (Some(font), true) = (font.as_ref(), hd.scale >= 2 && !tallying) {
+            let text_cells = uncovered.as_deref().unwrap_or(self.text.cells());
+            // (the letters the translation draws in place of, the intro's: not drawn, the picture under them shows)
+            let drawn =
+                self.translator.as_ref().and_then(|translator| translator.font_cells(text_cells));
+            // (the picture before the HD text draws the letters: what the ink of a letter the overlay takes out of
+            // the picture past its window covered around its cell, `translate::paint_spilled`; kept only for a frame
+            // that may have such cells, a page named or shown or cells spilled before)
+            let unlettered = self
+                .translator
+                .as_ref()
+                .filter(|translator| translator.may_spill())
+                .map(|_| picture.rgba.clone());
             font.draw_with(
                 &mut picture.rgba,
                 picture.width as usize,
                 scale,
-                self.text.cells(),
+                drawn.as_deref().unwrap_or(text_cells),
                 &wide.frame.pixels,
                 wide.frame.width,
                 beneath_pixels,
             );
-            if let Some(translator) = self.translator.as_mut() {
+            // (the card tooltip, over the HD text, unless the translation turns it off)
+            crate::tooltip::draw(
+                font,
+                &mut picture.rgba,
+                picture.width as usize,
+                scale,
+                drawn.as_deref().unwrap_or(text_cells),
+                self.translator.as_ref().map(|translator| &*translator.overlay),
+            );
+            if let Some(mut translator) = self.translator.take() {
                 let width = picture.width as usize;
                 let mut target = Target { rgba: &mut picture.rgba, width, scale };
                 let character = |glyph| font.character(glyph);
-                translator.draw(&mut target, self.text.cells(), &wide.frame, logical.x, &character);
+                let cells = uncovered_lettered
+                    .as_deref()
+                    .or(lettered.as_deref())
+                    .unwrap_or(text_cells)
+                    .to_vec();
+                // (the picture under the cells an English line spilled out of its window: the frame drawn again
+                // with the art, without the layers of the letters there, once a frame)
+                let drawn = quiet.as_ref().unwrap_or(log);
+                let clip = if wide.scene == Scene::Bordered {
+                    (logical.x, 0, logical.x + logical.width, wide.frame.height as i32)
+                } else {
+                    (0, 0, wide.frame.width as i32, wide.frame.height as i32)
+                };
+                let height = wide.frame.height;
+                let mut made: Option<BeneathMade> = None;
+                let mut beneath = |spilled: &[(i32, i32)]| {
+                    let mut layers = [false; 4];
+                    for cell in cells.iter().filter(|cell| spilled.contains(&(cell.x, cell.y))) {
+                        layers[usize::from(cell.layer & 3)] = true;
+                    }
+                    if !layers.contains(&true) {
+                        return None;
+                    }
+                    // (only the lines of the spilled cells are drawn again, a line over and under them too)
+                    let top = spilled.iter().map(|&(_, y)| y).min().unwrap_or(0) - 1;
+                    let bottom = spilled.iter().map(|&(_, y)| y).max().unwrap_or(0) + 9;
+                    let rows = (
+                        top.clamp(0, height as i32) as usize,
+                        bottom.clamp(0, height as i32) as usize,
+                    );
+                    if let Some((had, had_rows, under)) = &made
+                        && layers.iter().zip(had).all(|(wanted, had)| !wanted || *had)
+                        && had_rows.0 <= rows.0
+                        && rows.1 <= had_rows.1
+                    {
+                        return under.clone();
+                    }
+                    let under = self
+                        .spilled_beneath(
+                            rom,
+                            field,
+                            drawn,
+                            options,
+                            scene,
+                            hd,
+                            layers,
+                            rows,
+                            &found,
+                            (logical.x, clip),
+                        )
+                        .map(Arc::new);
+                    made = Some((layers, rows, under.clone()));
+                    under
+                };
+                translator.draw(
+                    &mut target,
+                    &cells,
+                    &wide.frame,
+                    log,
+                    logical.x,
+                    &character,
+                    &mut beneath,
+                    unlettered.as_deref(),
+                );
+                self.translator = Some(translator);
             }
         }
+        let mut cost = self.art.as_ref().map_or_else(crate::DrawCost::default, |art| art.cost());
+        cost.draw = self.compose_time;
+        cost.total = started.elapsed();
+        self.cost = cost;
         Ok(WideHd {
             picture,
             scene: wide.scene,
             logical: wide.logical,
             hud: wide.hud,
             stats: wide.stats,
+            art_pending: self.art_pending(),
         })
     }
 
@@ -734,8 +954,77 @@ impl WideRenderer {
         self.compose(rom, field, log, options, scene, None, 0, None)
     }
 
+    /// The picture beneath the cells an English line spilled out of its window ([`Beneath`]): the frame of `log`
+    /// drawn again without the BG `layers` of the letters there, with the art and the poses `found` in the frame (a
+    /// portrait beside the window, as a picture or as the pose of its sprites, where the letters hid it), at the
+    /// scale of `hd`. Only its lines `rows` (first, past the last) are drawn, the lines of the cells: the others are
+    /// black and show no picture. The art's record of the frame and the renderer's sprites are put back as they
+    /// were. `None` without art.
+    #[allow(clippy::too_many_arguments)]
+    fn spilled_beneath(
+        &mut self,
+        rom: Rom<'_>,
+        field: Option<&FieldState>,
+        log: &FrameLog,
+        options: WideOptions,
+        scene: Scene,
+        hd: HdOptions,
+        layers: [bool; 4],
+        rows: (usize, usize),
+        found: &[(crate::art::poses::Pose, u32)],
+        (x_offset, clip): (i32, (i32, i32, i32, i32)),
+    ) -> Option<Beneath> {
+        let mut art = self.art.take()?;
+        let mut quiet = log.clone();
+        for entry in &mut quiet.entries {
+            for (shown, off) in entry.regs.main_bg.iter_mut().zip(layers) {
+                *shown &= !off;
+            }
+        }
+        let before: Vec<_> = self.chunks.iter().map(|chunk| chunk.obj_pixels).collect();
+        art.active = true;
+        let saved = art.begin_under();
+        let drawn = self.compose(rom, field, &quiet, options, scene, Some(&mut art), 0, Some(rows));
+        art.active = false;
+        let under = drawn.ok().map(|wide| {
+            let mut beneath = picture(&wide.frame, &crate::enhanced::Capture::default(), None, hd);
+            art.compose(&mut beneath, &wide.frame, found, x_offset, clip);
+            Beneath {
+                rgba: std::mem::take(&mut beneath.rgba),
+                width: beneath.width as usize,
+                pictures: art.picture_pixels(),
+                frame_width: wide.frame.width,
+            }
+        });
+        art.end_under(saved, false, 0, None);
+        for (chunk, saved) in self.chunks.iter_mut().zip(&before) {
+            chunk.obj_pixels = *saved;
+        }
+        self.art = Some(art);
+        under
+    }
+
+    /// [`WideRenderer::compose_frame`], timed into the picture's cost.
     #[allow(clippy::too_many_arguments)]
     fn compose(
+        &mut self,
+        rom: Rom<'_>,
+        state: Option<&FieldState>,
+        log: &FrameLog,
+        options: WideOptions,
+        scene: Scene,
+        art: Option<&mut ArtState>,
+        hidden: u128,
+        only_rows: Option<(usize, usize)>,
+    ) -> Result<WideFrame, WideError> {
+        let started = std::time::Instant::now();
+        let frame = self.compose_frame(rom, state, log, options, scene, art, hidden, only_rows);
+        self.compose_time += started.elapsed();
+        frame
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    fn compose_frame(
         &mut self,
         rom: Rom<'_>,
         state: Option<&FieldState>,
@@ -932,6 +1221,10 @@ impl WideRenderer {
         Ok(wide)
     }
 }
+
+/// The picture beneath the spilled cells drawn in a frame (`WideRenderer::spilled_beneath`), with the BG layers it
+/// was drawn without and its lines (first, past the last): a later ask of the frame that these hold takes it again.
+type BeneathMade = ([bool; 4], (usize, usize), Option<Arc<Beneath>>);
 
 /// Whether the environment asks for every frame in one piece (`SSD_HD_SERIAL`).
 fn serial_env() -> bool {
@@ -1274,6 +1567,11 @@ pub struct WideRun {
     text: Option<TextRun>,
     /// The last picture [`WideRun::note_hd_shared`] drew, with the inputs it was drawn from.
     shared: Option<Drawn>,
+    /// The frames since the transformation started for the frame noted next ([`WideRun::set_ssj_lightning`]).
+    ssj_lightning: Option<u32>,
+    /// What the Enhanced pictures drawn since [`WideRun::take_cost`] cost, added up, and whether the last was drawn
+    /// in the background.
+    cost: Option<(crate::DrawCost, bool)>,
 }
 
 /// What a frame started from, as the work RAM says it: the main loop's state, the field variables and the pose variants'
@@ -1342,11 +1640,34 @@ fn same_log(a: &FrameLog, b: &FrameLog) -> bool {
 }
 
 /// The pages the message engine named, for the translation: at the end of the last frame noted, and at the start
-/// of the frame noted (or skipped) last.
+/// of the frame noted (or skipped) last; and the last page named at the end of a frame that was skipped, for the
+/// frame drawn next.
 #[derive(Debug, Default)]
 struct TextRun {
     ended: Option<OnScreen>,
     started: Option<OnScreen>,
+    /// A page written at once (the Item help) is named for two frames only: when those frames run in a batch the
+    /// window never draws (a fast-forward, or the frames the clock owes at speed 1), the frame drawn next starts
+    /// from no page, and the overlay would keep the page before it (or none) over the new page's English.
+    missed: Option<OnScreen>,
+}
+
+impl TextRun {
+    /// The frame that just ran is not drawn (yet): the page it started from is kept for the frame drawn next. Not
+    /// the page it ended on: the app draws the last frame of a batch after skipping it ([`WideRun::redraw_hd`]), and
+    /// that frame must not get the page its own end names a frame early.
+    fn skipped(&mut self) {
+        if self.started.is_some() {
+            self.missed.clone_from(&self.started);
+        }
+    }
+
+    /// The page to hand the frame about to be drawn: the one it started from, else the last one a skipped frame
+    /// ended on. Either way nothing is kept for the frames after it.
+    fn hand(&mut self) -> Option<OnScreen> {
+        let missed = self.missed.take();
+        self.started.clone().or(missed)
+    }
 }
 
 impl WideRun {
@@ -1363,7 +1684,23 @@ impl WideRun {
             skipped: None,
             text: None,
             shared: None,
+            ssj_lightning: None,
+            cost: None,
         }
+    }
+
+    /// What the Enhanced pictures drawn since the last call cost, added up, and whether the last one was drawn in the
+    /// background (a picture drawn there is counted when it comes back); `None` when none was drawn.
+    pub fn take_cost(&mut self) -> Option<(crate::DrawCost, bool)> {
+        self.cost.take()
+    }
+
+    /// Counts the picture the renderer just drew, here or in the background (`worker`).
+    fn note_cost(&mut self, worker: bool) {
+        let Some(drawn) = self.renderer.as_ref().map(WideRenderer::draw_cost) else { return };
+        let (cost, on_worker) = self.cost.get_or_insert_default();
+        cost.add(&drawn);
+        *on_worker = worker;
     }
 
     /// Draws the translation of `overlay` over the original's message windows in the Enhanced pictures (`None`:
@@ -1376,7 +1713,8 @@ impl WideRun {
 
     /// Tells the renderer the page the frame about to be drawn started from.
     fn hand_text(&mut self) {
-        let started = self.text.as_ref().and_then(|text| text.started.clone());
+        // The page the frame started from, else the last page a skipped frame ended on (see [`TextRun::missed`])
+        let started = self.text.as_mut().and_then(TextRun::hand);
         if self.text.is_some() {
             self.renderer().set_text_screen(started);
         }
@@ -1405,6 +1743,9 @@ impl WideRun {
         let (renderer, picture) = done.expect("the drawing in the background panicked");
         self.drawing = false;
         self.renderer = Some(renderer);
+        if picture.is_some() {
+            self.note_cost(true);
+        }
         Settled::Done(picture)
     }
 
@@ -1469,7 +1810,12 @@ impl WideRun {
         self.hand_text();
         let renderer = self.renderer();
         renderer.set_conditions(conditions);
-        renderer.render_hd(Rom(&rom), game_mode, field.as_ref(), log, options, hd).ok()
+        let picture =
+            renderer.render_hd(Rom(&rom), game_mode, field.as_ref(), log, options, hd).ok();
+        if picture.is_some() {
+            self.note_cost(false);
+        }
+        picture
     }
 
     /// [`WideRun::note_hd`] that shares its picture (see [`SharedHd`]). When the frame's inputs are those the picture
@@ -1514,9 +1860,12 @@ impl WideRun {
         renderer.set_conditions(conditions);
         let picture =
             renderer.render_hd(Rom(&rom), game_mode, field.as_ref(), log, options, hd).ok()?;
+        // (a picture that lacks art still being read is not the frame's: the next one is drawn again)
+        let pending = renderer.art_pending();
+        self.note_cost(false);
         let shared = SharedHd { serial: next_serial(), picture: Arc::new(picture) };
         let inputs = Inputs { started, text, hd, log: log.clone() };
-        self.shared = Some(Drawn { inputs, shared: shared.clone() });
+        self.shared = (!pending).then(|| Drawn { inputs, shared: shared.clone() });
         Some(shared)
     }
 
@@ -1526,6 +1875,9 @@ impl WideRun {
     /// be drawn with [`WideRun::redraw`] until another one is noted.
     pub fn skip(&mut self, wram: &[u8]) {
         self.skipped = Some(self.advance(wram));
+        if let Some(text) = self.text.as_mut() {
+            text.skipped();
+        }
     }
 
     /// The 16:9 view of the frame last skipped ([`WideRun::skip`]), from its render log `log`:
@@ -1546,7 +1898,12 @@ impl WideRun {
         self.hand_text();
         let renderer = self.renderer();
         renderer.set_conditions(conditions);
-        renderer.render_hd(Rom(&rom), game_mode, field.as_ref(), log?, options, hd).ok()
+        let picture =
+            renderer.render_hd(Rom(&rom), game_mode, field.as_ref(), log?, options, hd).ok();
+        if picture.is_some() {
+            self.note_cost(false);
+        }
+        picture
     }
 
     /// [`WideRun::redraw_hd`] drawn in the background, for a run whose pictures are shown a window
@@ -1617,6 +1974,20 @@ impl WideRun {
         self.renderer().set_art(pack);
     }
 
+    /// The lightning the Enhanced pictures draw over the PPU's picture while Goku's first Super Saiyan transformation
+    /// goes on (`None`: none; see [`crate::lightning`]).
+    pub fn set_lightning(&mut self, lightning: Option<Arc<crate::lightning::Lightning>>) {
+        self.shared = None;
+        self.renderer().set_lightning(lightning);
+    }
+
+    /// The frames since Goku's first Super Saiyan transformation started, while it goes on (`None`: it does not), for
+    /// the frame noted next ([`WideRun::note_hd_shared`], [`WideRun::skip`]): the app's watch says it, the work RAM
+    /// does not. A state loaded or a reset is `None` until the app says otherwise.
+    pub fn set_ssj_lightning(&mut self, frames: Option<u32>) {
+        self.ssj_lightning = frames;
+    }
+
     /// Makes the Enhanced pictures of a scale of 2 or more draw the game's UI text from `font`.
     pub fn set_font(&mut self, font: Option<Arc<Font>>) {
         self.shared = None;
@@ -1640,6 +2011,13 @@ impl WideRun {
     pub fn set_art_backgrounds_only(&mut self, on: bool) {
         self.shared = None;
         self.renderer().set_art_backgrounds_only(on);
+    }
+
+    /// Reads the pack's art on a thread of its own ([`WideRenderer::set_art_async`]). Call it after
+    /// [`WideRun::set_art`].
+    pub fn set_art_async(&mut self, on: bool) {
+        self.shared = None;
+        self.renderer().set_art_async(on);
     }
 
     /// What the art did in the last Enhanced picture.
@@ -1697,7 +2075,7 @@ impl WideRun {
         let current = (
             wram[GAME_MODE],
             FieldState::from_wram(wram).map(|state| state.in_room(rom)),
-            Conditions::of_work_ram(wram),
+            Conditions::of_work_ram(wram).with_ssj_lightning(self.ssj_lightning),
         );
         self.ended.replace(current.clone()).unwrap_or(current)
     }
@@ -2940,6 +3318,149 @@ mod tests {
         log
     }
 
+    /// The intro's screen (`ssd_catalogue::engine::intro_on_screen`): BG1's line 0 on the frame's row 40 (scroll
+    /// 512 - 41), BG2's lines below the frame.
+    fn intro_screen() -> OnScreen {
+        OnScreen {
+            table: ssd_catalogue::engine::INTRO_TABLE,
+            string: 0x0100,
+            page: 0,
+            key: ssd_catalogue::engine::INTRO_KEY.to_owned(),
+            state: 2,
+            stopped: false,
+            line: 0,
+            cell: 0,
+            base: 512 - 41,
+            portrait: false,
+            lines: vec![32; ssd_catalogue::engine::INTRO_LINES],
+            english: Vec::new(),
+            progress: 1.0,
+            names: [None, None, None],
+            numbers: Default::default(),
+        }
+    }
+
+    #[test]
+    fn in_the_intro_the_frame_is_drawn_without_the_layers_the_translation_takes_the_place_of() {
+        // BG2 shows the field's noise, BG1 the intro's text: the title set's `L` (a bar of colour 3, white) at
+        // column 0 of lines 0 and 3, on the frame's rows 40 and 88. With a translation of every line, the Enhanced
+        // picture is the frame's without BG1 and BG2 but for the Chinese from column 6: the HD text and the art see
+        // no letter of the intro (with the pack, the stripes' art and their blank cells left the letters' shapes
+        // under the translation), and the letter gives the lines their ink. A layer one of whose lines the
+        // translation lacks stays; outside the intro the frame is the game's.
+        let mut rom = rom();
+        rom.resize(0x10_0000, 0);
+        let bar = [0x1818_u16; 8];
+        let mut decoded = vec![0_u8; 256 * 16];
+        for (row, word) in bar.iter().enumerate() {
+            decoded[0xEF * 16 + row] = *word as u8;
+            decoded[0xEF * 16 + 8 + row] = (*word >> 8) as u8;
+        }
+        let mut stream = (decoded.len() as u16).to_le_bytes().to_vec();
+        for group in decoded.chunks(8) {
+            stream.push(0xFF);
+            stream.extend_from_slice(group);
+        }
+        rom[0x5F39..0x5F39 + stream.len()].copy_from_slice(&stream);
+        let state = state(2, CAMERA, &[]);
+        let mut log = field_log(&rom, &state, &[]);
+        log.vram[0x4000..0x4008].fill(0);
+        log.vram[0x4008..0x4010].copy_from_slice(&bar);
+        log.vram[0x7000..0x7400].fill(0);
+        log.vram[0x7000] = 1 | 0x2000;
+        log.vram[0x7000 + 6 * 32] = 1 | 0x2000;
+        log.cgram_start[3] = 0x7FFF;
+        for entry in &mut log.entries {
+            entry.regs.bg_mode = 0;
+            entry.regs.main_bg[0] = true;
+            entry.regs.bg_map_base[0] = 0x7000;
+            entry.regs.bg_char_base[0] = 0x4000;
+            entry.regs.bg_v_scroll[0] = 512 - 41;
+        }
+        let without = |log: &FrameLog, layers: [bool; 4]| {
+            let mut quiet = log.clone();
+            for entry in &mut quiet.entries {
+                for (shown, off) in entry.regs.main_bg.iter_mut().zip(layers) {
+                    *shown &= !off;
+                }
+            }
+            quiet
+        };
+        let font = Arc::new(Font::standard(&rom).unwrap());
+        let face = Arc::new(
+            crate::translate::ChineseFace::new(crate::font::SHARE_TECH_MONO.to_vec()).unwrap(),
+        );
+        let overlay = |lacking: Option<usize>| {
+            let rows = (0..ssd_catalogue::engine::INTRO_LINES)
+                .filter(|&line| Some(line) != lacking)
+                .fold(String::new(), |rows, line| {
+                    rows + &ssd_catalogue::engine::intro_key(line) + "\tA\n"
+                });
+            let table = ssd_catalogue::translation::Translation::parse(&format!("key\tzh\n{rows}"))
+                .unwrap();
+            Arc::new(Overlay::new(Arc::new(table), Arc::clone(&face)))
+        };
+        let options = WideOptions { width: 372, hud: HudPlacement::Window };
+        let hd = HdOptions { scale: 2, look: crate::Look::Crisp };
+        let draw = |log: &FrameLog, overlay: Option<Arc<Overlay>>, screen: Option<OnScreen>| {
+            let mut renderer = WideRenderer::new();
+            renderer.set_font(Some(Arc::clone(&font)));
+            renderer.set_overlay(overlay);
+            renderer.set_text_screen(screen);
+            renderer.render_hd(Rom(&rom), 0x87, None, log, options, hd).unwrap().picture
+        };
+        // The column of the picture (2x) the Chinese takes, from column 6 (each line on the screen is drawn: the
+        // letter on line 0 gives the ink, the scroll the others' rows)
+        let x0 = 2 * (58 + 48);
+        let chinese = |x: usize, _y: usize| (x0..x0 + 2 * 24).contains(&x);
+        let differ = |a: &crate::HdFrame, b: &crate::HdFrame, inside: bool| {
+            let w = a.width as usize;
+            (0..a.rgba.len() / 4)
+                .filter(|&at| chinese(at % w, at / w) == inside)
+                .any(|at| a.rgba[at * 4..at * 4 + 3] != b.rgba[at * 4..at * 4 + 3])
+        };
+        let game = draw(&log, None, None);
+        let quiet = draw(&without(&log, [true, true, false, false]), None, None);
+        // The game's frame: the letter, drawn by the HD font at column 0 (outside the Chinese)
+        assert!(differ(&game, &quiet, false), "the letter shows");
+        let translated = draw(&log, Some(overlay(None)), Some(intro_screen()));
+        assert!(
+            !differ(&translated, &quiet, false),
+            "nothing but the Chinese differs from the frame without the text"
+        );
+        assert!(differ(&translated, &quiet, true), "line 0's Chinese, in the letter's ink");
+        // Line 3 lacking: BG1 is drawn, line 3's letter shows; line 0's is taken out of the frame (its cells take
+        // the picture without BG1) and its Chinese drawn
+        let lacking = draw(&log, Some(overlay(Some(3))), Some(intro_screen()));
+        let rows = |picture: &crate::HdFrame, lines: std::ops::Range<usize>| {
+            let w = picture.width as usize;
+            lines
+                .flat_map(move |y| (0..x0).map(move |x| (y * w + x) * 4))
+                .map(|at| picture.rgba[at..at + 3].to_vec())
+                .collect::<Vec<_>>()
+        };
+        assert_ne!(rows(&lacking, 176..192), rows(&quiet, 176..192), "line 3's English stays");
+        assert_eq!(rows(&lacking, 80..96), rows(&quiet, 80..96), "line 0's goes");
+        assert_eq!(draw(&log, Some(overlay(None)), None), game, "not the intro");
+        // The HD text of the frame is read from the frame without BG1 and BG2: no cell of theirs (a cell of another
+        // layer under a letter would be one with the letter's shape cut out of it, painted with its ground)
+        let mut renderer = WideRenderer::new();
+        renderer.set_font(Some(Arc::clone(&font)));
+        renderer.set_overlay(Some(overlay(None)));
+        renderer.set_text_screen(Some(intro_screen()));
+        renderer.render_hd(Rom(&rom), 0x87, None, &log, options, hd).unwrap();
+        assert!(
+            !renderer.text.cells().iter().any(|cell| cell.layer < 2),
+            "the text of the frame without BG1, BG2"
+        );
+        renderer.set_text_screen(None);
+        renderer.render_hd(Rom(&rom), 0x87, None, &log, options, hd).unwrap();
+        assert!(
+            renderer.text.cells().iter().any(|cell| cell.layer == 0 && cell.bold),
+            "outside the intro, the `L`"
+        );
+    }
+
     #[test]
     fn a_picture_keeps_its_window_and_is_black_beside_it() {
         let rom = rom();
@@ -3089,6 +3610,87 @@ mod tests {
         let view = run.note(&wram, Some(&log)).unwrap();
         assert_eq!((view.frame.width, view.scene), (WIDTH_16_9, Scene::Bordered));
     }
+    #[test]
+    fn the_run_draws_the_lightning_it_is_told_and_gives_no_kept_picture_for_another_count() {
+        let rom = rom();
+        let wram = vec![0_u8; 0x20000];
+        let hd = HdOptions { scale: 4, look: crate::Look::Crisp };
+        let log = plane(224);
+        let dir = tempfile::tempdir().unwrap();
+        // Two pictures (made here, a block of one colour each on black), shown in turn
+        for (n, colour) in [(1, [0_u8, 0, 200]), (2, [0, 200, 0])] {
+            let mut rgba = Vec::new();
+            for y in 0..896 {
+                for x in 0..1024 {
+                    rgba.extend_from_slice(&if x < 512 && y < 448 {
+                        [colour[0], colour[1], colour[2], 255]
+                    } else {
+                        [0, 0, 0, 0]
+                    });
+                }
+            }
+            crate::png::write_rgba(&dir.path().join(format!("frame-{n}.png")), 1024, 896, &rgba)
+                .unwrap();
+        }
+        let mut run = WideRun::new(&rom);
+        run.set_lightning(crate::lightning::Lightning::load(dir.path()).map(Arc::new));
+        // The frame noted starts from the end of the one before it: the lightning comes a frame after the app says it
+        let picture = |run: &mut WideRun, frames: Option<u32>| {
+            run.set_ssj_lightning(frames);
+            run.note_hd_shared(&wram, Some(&log), hd).unwrap().picture.picture.rgba.clone()
+        };
+        let plain = picture(&mut run, None);
+        assert!(picture(&mut run, Some(0)) == plain, "said for the frame drawn next");
+        let first = picture(&mut run, Some(4));
+        assert!(first != plain, "the first picture is drawn over the frame");
+        let second = picture(&mut run, Some(8));
+        assert!(second != first, "the same log and work RAM, another picture of the lightning");
+        assert!(picture(&mut run, None) != plain, "the frame that started in the transformation");
+        assert!(
+            picture(&mut run, None) == plain,
+            "the transformation over (or a state loaded): none at once"
+        );
+    }
+
+    #[test]
+    fn a_picture_that_lacks_art_being_read_is_not_given_again_for_the_same_frame() {
+        let rom = rom();
+        let wram = vec![0_u8; 0x20000];
+        let hd = HdOptions { scale: 4, look: crate::Look::Crisp };
+        let dir = tempfile::tempdir().unwrap();
+        let log = crate::art::tests::plane_frame();
+        let pack = crate::art::tests::plane_pack(dir.path(), &log.vram);
+        let picture = |run: &mut WideRun| {
+            let shared = run.note_hd_shared(&wram, Some(&log), hd).unwrap();
+            let pending = shared.picture.art_pending;
+            (shared.serial, shared.picture.picture.rgba.clone(), pending)
+        };
+        let original = picture(&mut WideRun::new(&rom)).1;
+        let mut synchronous = WideRun::new(&rom);
+        synchronous.set_art(Some(Arc::clone(&pack)));
+        let with_art = picture(&mut synchronous).1;
+        assert!(with_art != original, "the plane is drawn from its art");
+        let mut run = WideRun::new(&rom);
+        run.set_art(Some(pack));
+        run.set_art_async(true);
+        let (serial, first, pending) = picture(&mut run);
+        assert!(first == original, "the first picture is the original's");
+        assert!(pending, "and it says it lacks art");
+        // The same frame again, until the art is read: never the first picture given back
+        let started = std::time::Instant::now();
+        let mut last = (serial, first, pending);
+        while last.1 != with_art && started.elapsed() < std::time::Duration::from_secs(30) {
+            std::thread::sleep(std::time::Duration::from_millis(5));
+            let next = picture(&mut run);
+            assert_ne!(next.0, last.0, "a picture that lacked art is drawn again");
+            last = next;
+        }
+        assert!(last.1 == with_art, "the picture once the art is read is the one with it");
+        assert!(!last.2, "and it lacks none");
+        // Drawn with all its art, the picture is given back for the same frame
+        assert_eq!(picture(&mut run).0, last.0);
+    }
+
     #[test]
     fn the_worker_draws_in_the_background_and_gives_each_picture_back_once_in_order() {
         let rom = rom();
@@ -3287,5 +3889,111 @@ mod tests {
         let mut other = log.clone();
         other.complete = false;
         assert!(!same_log(&log, &other), "complete");
+    }
+
+    fn help_page(key: &str) -> OnScreen {
+        OnScreen {
+            table: 0,
+            string: 25,
+            page: 0,
+            key: key.to_owned(),
+            state: 0,
+            stopped: false,
+            line: 0,
+            cell: 0,
+            base: 0,
+            portrait: false,
+            lines: vec![12, 13, 13],
+            english: Vec::new(),
+            progress: 1.0,
+            names: [None, None, None],
+            numbers: Default::default(),
+        }
+    }
+
+    /// A frame ran and ended naming `now` ([`WideRun::advance`]'s text part).
+    fn ran(text: &mut TextRun, now: Option<&str>) {
+        text.started = std::mem::replace(&mut text.ended, now.map(help_page));
+    }
+
+    fn key(page: Option<OnScreen>) -> Option<String> {
+        page.map(|page| page.key)
+    }
+
+    #[test]
+    fn a_page_named_only_in_skipped_frames_is_handed_to_the_frame_drawn_next() {
+        // The Item help is named at the end of two frames; they and the one after run in a batch the window does not
+        // draw (the harness's way: skip, skip, skip, then note the next frame)
+        let mut text = TextRun::default();
+        for now in [Some("help:25"), Some("help:25"), None] {
+            ran(&mut text, now);
+            text.skipped();
+        }
+        // The frame drawn next starts from no page: it gets the help all the same
+        ran(&mut text, None);
+        assert_eq!(key(text.hand()), Some("help:25".to_owned()));
+        // and only that frame: the next one starts from what the engine names then
+        ran(&mut text, None);
+        assert_eq!(text.hand(), None);
+    }
+
+    #[test]
+    fn the_app_drawing_each_frame_after_skipping_it_gets_a_new_page_when_it_starts_from_it() {
+        // The app at speed 1, not behind: every frame is skipped (its state followed), then drawn (redraw_hd)
+        let mut text = TextRun::default();
+        ran(&mut text, Some("help:25"));
+        text.skipped();
+        assert_eq!(
+            text.hand(),
+            None,
+            "the frame that names the page at its end does not show it yet"
+        );
+        ran(&mut text, Some("help:25"));
+        text.skipped();
+        assert_eq!(
+            key(text.hand()),
+            Some("help:25".to_owned()),
+            "the frame after it starts from it"
+        );
+    }
+
+    #[test]
+    fn a_page_named_once_at_the_end_of_a_drawn_frame_reaches_the_batch_after_it() {
+        // A frame starts from A and ends on B, named for that one frame (written at once); the next two frames run in
+        // a batch the window does not draw, and the app draws the last of them
+        let mut text = TextRun::default();
+        ran(&mut text, Some("help:2"));
+        ran(&mut text, Some("help:25"));
+        text.skipped();
+        assert_eq!(key(text.hand()), Some("help:2".to_owned()), "the frame drawn starts from A");
+        ran(&mut text, None);
+        text.skipped();
+        ran(&mut text, None);
+        text.skipped();
+        assert_eq!(
+            key(text.hand()),
+            Some("help:25".to_owned()),
+            "B, which only a skipped frame started from"
+        );
+    }
+
+    #[test]
+    fn the_page_a_frame_started_from_comes_before_a_missed_one() {
+        let mut text = TextRun::default();
+        ran(&mut text, Some("help:25"));
+        ran(&mut text, Some("help:2"));
+        text.skipped();
+        ran(&mut text, None);
+        text.started = Some(help_page("help:2"));
+        assert_eq!(key(text.hand()), Some("help:2".to_owned()));
+        assert_eq!(text.missed, None, "nothing is kept past the frame drawn");
+    }
+
+    #[test]
+    fn frames_that_are_drawn_keep_nothing_missed() {
+        let mut text = TextRun::default();
+        ran(&mut text, Some("help:25"));
+        // A drawn frame never calls skipped(): with no page at its start it gets none
+        assert_eq!(text.hand(), None);
     }
 }

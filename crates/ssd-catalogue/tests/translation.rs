@@ -43,3 +43,60 @@ fn the_slots_are_filled_and_the_engines_codes_left_out() {
 fn a_missing_file_is_an_error_not_a_panic() {
     assert!(Translation::read(Path::new("no/such/zh-hk.tsv")).is_err());
 }
+
+/// The shipped zh-tw pack (its source is checked by the generator's lints, which
+/// read the English ROM, so this only pins what they settled).
+fn zh_tw() -> Translation {
+    Translation::parse(include_str!("../../../translations/zh-tw/zh-tw.tsv"))
+        .expect("the pack reads")
+}
+
+#[test]
+fn the_zh_tw_pack_keeps_lakeys_two_row_windows_to_two_rows() {
+    // object 27's sneeze and cheer are drawn in a window of two rows, as their English pages are
+    let table = zh_tw();
+    for key in ["str7:0x01", "str7:0x02"] {
+        let rows =
+            table.text(key).unwrap_or_else(|| panic!("{key} has no text")).split("\\n").count();
+        assert!(rows <= 2, "{key} has {rows} rows in a window of two");
+    }
+}
+
+#[test]
+fn the_zh_tw_pack_writes_out_the_names_its_english_pages_have_no_slot_for() {
+    let table = zh_tw();
+    // pages whose English page has no name slot at all: the person is written in
+    for key in [
+        "battle:162",
+        "battle:165",
+        "battle:247",
+        "str2:0x09E",
+        "str2:0x165",
+        "str2:0x166",
+        "str2:0x16B",
+        "str3:0x8A",
+        "str3:0x8D",
+        "str3:0x8E",
+        "str3:0x8F",
+    ] {
+        let text = table.text(key).unwrap_or_else(|| panic!("{key} has no text"));
+        assert!(!text.contains("{name:"), "{key} still has a name slot: {text}");
+    }
+    // pages whose English page has {name:1} only: the second slot is written out
+    {
+        let key = "battle:286";
+        let text = table.text(key).unwrap_or_else(|| panic!("{key} has no text"));
+        assert!(text.contains("{name:1}") && !text.contains("{name:2}"), "{key}: {text}");
+    }
+    // pages whose slot changes with the scene (checked against the Japanese ROM): the
+    // slot is kept, since the game fills it the same way in both versions
+    for key in ["str2:0x06C", "str2:0x06D", "str2:0x06E"] {
+        let text = table.text(key).unwrap_or_else(|| panic!("{key} has no text"));
+        assert!(text.contains("{name:1}"), "{key}: {text}");
+    }
+    let text = table.text("str3:0x67").expect("str3:0x67 has no text");
+    assert!(text.contains("{name:1}") && text.contains("{name:2}"), "str3:0x67: {text}");
+    // the slot of str2:0x165 and str2:0x166 holds `我們` of the fifth name table, which the port does not read
+    assert!(table.text("str2:0x165").unwrap().contains("請跟我們"));
+    assert!(table.text("str2:0x166").unwrap().contains("跟我們"));
+}

@@ -149,6 +149,12 @@ pub fn translated(labels: &Labels, table: &Translation) -> Labels {
             object.help = help.lines().map(str::to_owned).collect();
         }
     }
+    // The Status screen's techniques are the attacks, by their command ids
+    for (index, command) in out.status.commands.iter_mut().enumerate() {
+        if let Some(name) = words(format!("attack:{index}")) {
+            command.name = name.replace('\n', "");
+        }
+    }
     out
 }
 
@@ -225,6 +231,33 @@ mod tests {
         assert_eq!(shown.objects[0].name, "石頭");
         assert_eq!(shown.objects[0].help, ["第一行", "第二行"]);
         assert_eq!((shown.objects[0].price, shown.objects[0].battle), (Some(9), true));
+    }
+
+    #[test]
+    fn a_translation_names_the_status_techniques_by_their_attacks() {
+        let command = |name: &str, ki_cost| CommandLabel { name: name.into(), ki_cost };
+        let labels = Labels {
+            status: StatusLabels {
+                commands: vec![
+                    command("Attack", 0),
+                    command("Ki Blast", 2),
+                    command("Masenko", 15),
+                ],
+                techniques: vec![vec![1, 2]],
+                levels: Vec::new(),
+                level_cap: None,
+            },
+            characters: Vec::new(),
+            objects: Vec::new(),
+            growth: Vec::new(),
+        };
+        let table = Translation::parse("key\tzh\nattack:1\t衝擊波\nattack:2\t魔閃\\n光\n").unwrap();
+        let shown = translated(&labels, &table);
+        let names: Vec<&str> = shown.status.commands.iter().map(|c| c.name.as_str()).collect();
+        assert_eq!(names, ["Attack", "衝擊波", "魔閃光"], "not translated: English stays");
+        let costs: Vec<u8> = shown.status.commands.iter().map(|c| c.ki_cost).collect();
+        assert_eq!(costs, [0, 2, 15]);
+        assert_eq!(shown.status.techniques, labels.status.techniques);
     }
 
     #[test]

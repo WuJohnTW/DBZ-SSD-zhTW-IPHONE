@@ -144,6 +144,9 @@ const TILE_CHARS: &[(u8, char)] = &[
     (0x7C, '.'),
     (0x7E, '"'),
     (0x7F, '"'),
+    // The slash of HP and KI (`80/80`) on the Status page, the party windows and the save screens: the English patch
+    // redrew the original's `／` (tile `$8F`) with a stray pixel at its top left, and no English text uses the tile
+    (0x8F, '/'),
 ];
 
 /// The title set's white glyphs: the tile of `00:DF39` (its index in the decoded stream) and what it
@@ -669,7 +672,6 @@ impl Font {
                 }
             }
         }
-        crate::tooltip::draw(self, rgba, width, scale, cells);
     }
 }
 
@@ -1077,6 +1079,18 @@ mod tests {
         vram[19] = 0x1819;
         assert_eq!(font.glyph_at(&vram, 16), None, "one word different");
         assert_eq!(font.glyph_at(&vram, 60000), None, "outside VRAM");
+    }
+
+    #[test]
+    // `% 250 + 1` spells out the test image's code of a tile (see `rom`), though for `$8F` the `% 250` changes nothing
+    #[allow(clippy::identity_op)]
+    fn the_tile_of_the_hp_slash_is_drawn_as_a_slash() {
+        let font = font();
+        // The test image's tile `$8F`: one word holding its code (see `rom`)
+        let mut vram = vec![0_u16; 8];
+        vram[7] = u16::from((0x8F_u8 % 250) + 1) << 8;
+        let slash = font.glyph_at(&vram, 0).expect("the tile of $8F is a glyph").glyph;
+        assert_eq!(shape(&font, slash), ('/', 1));
     }
 
     #[test]

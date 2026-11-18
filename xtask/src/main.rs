@@ -231,6 +231,42 @@ fn cheat_spike(dir: &str) -> anyhow::Result<ExitCode> {
     Ok(ExitCode::SUCCESS)
 }
 
+/// Writes `key-<key>.pose` beside each `key-<key>.txt` of `dir` (`art-override/super-vegeta`): what the pose of each keyed
+/// picture is without the original sprite's pixels (`ssd_hd::pack::keyed_pose_text`), the file a release ships in their
+/// place. A file the game would refuse stops the run before anything is written. Rerun: the same files.
+fn keyed_poses(dir: &Path) -> anyhow::Result<ExitCode> {
+    let mut poses = Vec::new();
+    let mut entries: Vec<PathBuf> = std::fs::read_dir(dir)
+        .with_context(|| format!("reading {}", dir.display()))?
+        .map(|entry| entry.map(|entry| entry.path()))
+        .collect::<Result<_, _>>()?;
+    entries.sort();
+    for path in entries {
+        let name = path.file_name().unwrap_or_default().to_string_lossy().into_owned();
+        let Some(stem) = name.strip_suffix(".txt") else { continue };
+        let Some(digits) = stem.strip_prefix(ssd_hd::pack::KEYED_PICTURE) else { continue };
+        if digits.len() != 16 || !digits.bytes().all(|b| b.is_ascii_hexdigit()) {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path)
+            .with_context(|| format!("reading {}", path.display()))?;
+        let pose = ssd_hd::pack::keyed_pose_text(&text)
+            .map_err(|error| anyhow::anyhow!("{}: {error}", path.display()))?;
+        anyhow::ensure!(
+            pose.starts_with(&format!("key={}", digits.to_ascii_lowercase())),
+            "{}: its pixels have another key ({})",
+            path.display(),
+            pose.trim()
+        );
+        poses.push((path.with_extension(ssd_hd::pack::KEYED_POSE_EXTENSION), pose));
+    }
+    for (path, pose) in &poses {
+        std::fs::write(path, pose).with_context(|| format!("writing {}", path.display()))?;
+    }
+    println!("keyed-poses: {} written in {}", poses.len(), dir.display());
+    Ok(ExitCode::SUCCESS)
+}
+
 /// Plays the HD menus headless, scenario by scenario (see [`menu_test`]).
 fn menu_test(args: &[&str]) -> anyhow::Result<ExitCode> {
     let args = match menu_test::parse_args(args) {
@@ -1316,6 +1352,7 @@ fn usage() -> ExitCode {
         "       cargo run --release -p xtask -- menu-test cheats [--save <file.sav>] [--replays <dir>] [name...]"
     );
     eprintln!("       cargo run --release -p xtask -- cheat-spike <dir>");
+    eprintln!("       cargo run --release -p xtask -- keyed-poses <art-override/super-vegeta dir>");
     eprintln!("       cargo run --release -p xtask -- recompile");
     eprintln!("       cargo run --release -p xtask -- framecheck <replay>");
     eprintln!(
@@ -1470,6 +1507,7 @@ fn main() -> anyhow::Result<ExitCode> {
         ["rebase-replays", rest @ ..] => rebase_replays(rest),
         ["menu-test", rest @ ..] => menu_test(rest),
         ["cheat-spike", dir] => cheat_spike(dir),
+        ["keyed-poses", dir] => keyed_poses(Path::new(dir)),
         ["coverage", rest @ ..] => coverage(rest),
         ["repro", rest @ ..] => repro(rest),
         ["export-mlb", rest @ ..] => export_mlb(rest),

@@ -20,7 +20,11 @@
 //! touch menu|options|edit|hidden|play|minimal|full|stick|dpad|gamepad|nogamepad|select <group>|press <buttons>|release
 //! touch pad up|down|left|right|a|b
 //! touch hold select+start <ms>
+//! quit esc|left|right|enter
 //! ```
+//!
+//! A `quit` line is a key of Esc's question (`crate::quit_confirm`): `esc` opens it (and closes it again), the others
+//! move its cursor and answer.
 //!
 //! The `menu` lines are for `--mode enhanced`, and play the HD menu as a player does: `menu open`
 //! presses A on the field, `menu key` gives the HD a key (`a` confirms, `b` cancels), and the
@@ -59,6 +63,8 @@ pub enum Command {
     Menu(MenuCommand),
     /// A line of the touch controls (`--touch-ui`): see [`crate::touch::Touch::script`].
     Touch(String),
+    /// A key of Esc's question: `None` is Esc itself.
+    Quit(Option<crate::quit_confirm::Press>),
 }
 
 /// What a `menu` line does.
@@ -198,9 +204,14 @@ fn parse_command(text: &str) -> Result<Command, String> {
         ("menu", _) => Err(MENU_USAGE.to_owned()),
         ("touch", rest) if !rest.is_empty() => Ok(Command::Touch(rest.join(" "))),
         ("touch", _) => Err("touch takes a word, such as menu, edit or press up,a".to_owned()),
+        ("quit", ["esc"]) => Ok(Command::Quit(None)),
+        ("quit", ["left"]) => Ok(Command::Quit(Some(crate::quit_confirm::Press::Left))),
+        ("quit", ["right"]) => Ok(Command::Quit(Some(crate::quit_confirm::Press::Right))),
+        ("quit", ["enter"]) => Ok(Command::Quit(Some(crate::quit_confirm::Press::Confirm))),
+        ("quit", _) => Err("quit takes one of esc, left, right, enter".to_owned()),
         _ => Err(format!(
             "unknown action `{action}`: expected panel, tab, pause, step, frames, select, \
-             breakpoint, mode, menu or touch"
+             breakpoint, mode, menu, touch or quit"
         )),
     }
 }
@@ -325,6 +336,16 @@ mod tests {
             Command::Menu(MenuCommand::Press(Capture::Code(12)))
         );
         assert!(error("menu press nonsense").message.contains("unknown key or button"));
+    }
+
+    #[test]
+    fn a_quit_line_is_a_key_of_the_question() {
+        use crate::quit_confirm::Press;
+        assert_eq!(command("quit esc"), Command::Quit(None));
+        assert_eq!(command("quit right"), Command::Quit(Some(Press::Right)));
+        assert_eq!(command("quit left"), Command::Quit(Some(Press::Left)));
+        assert_eq!(command("quit enter"), Command::Quit(Some(Press::Confirm)));
+        assert!(error("quit now").message.contains("quit takes"));
     }
 
     #[test]

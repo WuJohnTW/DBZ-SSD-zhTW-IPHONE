@@ -95,6 +95,11 @@ pub const VETTED: &[(&str, u32)] = &[
     ("assets/fonts/DotGothic16-Regular.ttf", 0x3225_1781),
     // Share Tech Mono (SIL OFL 1.1, Carrois Type Design): Google Fonts' copy; the HD text of the game.
     ("assets/fonts/ShareTechMono-Regular.ttf", 0x1D7A_0035),
+    // LXGW WenKai TC 1.530 Regular (SIL OFL 1.1): the font of the zh-tw language pack, in place of Noto Sans
+    // TC. Scanned in full before it was listed: no 16-byte run of it is in the ROM (publish-check clean without it).
+    // 為 (U+70BA) drawn with the glyph `u70BA` of LXGW WenKai 1.530 Regular (OFL), appended as `u70BA.tw` (1.530
+    // TC draws 為 and 爲 with the one glyph of 爲); the 16-byte runs of the ROM in it are those of 0xFA34_695B, no more.
+    ("translations/zh-tw/fonts/LXGWWenKaiTC-Regular.ttf", 0xE1FE_C227),
 ];
 
 /// Whether `data` is the vetted content of `path` ([`VETTED`]).

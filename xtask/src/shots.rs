@@ -68,12 +68,24 @@ pub struct Args {
     /// Host writes to work RAM, `FRAME:ADDR=HEX` (repeatable): the bytes are written before frame FRAME runs, as the
     /// Enhanced app's host writes are (`docs/mods/art.md`, the Kaioken's pose variant proof).
     pub wram: Vec<String>,
+    /// With `--hd-scale`: a translation (a language pack's `<code>.tsv`) and its font (`--translation-font`), drawn
+    /// over the message windows as the Enhanced app draws the language it runs in (`ssd-app`'s `lang::overlay`).
+    pub translation: Option<PathBuf>,
+    pub translation_font: Option<PathBuf>,
+    /// Run with the Enhanced app's hook table (`ssd_game::cheats` with the story fixes, then the mods' redirectors),
+    /// as the game installs it: the cursors and marks on their right rows, the cheats' hooks. Without it shots runs
+    /// the bare machine (only `--mods` installs the redirectors).
+    pub app_hooks: bool,
+    /// Write each shot's picture to this file (a FIFO, typically) instead of, or besides, a PNG: a line
+    /// `RAW <frame> <w> <h>` and then `w*h*4` RGBA bytes, so a checker reads every frame without the frames touching
+    /// the disk (`tools/regress45`).
+    pub raw_out: Option<PathBuf>,
 }
 
 /// Parses `<script> [--frames a,b,c] [--every N] [--upto N] [--out dir] [--sheet COLS]
 /// [--no-png] [--peek a,b] [--watch a,b] [--watch-from N] [--state-in f] [--state-out f]
 /// [--wram-out f] [--sram f] [--sram-out f] [--hd-scale N] [--enhanced-look crisp|smooth|pixel] [--pack DIR]
-/// [--gaps DIR] [--mods PACK]...`.
+/// [--gaps DIR] [--mods PACK]... [--translation TSV --translation-font FONT] [--app-hooks] [--raw-out FILE]`.
 ///
 /// # Errors
 ///
@@ -103,6 +115,10 @@ pub fn parse_args(args: &[&str]) -> Result<Args, String> {
         box_map: None,
         wram: Vec::new(),
         mods: Vec::new(),
+        translation: None,
+        translation_font: None,
+        app_hooks: false,
+        raw_out: None,
     };
     let number = |flag: &str, v: Option<&&str>| -> Result<u64, String> {
         let v = v.ok_or(format!("{flag} needs a value"))?;
@@ -177,6 +193,18 @@ pub fn parse_args(args: &[&str]) -> Result<Args, String> {
             "--mods" => {
                 parsed.mods.push(PathBuf::from(it.next().ok_or("--mods needs a pack")?));
             }
+            "--translation" => {
+                parsed.translation =
+                    Some(PathBuf::from(it.next().ok_or("--translation needs a .tsv file")?));
+            }
+            "--translation-font" => {
+                parsed.translation_font =
+                    Some(PathBuf::from(it.next().ok_or("--translation-font needs a font file")?));
+            }
+            "--app-hooks" => parsed.app_hooks = true,
+            "--raw-out" => {
+                parsed.raw_out = Some(PathBuf::from(it.next().ok_or("--raw-out needs a file")?));
+            }
             "--wram" => {
                 parsed.wram.push(it.next().ok_or("--wram needs FRAME:ADDR=HEX")?.to_string());
             }
@@ -211,7 +239,36 @@ pub fn parse_args(args: &[&str]) -> Result<Args, String> {
         return Err("needs --frames or --every (or --state-out, --wram-out, --sram-out, --watch)"
             .to_owned());
     }
+    if parsed.translation.is_some() != parsed.translation_font.is_some() {
+        return Err("--translation and --translation-font go together".to_owned());
+    }
+    if parsed.translation.is_some() && parsed.hd_scale.is_none() {
+        return Err("--translation draws over the Enhanced picture: it needs --hd-scale".to_owned());
+    }
     Ok(parsed)
+}
+
+/// The hook table of `--app-hooks`: `existing` (the redirectors of `--mods`, if any) with the Enhanced app's hooks
+/// added as the game adds them, the cheats and the story fixes first, then the mods' redirectors.
+fn app_hook_table(existing: Option<&ssd_oracle::HookTable>) -> ssd_oracle::HookTable {
+    let mut table = existing.cloned().unwrap_or_else(ssd_oracle::HookTable::new);
+    ssd_game::cheats::install(&mut table);
+    ssd_game::mods::install(&mut table);
+    table
+}
+
+/// One shot on `--raw-out`: `RAW <frame> <w> <h>` and a newline, then the `w*h*4` RGBA bytes, flushed (a reader on a
+/// FIFO takes each frame as it comes).
+fn write_raw(
+    out: &mut impl std::io::Write,
+    frame: u64,
+    w: u32,
+    h: u32,
+    rgba: &[u8],
+) -> std::io::Result<()> {
+    out.write_all(format!("RAW {frame} {w} {h}\n").as_bytes())?;
+    out.write_all(rgba)?;
+    out.flush()
 }
 
 /// The input of a script: its joypad per frame and its length.
@@ -400,6 +457,29 @@ fn rgba(machine: &Machine) -> (u32, u32, Vec<u8>) {
 /// # Errors
 ///
 /// A pack that cannot be read, or a set the checks refuse (each refusal is printed with the error).
+/// The overlay of `--translation` and `--translation-font`, made as the app makes the one of the language it runs
+/// in (`ssd-app`'s `lang::overlay`): the table, the font, and the names the game writes into its tile maps read
+/// from the canonical ROM `rom`. `None` without them.
+fn translation_overlay(
+    args: &Args,
+    rom: &[u8],
+) -> anyhow::Result<Option<Arc<ssd_hd::translate::Overlay>>> {
+    let (Some(table), Some(font)) = (&args.translation, &args.translation_font) else {
+        return Ok(None);
+    };
+    let table = Arc::new(
+        ssd_catalogue::translation::Translation::read(table)
+            .with_context(|| format!("reading {}", table.display()))?,
+    );
+    let bytes = std::fs::read(font).with_context(|| format!("reading {}", font.display()))?;
+    let face = Arc::new(
+        ssd_hd::translate::ChineseFace::new(bytes)
+            .with_context(|| format!("{} is not a font", font.display()))?,
+    );
+    let names = ssd_catalogue::engine::screen_names(rom, &table);
+    Ok(Some(Arc::new(ssd_hd::translate::Overlay::new(table, face).with_names(names))))
+}
+
 fn pack_image(
     rom: &[u8],
     paths: &[PathBuf],
@@ -578,6 +658,26 @@ pub fn run(
         ssd_game::mods::install(&mut table);
         machine.set_hook_table(Some(table));
     }
+    // `--app-hooks`: the Enhanced app's hook table (cheats and the story fixes, then the mods' redirectors), as the
+    // game installs them
+    if args.app_hooks {
+        let table = app_hook_table(machine.hook_table());
+        machine.set_hook_table(Some(table));
+    }
+    // `--raw-out`: each shot's picture as `RAW <frame> <w> <h>\n` and w*h*4 RGBA bytes (a FIFO works: the frames never
+    // touch the disk; truncating is ignored for a FIFO)
+    let mut raw_out: Option<std::io::BufWriter<std::fs::File>> = match &args.raw_out {
+        Some(path) => Some(std::io::BufWriter::with_capacity(
+            4 << 20,
+            std::fs::OpenOptions::new()
+                .write(true)
+                .create(true)
+                .truncate(true)
+                .open(path)
+                .with_context(|| format!("opening --raw-out {}", path.display()))?,
+        )),
+        None => None,
+    };
     if let Some(path) = &args.state_in {
         let bytes = std::fs::read(path).with_context(|| format!("reading {}", path.display()))?;
         machine.load_state(&bytes)?;
@@ -604,6 +704,9 @@ pub fn run(
             let mut run = WideRun::new(world.as_deref().unwrap_or(rom));
             run.set_art(Some(pack));
             run.set_font(Some(font));
+            if let Some(overlay) = translation_overlay(args, rom)? {
+                run.set_overlay(Some(overlay));
+            }
             machine.set_line_log(true);
             Some((run, HdOptions { scale, look: args.look }))
         }
@@ -869,6 +972,9 @@ pub fn run(
             });
             let _ = write!(line, " {}={value}", p.label);
         }
+        if let (Some(raw), Some((w, h, pixels))) = (raw_out.as_mut(), &picture) {
+            write_raw(raw, frame, *w, *h, pixels)?;
+        }
         if !args.no_png
             && let Some((w, h, pixels)) = &picture
         {
@@ -1045,6 +1151,65 @@ mod tests {
     }
 
     #[test]
+    fn app_hooks_and_raw_out_are_options_off_by_default() {
+        let plain = parse_args(&["x", "--frames", "1"]).unwrap();
+        assert!(!plain.app_hooks);
+        assert!(plain.raw_out.is_none());
+        let set =
+            parse_args(&["x", "--frames", "1", "--app-hooks", "--raw-out", "f.fifo"]).unwrap();
+        assert!(set.app_hooks);
+        assert_eq!(set.raw_out.as_deref(), Some(Path::new("f.fifo")));
+        assert!(
+            parse_args(&["x", "--frames", "1", "--raw-out"]).unwrap_err().contains("--raw-out")
+        );
+    }
+
+    #[test]
+    fn app_hooks_add_the_games_hooks_to_the_mods_redirectors() {
+        let mut mods_only = ssd_oracle::HookTable::new();
+        ssd_game::mods::install(&mut mods_only);
+        let bare = app_hook_table(None);
+        let over_mods = app_hook_table(Some(&mods_only));
+        // the cheats and story fixes are more than the redirectors alone, and adding them to a table that already has
+        // the redirectors gives the same table as from nothing (the game's own order: cheats, then mods)
+        assert!(
+            bare.len() > mods_only.len(),
+            "{} hooks with the app's, {} mods only",
+            bare.len(),
+            mods_only.len()
+        );
+        assert_eq!(over_mods.len(), bare.len());
+    }
+
+    #[test]
+    fn a_raw_shot_is_a_header_line_then_the_rgba_bytes() {
+        let mut out = Vec::new();
+        write_raw(&mut out, 4699, 2, 1, &[1, 2, 3, 4, 5, 6, 7, 8]).unwrap();
+        write_raw(&mut out, 4700, 1, 1, &[9, 9, 9, 9]).unwrap();
+        let mut want = b"RAW 4699 2 1\n".to_vec();
+        want.extend_from_slice(&[1, 2, 3, 4, 5, 6, 7, 8]);
+        want.extend_from_slice(b"RAW 4700 1 1\n");
+        want.extend_from_slice(&[9, 9, 9, 9]);
+        assert_eq!(out, want);
+    }
+
+    #[test]
+    fn a_translation_needs_its_font_and_the_enhanced_picture() {
+        let both = ["x", "--frames", "1", "--hd-scale", "3", "--translation", "t.tsv"];
+        let parsed = parse_args(&[&both[..], &["--translation-font", "f.ttf"]].concat()).unwrap();
+        assert_eq!(parsed.translation.as_deref(), Some(Path::new("t.tsv")));
+        assert_eq!(parsed.translation_font.as_deref(), Some(Path::new("f.ttf")));
+        assert!(parse_args(&both).unwrap_err().contains("--translation-font"));
+        assert!(
+            parse_args(&["x", "--frames", "1", "--translation", "t", "--translation-font", "f"])
+                .unwrap_err()
+                .contains("--hd-scale")
+        );
+        let plain = parse_args(&["x", "--frames", "1"]).unwrap();
+        assert!(plain.translation.is_none() && plain.translation_font.is_none());
+    }
+
+    #[test]
     fn mods_are_repeatable_and_need_a_pack() {
         let a = parse_args(&[
             "x.ssdreplay",
@@ -1117,5 +1282,63 @@ mod tests {
                 .unwrap();
         assert_eq!(smooth.look, Look::Smooth);
         assert!(parse_args(&["menus", "--frames", "1", "--enhanced-look", "sharp"]).is_err());
+    }
+
+    /// With the ROM (`SSD_ROM_PATH`) and the v0.3.9 HD pack (`SSD_HD_PACK`, the installed pack's folder: the one holding
+    /// `hdpack.toml`, e.g. `<cache>/hd/A8CF4F2A/1`, not its parent): Vegeta's flight
+    /// to Earth (`wander` with the story scene started at frame 3400; at 5400 his line `str2:05C` is on screen) shows a
+    /// starfield on BG2 in the field's mode, with the last field map still in the work RAM. BG2's scroll puts the window
+    /// past that map's edge, and the tile check took the picture for the map: not one word was the lookup's, but past the
+    /// edge every difference was excused as the ring's. The art of that map, a sea, was drawn over the right three
+    /// quarters of the window, where the original shows black space.
+    ///
+    /// The measure is the share of teal (green and blue each 40 above red, green above 80) in the window right of the
+    /// stars' column and above the dialogue box (2x picture, x 240 to 628, y 0 to 280): 93 % with the sea drawn, 0.04 %
+    /// for the original's stars (a few are cyan). Under 2 % is the stars with room to spare and nowhere near the sea.
+    #[test]
+    #[ignore = "needs the ROM (SSD_ROM_PATH) and the HD pack (SSD_HD_PACK)"]
+    fn the_flight_through_space_draws_no_field_map_over_the_stars() {
+        let rom = std::fs::read(std::env::var("SSD_ROM_PATH").expect("SSD_ROM_PATH")).unwrap();
+        let rom = ssd_rom::normalize(&rom, None).unwrap().bytes;
+        let pack = PathBuf::from(std::env::var("SSD_HD_PACK").expect("SSD_HD_PACK"));
+        let root = Path::new(env!("CARGO_MANIFEST_DIR")).join("..");
+        let symbols = Symbols::load(root.join("re").join("symbols.toml")).unwrap();
+        let dir = tempfile::tempdir().unwrap();
+        let (pack_arg, out_arg) = (pack.to_string_lossy(), dir.path().to_string_lossy());
+        let args = parse_args(&[
+            "wander",
+            "--frames",
+            "5400",
+            "--wram",
+            "3400:7E121F=01",
+            "--wram",
+            "3400:7E0024=87",
+            "--hd-scale",
+            "2",
+            "--pack",
+            &pack_arg,
+            "--out",
+            &out_arg,
+        ])
+        .unwrap();
+        run(&rom, &symbols, &args, &root, &pack, &mut Vec::new()).unwrap();
+        let png = std::fs::read(dir.path().join("f005400.png")).unwrap();
+        let (width, height, rgba) = ssd_hd::png::read_rgba(&png).unwrap();
+        assert_eq!((width, height), (744, 478), "the wide view at 2x");
+        let (mut teal, mut all) = (0_u32, 0_u32);
+        for y in 0..280 {
+            for x in 240..628 {
+                let at = (y * width as usize + x) * 4;
+                let [r, g, b] = [rgba[at], rgba[at + 1], rgba[at + 2]].map(i32::from);
+                teal += u32::from(g > r + 40 && b > r + 40 && g > 80);
+                all += 1;
+            }
+        }
+        let share = f64::from(teal) / f64::from(all);
+        assert!(
+            share < 0.02,
+            "{:.2} % of the space right of the stars is the field map's sea",
+            share * 100.0
+        );
     }
 }

@@ -38,7 +38,7 @@ pub(crate) struct FakeMenu {
     pub listed: Vec<u8>,
     /// The rows of the party the original's Order screen has taken so far, slot by slot.
     pub picks: Vec<u8>,
-    /// `travel_mode`: 2 flying.
+    /// `travel_mode` 2 and `gate_flag_01bc` `$A1`: flying.
     pub flying: bool,
     /// `effect_pending` bit 7: an item effect runs.
     pub effect: bool,
@@ -114,6 +114,7 @@ impl FakeMenu {
             put(d::PARTY_ORDER + self.listed.len() as u32, 0xFF);
         }
         put(d::TRAVEL_MODE, if self.flying { 2 } else { 1 });
+        put(d::GATE_FLAG_01BC, if self.flying { 0xA1 } else { 0x82 });
         put(d::EFFECT_PENDING, if self.effect { 0x80 } else { 0 });
         put(d::ITEM_COUNT, if self.list.is_empty() { 3 } else { self.list.len() as u8 });
         if self.battle {
