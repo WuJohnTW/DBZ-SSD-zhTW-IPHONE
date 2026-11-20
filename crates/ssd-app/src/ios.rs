@@ -19,23 +19,14 @@ pub extern "C" fn ssd_ios_main(argc: c_int, argv: *mut *mut c_char) -> c_int {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
         .try_init();
 
-    // SDL_GetPrefPath creates and returns the app-specific writable directory in the iOS sandbox.
-    // SAFETY: static NUL-terminated identifiers; SDL owns the returned pointer until SDL_free.
-    let data_dir = unsafe {
-        sdl3::sys::filesystem::SDL_GetPrefPath(
-            c"WuJohnTW".as_ptr(),
-            c"DBZ SSD".as_ptr(),
-        )
+    // SDL creates this app-specific writable directory inside the iOS sandbox.
+    let path = match sdl3::filesystem::get_pref_path("WuJohnTW", "DBZ SSD") {
+        Ok(path) => path,
+        Err(error) => {
+            log::error!("could not create the iOS app data directory: {error}");
+            return i32::from(EXIT_ROM_MISSING);
+        }
     };
-    if data_dir.is_null() {
-        log::error!("SDL_GetPrefPath failed: {}", sdl3::get_error());
-        return i32::from(EXIT_ROM_MISSING);
-    }
-
-    // SAFETY: SDL returned a valid NUL-terminated UTF-8 path.
-    let path = unsafe { CStr::from_ptr(data_dir) }.to_string_lossy().into_owned();
-    // SAFETY: free the allocation returned by SDL_GetPrefPath exactly once.
-    unsafe { sdl3::sys::stdinc::SDL_free(data_dir.cast()) };
     // SAFETY: this entry runs before the game starts worker threads.
     unsafe { std::env::set_var("SSD_DATA_DIR", path) };
 
@@ -51,5 +42,5 @@ pub extern "C" fn ssd_ios_main(argc: c_int, argv: *mut *mut c_char) -> c_int {
         }
     }
 
-    i32::from(run(args))
+    if run(args) == std::process::ExitCode::SUCCESS { 0 } else { 1 }
 }
