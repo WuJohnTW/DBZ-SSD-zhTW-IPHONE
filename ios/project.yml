@@ -26,9 +26,21 @@ targets:
     platform: iOS
     sources:
       - path: SDLHost
-      - path: ../translations/zh-tw
+      - path: ../translations/zh-tw/zh-tw.tsv
         buildPhase: resources
-      - path: ../assets/fonts
+      - path: ../translations/zh-tw/ui-zh-tw.tsv
+        buildPhase: resources
+      - path: ../translations/zh-tw/fonts/LXGWWenKaiTC-Regular.ttf
+        buildPhase: resources
+      - path: ../assets/fonts/DotGothic16-Regular.ttf
+        buildPhase: resources
+      - path: ../assets/fonts/IBMPlexSans-Regular.ttf
+        buildPhase: resources
+      - path: ../assets/fonts/IBMPlexSans-SemiBold.ttf
+        buildPhase: resources
+      - path: ../assets/fonts/JetBrainsMono-Regular.ttf
+        buildPhase: resources
+      - path: ../assets/fonts/ShareTechMono-Regular.ttf
         buildPhase: resources
     dependencies:
       - framework: Vendor/SDL3.xcframework
