@@ -1,0 +1,78 @@
+name: DBZSSD
+options:
+  bundleIdPrefix: tw.wujohn
+  deploymentTarget:
+    iOS: "15.0"
+  createIntermediateGroups: true
+  developmentLanguage: zh-Hant
+settings:
+  base:
+    SWIFT_VERSION: "5.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "15.0"
+    TARGETED_DEVICE_FAMILY: "1"
+    SUPPORTS_MACCATALYST: NO
+    GENERATE_INFOPLIST_FILE: NO
+    INFOPLIST_FILE: SDLHost/Info.plist
+    CODE_SIGN_STYLE: Automatic
+    PRODUCT_BUNDLE_IDENTIFIER: tw.wujohn.dbzssd
+    PRODUCT_NAME: "七龍珠Z超賽亞傳說"
+    CLANG_ENABLE_MODULES: YES
+    FRAMEWORK_SEARCH_PATHS:
+      - "$(inherited)"
+      - "$(PROJECT_DIR)/Vendor"
+targets:
+  DBZSSD:
+    type: application
+    platform: iOS
+    sources:
+      - path: SDLHost
+      - path: ../translations/zh-tw
+        buildPhase: resources
+      - path: ../assets/fonts
+        buildPhase: resources
+    dependencies:
+      - framework: Vendor/SDL3.xcframework
+        embed: true
+    settings:
+      base:
+        PRODUCT_BUNDLE_IDENTIFIER: tw.wujohn.dbzssd
+        INFOPLIST_KEY_UIRequiresFullScreen: YES
+        INFOPLIST_KEY_UILaunchScreen_Generation: YES
+        INFOPLIST_KEY_UIUserInterfaceStyle: Dark
+        INFOPLIST_KEY_LSApplicationCategoryType: public.app-category.games
+        OTHER_LDFLAGS:
+          - "$(inherited)"
+          - "-force_load"
+          - "$(PROJECT_DIR)/../target/aarch64-apple-ios/release/libssd_ios.a"
+          - "-framework"
+          - "Metal"
+          - "-framework"
+          - "MetalKit"
+          - "-framework"
+          - "UIKit"
+          - "-framework"
+          - "Foundation"
+          - "-framework"
+          - "QuartzCore"
+          - "-framework"
+          - "CoreGraphics"
+          - "-framework"
+          - "GameController"
+          - "-framework"
+          - "AVFoundation"
+          - "-framework"
+          - "AudioToolbox"
+          - "-framework"
+          - "CoreAudio"
+          - "-lz"
+          - "-lc++"
+    preBuildScripts:
+      - name: Build Rust game core
+        script: |
+          set -euo pipefail
+          cd "$SRCROOT/.."
+          rustup target add aarch64-apple-ios
+          cargo build --locked --release --lib -p ssd-app --target aarch64-apple-ios
+    scheme:
+      testTargets: []
+      gatherCoverageData: false
