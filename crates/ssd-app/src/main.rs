@@ -298,8 +298,12 @@ pub fn run(args: Vec<std::ffi::OsString>) -> ExitCode {
     let rom = match rom_setup::resolve_rom(cli.rom.as_deref(), cli.ips.as_deref(), cli.force_rom) {
         Ok(rom_setup::RomSetup::Ready(bytes)) => bytes,
         Ok(rom_setup::RomSetup::Missing) => {
-            let msg = "No ROM yet. Start once with:\n\nssd-recompiled --rom \"path\\to\\rom.sfc\"\n\n\
-                       Accepted: Klepto v1.02 English translation, or the Japanese Rev 1 ROM with --ips dbz102.ips.";
+            let msg = if cfg!(target_os = "ios") {
+                "找不到遊戲 ROM。請開啟 iPhone「檔案」App，在「我的 iPhone」中的「七龍珠Z 超賽亞傳說」資料夾放入一個 .sfc 或 .smc 檔案，再重新啟動遊戲。\n\n日版 Rev 1 ROM 請同時放入 Klepto v1.02 修補檔，檔名必須是 dbz102.ips。資料夾內只能放一個 ROM。"
+            } else {
+                "No ROM yet. Start once with:\n\nssd-recompiled --rom \"path\\to\\rom.sfc\"\n\n\
+                 Accepted: Klepto v1.02 English translation, or the Japanese Rev 1 ROM with --ips dbz102.ips."
+            };
             eprintln!("{msg}");
             if cli.headless_frames.is_none() {
                 let _ = sdl3::messagebox::show_simple_message_box(
