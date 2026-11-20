@@ -9,7 +9,7 @@
 include!("main.rs");
 
 use std::ffi::{CStr, OsString, c_char, c_int};
-use std::path::{Path, PathBuf};
+use std::path::PathBuf;
 
 /// Find ROM files copied into the app's Documents folder through the iOS Files app.
 /// Only auto-select a ROM when exactly one candidate exists; never guess between multiple dumps.
