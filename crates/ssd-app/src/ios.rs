@@ -42,5 +42,15 @@ pub extern "C" fn ssd_ios_main(argc: c_int, argv: *mut *mut c_char) -> c_int {
         }
     }
 
+    // This iPhone build is the Traditional Chinese Remastered edition. Classic mode does not
+    // render translation tables, so select Enhanced explicitly and enable the existing SDL touch UI.
+    args.extend([
+        OsString::from("--mode"),
+        OsString::from("enhanced"),
+        OsString::from("--lang"),
+        OsString::from("zh-tw"),
+        OsString::from("--touch-ui"),
+    ]);
+
     if run(args) == std::process::ExitCode::SUCCESS { 0 } else { 1 }
 }
