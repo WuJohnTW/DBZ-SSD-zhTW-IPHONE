@@ -68,6 +68,22 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             build
 
+      - name: Package unsigned IPA
+        run: |
+          set -euo pipefail
+          app="$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos/DBZSSD.app"
+          mkdir -p "$RUNNER_TEMP/ipa/Payload"
+          ditto "$app" "$RUNNER_TEMP/ipa/Payload/DBZSSD.app"
+          (cd "$RUNNER_TEMP/ipa" && /usr/bin/zip -qry "$RUNNER_TEMP/DBZSSD-unsigned.ipa" Payload)
+          test -s "$RUNNER_TEMP/DBZSSD-unsigned.ipa"
+
+      - name: Upload unsigned IPA
+        uses: actions/upload-artifact@v4
+        with:
+          name: DBZSSD-unsigned-IPA
+          path: ${{ runner.temp }}/DBZSSD-unsigned.ipa
+          retention-days: 7
+
       - name: Upload unsigned app bundle
         if: success()
         uses: actions/upload-artifact@v4
