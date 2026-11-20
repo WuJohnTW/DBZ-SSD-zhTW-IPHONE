@@ -35,7 +35,7 @@ jobs:
         env:
           MACOSX_DEPLOYMENT_TARGET: "15.0"
           CMAKE: cmake
-        run: cargo +1.99 check --locked -p ssd-app --target aarch64-apple-ios
+        run: cargo +1.99 check --locked -p ssd-app --lib --target aarch64-apple-ios
 
       - name: Explain scope
         if: always()
