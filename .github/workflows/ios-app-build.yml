@@ -36,19 +36,20 @@ jobs:
           xcodegen --version
 
       - name: Download official SDL3 iOS framework
+        env:
+          GH_TOKEN: ${{ github.token }}
         shell: bash
         run: |
           set -euo pipefail
-          release_json="$(curl -fsSL https://api.github.com/repos/libsdl-org/SDL/releases/latest)"
-          dmg_url="$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(a["browser_download_url"] for a in d["assets"] if a["name"].endswith(".dmg") and a["name"].startswith("SDL3-")))' <<< "$release_json")"
           mkdir -p "$RUNNER_TEMP/sdl" ios/Vendor
-          curl -fL "$dmg_url" -o "$RUNNER_TEMP/SDL3.dmg"
-          hdiutil attach "$RUNNER_TEMP/SDL3.dmg" -nobrowse -readonly -mountpoint "$RUNNER_TEMP/sdl"
+          gh release download --repo libsdl-org/SDL --pattern 'SDL3-*.dmg' --dir "$RUNNER_TEMP"
+          dmg="$(find "$RUNNER_TEMP" -maxdepth 1 -name 'SDL3-*.dmg' -print -quit)"
+          test -n "$dmg"
+          hdiutil attach "$dmg" -nobrowse -readonly -mountpoint "$RUNNER_TEMP/sdl"
           framework="$(find "$RUNNER_TEMP/sdl" -name SDL3.xcframework -type d -print -quit)"
           test -n "$framework"
           ditto "$framework" ios/Vendor/SDL3.xcframework
           hdiutil detach "$RUNNER_TEMP/sdl"
-
       - name: Generate Xcode project
         run: xcodegen generate --spec ios/project.yml
 
