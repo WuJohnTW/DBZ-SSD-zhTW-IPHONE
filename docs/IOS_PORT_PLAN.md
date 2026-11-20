@@ -1,6 +1,6 @@
 # iOS port plan
 
-Status: initial iOS Rust static-library entry and SDL3 UIKit bridge committed; no Xcode project, document picker, signed app, or IPA exists yet.
+Status: iOS Rust static-library entry, SDL3 UIKit bridge, XcodeGen project specification, and unsigned-app CI pipeline committed. The first iOS Rust target check passed. Full Xcode app build is pending; document picker, signed app, and IPA are not complete.
 
 ## Verified project structure
 
@@ -11,7 +11,7 @@ Status: initial iOS Rust static-library entry and SDL3 UIKit bridge committed; n
 - A separate Apple Silicon macOS launcher exists under `macos/`. It is not an iOS app and cannot be reused as an iOS bundle unchanged.
 - The existing workspace has no iOS crate/member or Xcode project.
 
-## Implemented scaffold (not yet device-tested)\n\n- Added `crates/ssd-app/src/ios.rs` as an iOS-only Rust static-library entry. It reuses the existing app modules and sets `SSD_DATA_DIR` to SDL's app-specific writable preferences directory.\n- Added a `[lib]` static-library target (`ssd_ios`) to `crates/ssd-app/Cargo.toml`; the existing desktop binary target remains in place.\n- Added `ios/SDLHost/main.m`, a small Objective-C bridge that uses SDL3's iOS `SDL_main.h` entry integration and forwards to `ssd_ios_main`.\n- Added a macOS GitHub Actions cross-compilation check that checks the iOS Rust library target. The workflow has been committed but a successful run has not yet been verified.\n\n## Proposed iOS architecture
+## Implemented scaffold (not yet device-tested)\n\n- Added `crates/ssd-app/src/ios.rs` as an iOS-only Rust static-library entry. It reuses the existing app modules and sets `SSD_DATA_DIR` to SDL's app-specific writable preferences directory.\n- Added a `[lib]` static-library target (`ssd_ios`) to `crates/ssd-app/Cargo.toml`; the existing desktop binary target remains in place.\n- Added `ios/SDLHost/main.m`, a small Objective-C bridge that uses SDL3's iOS `SDL_main.h` entry integration and forwards to `ssd_ios_main`.\n- Added a macOS GitHub Actions cross-compilation check that checks the iOS Rust library target. The workflow has been committed but a successful run has not yet been verified.\n\n## Implemented app project scaffold (build validation pending)\n\n- Added `ios/project.yml` to generate an iPhone app project with XcodeGen, iOS 15 deployment target, landscape orientation, Traditional Chinese translation tables, and font resources.\n- Added `ios/SDLHost/Info.plist` and `ios/README.md`.\n- Added `.github/workflows/ios-app-build.yml`: downloads the official SDL3 release DMG, extracts `SDL3.xcframework`, generates the Xcode project, builds the Rust static library, and attempts an unsigned device app build.\n- The Rust target compatibility workflow passed on commit `b2a7ad2c`. This verifies `cargo check` for the iOS target only; it does not verify native Xcode linking or runtime.\n\n## Proposed iOS architecture
 
 1. Add an iOS app wrapper (Xcode project or generated project) whose native entry point uses SDL3's iOS `SDL_main` integration. SDL3 documents that iOS supplies the app delegate/run loop and that `SDL_main.h` provides the entry point.
 2. Build the Rust game as an iOS static library for `aarch64-apple-ios`, with the iOS wrapper providing the platform entry point. Do not attempt to use an iOS dynamic library as the app's main executable.
@@ -25,7 +25,7 @@ Status: initial iOS Rust static-library entry and SDL3 UIKit bridge committed; n
 - Inspect and adapt `ssd-app`'s SDL initialization, window creation, event loop, filesystem paths, audio, and app lifecycle handling for iOS.
 - Add a touch-first UI. Existing Android touch controls are a useful starting point, but must be tested for iPhone safe areas, rotation, scaling, and iOS lifecycle events.
 - Integrate SDL3 as an iOS-compatible framework/xcframework (or a reproducible source build) and link required Apple system frameworks.
-- Add Xcode project settings, Info.plist, launch assets, bundle identifier, deployment target, and resource-copy phases.
+- Complete and validate Xcode project settings, Info.plist, launch assets, bundle identifier, deployment target, and resource-copy phases. The initial XcodeGen specification is committed but still needs a successful CI build.
 - Add simulator/device build checks where available, plus runtime tests for ROM import, Chinese font rendering, audio, saves, background/foreground, and memory pressure.
 
 ## Acceptance criteria
@@ -37,4 +37,4 @@ Status: initial iOS Rust static-library entry and SDL3 UIKit bridge committed; n
 
 ## Current limitation
 
-The Rust static-library entry and SDL3 Objective-C entry bridge are scaffolding only and have not been compiled or run on an iPhone. The Xcode project, SDL3 framework integration, document picker, ROM import, resource bundling, signing, and IPA build are not implemented yet.
+The Rust target compatibility check passed. The Rust static-library entry, SDL3 Objective-C entry bridge, and XcodeGen project specification are scaffolding only; the full Xcode build has not yet been verified. Document picker, ROM import integration, on-device testing, signing, and IPA build are not complete.
