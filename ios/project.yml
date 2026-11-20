@@ -97,6 +97,13 @@ targets:
           cd "$SRCROOT/.."
           rustup target add aarch64-apple-ios
           cargo build --locked --release --lib -p ssd-app --target aarch64-apple-ios
+    postBuildScripts:
+      - name: Place Traditional Chinese font in expected folder
+        script: |
+          set -euo pipefail
+          resources="$TARGET_BUILD_DIR/$UNLOCALIZED_RESOURCES_FOLDER_PATH"
+          mkdir -p "$resources/fonts"
+          cp "$resources/LXGWWenKaiTC-Regular.ttf" "$resources/fonts/LXGWWenKaiTC-Regular.ttf"
     scheme:
       testTargets: []
       gatherCoverageData: false
