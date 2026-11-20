@@ -8,7 +8,12 @@ publish = false
 name = "ssd-recompiled"
 path = "src/main.rs"
 
-[lib]\nname = "ssd_ios"\npath = "src/ios.rs"\ncrate-type = ["staticlib"]\n\n[dependencies]
+[lib]
+name = "ssd_ios"
+path = "src/ios.rs"
+crate-type = ["staticlib"]
+
+[dependencies]
 ssd-game = { workspace = true }
 ssd-hd = { workspace = true }   # the PNG writer of the UI snapshots (ssd_hd::png)
 ssd-oracle = { workspace = true }
