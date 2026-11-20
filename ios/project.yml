@@ -2,13 +2,13 @@ name: DBZSSD
 options:
   bundleIdPrefix: tw.wujohn
   deploymentTarget:
-    iOS: "15.0"
+    iOS: "18.5"
   createIntermediateGroups: true
   developmentLanguage: zh-Hant
 settings:
   base:
     SWIFT_VERSION: "5.0"
-    IPHONEOS_DEPLOYMENT_TARGET: "15.0"
+    IPHONEOS_DEPLOYMENT_TARGET: "18.5"
     TARGETED_DEVICE_FAMILY: "1"
     SUPPORTS_MACCATALYST: NO
     GENERATE_INFOPLIST_FILE: NO
@@ -70,6 +70,14 @@ targets:
           - "CoreGraphics"
           - "-framework"
           - "CoreVideo"
+          - "-framework"
+          - "CoreMedia"
+          - "-framework"
+          - "CoreBluetooth"
+          - "-framework"
+          - "CoreHaptics"
+          - "-framework"
+          - "CoreMotion"
           - "-framework"
           - "OpenGLES"
           - "-framework"
