@@ -1,0 +1,45 @@
+name: iOS target compatibility
+
+on:
+  push:
+    branches: [ios-port]
+    paths:
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - ".cargo/**"
+      - "crates/**"
+      - "third_party/**"
+      - ".github/workflows/ios-cross-check.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  check-ios-target:
+    name: Check Rust dependencies for iOS device
+    runs-on: macos-15
+    timeout-minutes: 45
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install Rust iOS target
+        run: |
+          rustup target add --toolchain 1.99 aarch64-apple-ios
+          rustc +1.99 --version
+          xcodebuild -version
+
+      - name: Check app for iOS device target
+        env:
+          MACOSX_DEPLOYMENT_TARGET: "15.0"
+          CMAKE: cmake
+        run: cargo +1.99 check --locked -p ssd-app --target aarch64-apple-ios
+
+      - name: Explain scope
+        if: always()
+        run: |
+          echo "This job is a cross-compilation compatibility check only."
+          echo "It does not produce an iOS .app or .ipa and does not test iPhone runtime behavior."
+          echo "A native iOS app wrapper, document picker, sandbox paths, signing, and device build remain separate work.";
