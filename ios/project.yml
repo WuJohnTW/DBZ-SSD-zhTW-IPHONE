@@ -15,7 +15,7 @@ settings:
     INFOPLIST_FILE: SDLHost/Info.plist
     CODE_SIGN_STYLE: Automatic
     PRODUCT_BUNDLE_IDENTIFIER: tw.wujohn.dbzssd
-    PRODUCT_NAME: "七龍珠Z超賽亞傳說"
+    PRODUCT_NAME: DBZSSD
     CLANG_ENABLE_MODULES: YES
     FRAMEWORK_SEARCH_PATHS:
       - "$(inherited)"
