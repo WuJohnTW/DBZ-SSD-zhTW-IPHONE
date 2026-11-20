@@ -1,6 +1,6 @@
 # iOS port plan
 
-Status: investigation only; no iOS app target or IPA exists yet.
+Status: initial iOS Rust static-library entry and SDL3 UIKit bridge committed; no Xcode project, document picker, signed app, or IPA exists yet.
 
 ## Verified project structure
 
@@ -11,7 +11,7 @@ Status: investigation only; no iOS app target or IPA exists yet.
 - A separate Apple Silicon macOS launcher exists under `macos/`. It is not an iOS app and cannot be reused as an iOS bundle unchanged.
 - The existing workspace has no iOS crate/member or Xcode project.
 
-## Proposed iOS architecture
+## Implemented scaffold (not yet device-tested)\n\n- Added `crates/ssd-app/src/ios.rs` as an iOS-only Rust static-library entry. It reuses the existing app modules and sets `SSD_DATA_DIR` to SDL's app-specific writable preferences directory.\n- Added a `[lib]` static-library target (`ssd_ios`) to `crates/ssd-app/Cargo.toml`; the existing desktop binary target remains in place.\n- Added `ios/SDLHost/main.m`, a small Objective-C bridge that uses SDL3's iOS `SDL_main.h` entry integration and forwards to `ssd_ios_main`.\n- Added a macOS GitHub Actions cross-compilation check that checks the iOS Rust library target. The workflow has been committed but a successful run has not yet been verified.\n\n## Proposed iOS architecture
 
 1. Add an iOS app wrapper (Xcode project or generated project) whose native entry point uses SDL3's iOS `SDL_main` integration. SDL3 documents that iOS supplies the app delegate/run loop and that `SDL_main.h` provides the entry point.
 2. Build the Rust game as an iOS static library for `aarch64-apple-ios`, with the iOS wrapper providing the platform entry point. Do not attempt to use an iOS dynamic library as the app's main executable.
@@ -37,4 +37,4 @@ Status: investigation only; no iOS app target or IPA exists yet.
 
 ## Current limitation
 
-This document records the investigation and intended approach only. It does not claim that the iOS wrapper, Rust target, Xcode project, signing, or IPA build has been implemented or tested.
+The Rust static-library entry and SDL3 Objective-C entry bridge are scaffolding only and have not been compiled or run on an iPhone. The Xcode project, SDL3 framework integration, document picker, ROM import, resource bundling, signing, and IPA build are not implemented yet.
