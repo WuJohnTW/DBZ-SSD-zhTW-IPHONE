@@ -9,11 +9,55 @@
 include!("main.rs");
 
 use std::ffi::{CStr, OsString, c_char, c_int};
+use std::path::{Path, PathBuf};
+
+/// Find ROM files copied into the app's Documents folder through the iOS Files app.
+/// Only auto-select a ROM when exactly one candidate exists; never guess between multiple dumps.
+fn documents_rom_args() -> Vec<OsString> {
+    let Some(home) = std::env::var_os("HOME") else {
+        return Vec::new();
+    };
+    let documents = PathBuf::from(home).join("Documents");
+    let Ok(entries) = std::fs::read_dir(&documents) else {
+        return Vec::new();
+    };
+
+    let mut roms: Vec<PathBuf> = entries
+        .filter_map(Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| {
+            path.is_file()
+                && path.extension().and_then(|ext| ext.to_str()).is_some_and(|ext| {
+                    ext.eq_ignore_ascii_case("sfc") || ext.eq_ignore_ascii_case("smc")
+                })
+        })
+        .collect();
+    roms.sort();
+
+    if roms.len() != 1 {
+        if roms.len() > 1 {
+            log::warn!(
+                "more than one ROM is in Documents; keep only the ROM you want to import"
+            );
+        }
+        return Vec::new();
+    }
+
+    let mut args = vec![OsString::from("--rom"), roms.remove(0).into_os_string()];
+    let patch = documents.join("dbz102.ips");
+    if patch.is_file() {
+        args.push(OsString::from("--ips"));
+        args.push(patch.into_os_string());
+    }
+    args
+}
 
 /// The SDL/Xcode host calls this once the UIKit application has entered SDL's run loop.
 ///
 /// The game stores saves and settings under SDL's app-specific preferences directory. The bundle
-/// resource directory is read-only on iOS and must never be used for player data.
+/// resource directory is read-only on iOS and must never be used for player data. ROM files can be
+/// copied into the app's Documents folder from the iOS Files app; the first launch imports the one
+/// unambiguous .sfc/.smc file it finds there into the game's validated ROM cache.
 #[unsafe(no_mangle)]
 pub extern "C" fn ssd_ios_main(argc: c_int, argv: *mut *mut c_char) -> c_int {
     let _ = env_logger::Builder::from_env(env_logger::Env::default().default_filter_or("info"))
@@ -40,6 +84,11 @@ pub extern "C" fn ssd_ios_main(argc: c_int, argv: *mut *mut c_char) -> c_int {
                 args.push(OsString::from(unsafe { CStr::from_ptr(*value) }.to_string_lossy().into_owned()));
             }
         }
+    }
+
+    // Prefer explicit launch arguments; otherwise import the single ROM copied via Files.
+    if !args.iter().any(|arg| arg == "--rom") {
+        args.extend(documents_rom_args());
     }
 
     // This iPhone build is the Traditional Chinese Remastered edition. Classic mode does not
