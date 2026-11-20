@@ -1,0 +1,84 @@
+name: iOS app build
+
+on:
+  push:
+    branches: [ios-port]
+    paths:
+      - "ios/**"
+      - "crates/**"
+      - "Cargo.toml"
+      - "Cargo.lock"
+      - "rust-toolchain.toml"
+      - "translations/zh-tw/**"
+      - "assets/fonts/**"
+      - ".github/workflows/ios-app-build.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build-ios-app:
+    name: Build unsigned iPhone app
+    runs-on: macos-15
+    timeout-minutes: 90
+    steps:
+      - name: Check out source
+        uses: actions/checkout@v4
+
+      - name: Install XcodeGen
+        run: brew install xcodegen
+
+      - name: Install Rust iOS target
+        run: |
+          rustup target add --toolchain 1.99 aarch64-apple-ios
+          xcodebuild -version
+          xcodegen --version
+
+      - name: Download official SDL3 iOS framework
+        shell: bash
+        run: |
+          set -euo pipefail
+          release_json="$(curl -fsSL https://api.github.com/repos/libsdl-org/SDL/releases/latest)"
+          dmg_url="$(python3 -c 'import json,sys; d=json.load(sys.stdin); print(next(a["browser_download_url"] for a in d["assets"] if a["name"].endswith(".dmg") and a["name"].startswith("SDL3-")))' <<< "$release_json")"
+          mkdir -p "$RUNNER_TEMP/sdl" ios/Vendor
+          curl -fL "$dmg_url" -o "$RUNNER_TEMP/SDL3.dmg"
+          hdiutil attach "$RUNNER_TEMP/SDL3.dmg" -nobrowse -readonly -mountpoint "$RUNNER_TEMP/sdl"
+          framework="$(find "$RUNNER_TEMP/sdl" -name SDL3.xcframework -type d -print -quit)"
+          test -n "$framework"
+          ditto "$framework" ios/Vendor/SDL3.xcframework
+          hdiutil detach "$RUNNER_TEMP/sdl"
+
+      - name: Generate Xcode project
+        run: xcodegen generate --spec ios/project.yml
+
+      - name: Build Rust static library
+        run: cargo +1.99 build --locked --release --lib -p ssd-app --target aarch64-apple-ios
+
+      - name: Build unsigned iOS app
+        run: |
+          xcodebuild \
+            -project ios/DBZSSD.xcodeproj \
+            -scheme DBZSSD \
+            -configuration Release \
+            -sdk iphoneos \
+            -destination 'generic/platform=iOS' \
+            -derivedDataPath "$RUNNER_TEMP/DerivedData" \
+            CODE_SIGNING_ALLOWED=NO \
+            build
+
+      - name: Package unsigned app for inspection
+        if: success()
+        run: |
+          mkdir -p "$RUNNER_TEMP/unsigned"
+          ditto "$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos/DBZSSD.app" "$RUNNER_TEMP/unsigned/DBZSSD.app"
+          cd "$RUNNER_TEMP/unsigned"
+          zip -qry "$GITHUB_WORKSPACE/DBZSSD-unsigned-app.zip" DBZSSD.app
+
+      - name: Upload unsigned app bundle
+        if: success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: DBZSSD-unsigned-ios-app
+          path: DBZSSD-unsigned-app.zip
+          retention-days: 7
