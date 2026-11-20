@@ -68,18 +68,11 @@ jobs:
             CODE_SIGNING_ALLOWED=NO \
             build
 
-      - name: Package unsigned app for inspection
-        if: success()
-        run: |
-          mkdir -p "$RUNNER_TEMP/unsigned"
-          ditto "$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos/DBZSSD.app" "$RUNNER_TEMP/unsigned/DBZSSD.app"
-          cd "$RUNNER_TEMP/unsigned"
-          zip -qry "$GITHUB_WORKSPACE/DBZSSD-unsigned-app.zip" DBZSSD.app
-
       - name: Upload unsigned app bundle
         if: success()
         uses: actions/upload-artifact@v4
         with:
           name: DBZSSD-unsigned-ios-app
-          path: DBZSSD-unsigned-app.zip
+          path: ${{ runner.temp }}/DerivedData/Build/Products/Release-iphoneos/DBZSSD.app
+          include-hidden-files: true
           retention-days: 7
