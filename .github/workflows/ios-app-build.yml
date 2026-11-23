@@ -72,6 +72,10 @@ jobs:
         run: |
           set -euo pipefail
           app="$RUNNER_TEMP/DerivedData/Build/Products/Release-iphoneos/DBZSSD.app"
+          executable="$(/usr/libexec/PlistBuddy -c 'Print :CFBundleExecutable' "$app/Info.plist")"
+          test -n "$executable"
+          test -x "$app/$executable"
+          echo "Validated CFBundleExecutable=$executable"
           mkdir -p "$RUNNER_TEMP/ipa/Payload"
           ditto "$app" "$RUNNER_TEMP/ipa/Payload/DBZSSD.app"
           (cd "$RUNNER_TEMP/ipa" && /usr/bin/zip -qry "$RUNNER_TEMP/DBZSSD-unsigned.ipa" Payload)
