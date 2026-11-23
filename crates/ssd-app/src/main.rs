@@ -316,7 +316,16 @@ pub fn run(args: Vec<std::ffi::OsString>) -> ExitCode {
             return ExitCode::from(EXIT_ROM_MISSING);
         }
         Err(e) => {
-            eprintln!("ROM rejected: {e:#}");
+            let message = format!("遊戲 ROM 無法載入：{e:#}\\n\\n請確認 ROM 是日版 Rev 1，並將 dbz102.ips 放在遊戲資料夾中；ROM 檔案需為 .sfc 或 .smc。");
+            eprintln!("{message}");
+            if cfg!(target_os = "ios") && cli.headless_frames.is_none() {
+                let _ = sdl3::messagebox::show_simple_message_box(
+                    sdl3::messagebox::MessageBoxFlag::ERROR,
+                    TITLE,
+                    &message,
+                    None,
+                );
+            }
             return ExitCode::from(EXIT_ROM_REJECTED);
         }
     };
