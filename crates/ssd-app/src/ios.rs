@@ -43,10 +43,25 @@ fn documents_rom_args() -> Vec<OsString> {
     }
 
     let mut args = vec![OsString::from("--rom"), roms.remove(0).into_os_string()];
-    let patch = documents.join("dbz102.ips");
-    if patch.is_file() {
+    let rom_path = PathBuf::from(args[1].clone());
+    if let Ok(metadata) = std::fs::metadata(&rom_path) {
+        log::info!("iOS ROM candidate: {} ({} bytes)", rom_path.display(), metadata.len());
+    }
+    // Files may preserve the patch name's case or append a duplicate suffix; accept only the
+    // exact base name case-insensitively and report the selected path for diagnostics.
+    let patch = std::fs::read_dir(&documents).ok().and_then(|entries| {
+        entries.filter_map(Result::ok).map(|entry| entry.path()).find(|path| {
+            path.is_file()
+                && path.file_name().and_then(|name| name.to_str())
+                    .is_some_and(|name| name.eq_ignore_ascii_case("dbz102.ips"))
+        })
+    });
+    if let Some(patch) = patch {
+        log::info!("iOS IPS patch found: {}", patch.display());
         args.push(OsString::from("--ips"));
         args.push(patch.into_os_string());
+    } else {
+        log::warn!("iOS dbz102.ips patch not found in {}", documents.display());
     }
     args
 }
